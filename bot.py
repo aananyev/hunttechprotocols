@@ -1,8 +1,14 @@
 #!/usr/bin/env python3
 """
-Telegram Bot: достаёт НЕПРОЧИТАННЫЕ письма с темой "Конспект встречи" из IMAP почты,
-извлекает txt-содержимое и выводит нумерованный список в обратном хронологическом порядке.
-После просмотра помечает письма как прочитанные.
+🤖 HuntTech Protocols Bot
+=================================
+Бизнес-назначение: 
+Автоматизация рутины рекрутингового агентства — достаём из почты 
+«Конспекты встреч» (ежедневные совещания Совета директоров IT-компании),
+извлекаем текстовые отчёты и даём одним нажатием кнопки сгенерировать
+структурированное саммари по заданному шаблону (промпту) через нейросеть.
+
+Основан на aiogram 3.x.
 """
 
 import asyncio
@@ -17,6 +23,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+# ── Логирование ──────────────────────────────────────────────────
+# Логи нужны, чтобы отслеживать работу бота в фоне — кто и когда
+# запрашивал конспекты, были ли ошибки IMAP/AI.
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
@@ -35,17 +44,39 @@ from dotenv import load_dotenv
 # ── Конфигурация ──────────────────────────────────────────────
 
 load_dotenv()
+# TG_TOKEN — ключ от @BotFather, даёт боту доступ к Telegram API.
+# Хранится в .env (не в git!), чтобы не светить секрет в репозитории.
 TG_TOKEN = os.getenv("TG_TOKEN", "") or exit("❌ TG_TOKEN не задан! Положи токен в .env")
 
+# SUBJECT_FILTER — бизнес-правило: мы ищем только письма с темой
+# "Конспект встречи", которые секретарь Совета директоров отправляет
+# после каждого ежедневного совещания.
 SUBJECT_FILTER = "Конспект встречи"
-MAX_MSG_LEN = 3800  # Telegram лимит ~4096, оставляем запас под Markdown
+
+# MAX_MSG_LEN — Telegram не принимает сообщения длиннее ~4096 символов.
+# Оставляем запас 300 символов под Markdown-разметку, чтобы биться
+# в лимит на длинных ответах нейросети.
+MAX_MSG_LEN = 3800
+
+# USERS_FILE — хранилище учётных данных пользователей (email, пароль,
+# AI-ключи). Каждый пользователь бота подключает свою почту.
+# Файл исключён из git — в нём пароли приложений от IMAP и API-ключи.
 USERS_FILE = Path(__file__).parent / "users.json"
+
+
+# ═══════════════════════════════════════════════════════════════════
+# БЛОК ХРАНЕНИЯ ДАННЫХ
+# ═══════════════════════════════════════════════════════════════════
+# Бизнес-требование: бот многопользовательский. Каждый рекрутер
+# агентства может подключить свой почтовый ящик и свои AI-ключи.
+# Данные хранятся в JSON-файлах (не БД, потому что пользователей 
+# пока единицы, и администрировать проще через файлы).
 
 
 # ── Хранилище пользовательских настроек почты ─────────────────
 
 def _load_users() -> dict:
-    """Загружает настройки пользователей: {user_id: {email, server, port, password}}"""
+    """Загружает учётные записи пользователей: {user_id: {email, server, port, password, ai?}}"""
     if not USERS_FILE.exists():
         return {}
     try:
@@ -59,19 +90,21 @@ def _load_users() -> dict:
 
 
 def _save_users(users: dict):
-    """Сохраняет настройки пользователей."""
+    """Сохраняет учётные записи пользователей."""
     with open(USERS_FILE, "w", encoding="utf-8") as f:
         json.dump(users, f, ensure_ascii=False, indent=2)
 
 
 def get_user_config(user_id: int) -> dict | None:
-    """Возвращает настройки пользователя или None."""
+    """Возвращает настройки IMAP/AI конкретного пользователя.
+       Бизнес-правило: без настроек нельзя /list и /list_all."""
     users = _load_users()
     return users.get(str(user_id))
 
 
 def save_user_config(user_id: int, email: str, server: str, login: str, password: str):
-    """Сохраняет настройки пользователя (IMAP + AI)."""
+    """Сохраняет IMAP-настройки пользователя (email, IMAP-сервер, логин, пароль).
+       Вызывается после успешной проверки подключения в /setup."""
     users = _load_users()
     key = str(user_id)
     if key not in users:
@@ -87,7 +120,8 @@ def save_user_config(user_id: int, email: str, server: str, login: str, password
 
 
 def save_ai_config(user_id: int, endpoint: str, api_key: str, model: str):
-    """Сохраняет AI-настройки пользователя."""
+    """Сохраняет AI-настройки пользователя (endpoint, api_key, модель).
+       Вызывается после /setup_ai. API-ключ хранится рядом с IMAP-паролем."""
     users = _load_users()
     key = str(user_id)
     if key not in users:
@@ -101,17 +135,31 @@ def save_ai_config(user_id: int, endpoint: str, api_key: str, model: str):
 
 
 def get_ai_config(user_id: int) -> dict | None:
-    """Возвращает AI-настройки пользователя или None."""
+    """Возвращает AI-настройки пользователя или None.
+       Без AI-конфига кнопка «Саммари» не работает."""
     config = get_user_config(user_id)
     if config and "ai" in config:
         return config["ai"]
     return None
 
 
+# ═══════════════════════════════════════════════════════════════════
+# БЛОК ОБРАБОТКИ ПОЧТЫ (IMAP)
+# ═══════════════════════════════════════════════════════════════════
+# Бизнес-процесс: каждое утро после совещания Совета директоров 
+# секретарь высылает текстовую расшифровку встречи в виде .txt-файла.
+# Бот забирает эти письма, не помечая их прочитанными (UNSEEN),
+# чтобы пользователь мог перепроверить в веб-интерфейсе почты.
+
+
 # ── Хелперы ───────────────────────────────────────────────────
 
 def decode_mime_header(header_value: str) -> str:
-    """Декодирует MIME-заголовок (QP, Base64 и т.д.) в читаемую строку."""
+    """
+    Декодирует MIME-заголовки (QP, Base64).
+    Бизнес-правило: темы писем могут содержать кириллицу, закодированную 
+    в =?UTF-8?B?...?=, поэтому нужна правильная раскодировка.
+    """
     if header_value is None:
         return ""
     parts = decode_header(header_value)
@@ -128,7 +176,9 @@ def decode_mime_header(header_value: str) -> str:
 
 
 def get_email_date(msg) -> Optional[datetime]:
-    """Извлекает дату письма из Date-заголовка."""
+    """Извлекает дату письма из Date-заголовка.
+       Бизнес-правило: дата важна для сортировки — показываем 
+       сначала самые свежие конспекты."""
     date_str = msg.get("Date")
     if not date_str:
         return None
@@ -140,9 +190,9 @@ def get_email_date(msg) -> Optional[datetime]:
 
 def extract_txt_attachments(msg) -> list[str]:
     """
-    Рекурсивно обходит части письма. Возвращает содержимое:
-      - text/plain вложений (файлы .txt)
-      - text/plain тела письма (если нет отдельных вложений)
+    Рекурсивно обходит все части письма и собирает текстовое содержимое.
+    Бизнес-правило: конспект встречи приходит как .txt-вложение.
+    Если вложения нет, но есть text/plain в теле — тоже берём.
     """
     texts: list[str] = []
 
@@ -171,7 +221,11 @@ def extract_txt_attachments(msg) -> list[str]:
 # ── Общие IMAP-хелперы ────────────────────────────────────────
 
 def _connect_imap(config: dict) -> imaplib.IMAP4_SSL:
-    """Подключается к IMAP по настройкам пользователя и возвращает объект с открытой INBOX."""
+    """
+    Подключается к IMAP-серверу по настройкам пользователя.
+    Бизнес-правило: логин для IMAP часто совпадает с email, 
+    но бывает отличается (например, логин — часть email до @).
+    """
     imap_login = config.get("login", config["email"])
     logger.info("Подключение к IMAP %s (login: %s)...", config["server"], imap_login)
     server = imaplib.IMAP4_SSL(config["server"], config.get("port", 993))
@@ -181,9 +235,100 @@ def _connect_imap(config: dict) -> imaplib.IMAP4_SSL:
     return server
 
 
+def _filter_and_extract(server, msg_ids: list[bytes]) -> list[tuple]:
+    """
+    Фильтрует письма по теме SUBJECT_FILTER и извлекает txt-содержимое.
+    
+    Бизнес-правило — КРИТИЧЕСКИ ВАЖНОЕ:
+    Письма НЕ ДОЛЖНЫ помечаться как прочитанные. Используем BODY.PEEK[]
+    вместо RFC822, плюс явно снимаем флаг \\Seen — двойная защита.
+    
+    Отображение темы: если тема вида "Конспект встречи [Название]",
+    показываем только "[Название]". Если "Конспект встречи от 01.01"
+    (без названия), показываем полную тему.
+    """
+    matched: list[tuple] = []
+
+    for msg_id in msg_ids:
+        # BODY.PEEK[] — единственный правильный способ читать письмо
+        # не снимая флаг UNSEEN. Если использовать RFC822, сервер
+        # автоматически пометит письмо прочитанным.
+        typ, msg_data = server.fetch(msg_id, "(BODY.PEEK[])")
+        if typ != "OK":
+            continue
+
+        raw_email = msg_data[0][1]
+        msg = email.message_from_bytes(raw_email)
+
+        subject = decode_mime_header(msg.get("Subject", ""))
+        # Бизнес-правило: отбираем только письма по нашей теме.
+        # Кириллица может быть в разной кодировке, поэтому сравниваем
+        # в нижнем регистре.
+        if not subject.lower().startswith(SUBJECT_FILTER.lower()):
+            continue
+
+        # Формируем отображаемый заголовок: убираем кавычки вокруг темы,
+        # отсекаем префикс "Конспект встречи".
+        clean_subject = subject
+        for ch in ("«", "»", '"', "'"):
+            clean_subject = clean_subject.replace(ch, "")
+        clean_subject = clean_subject.strip()
+
+        remainder = subject[len(SUBJECT_FILTER):].strip()
+        for ch in ("«", "»", '"', "'"):
+            remainder = remainder.replace(ch, "")
+        remainder = remainder.strip()
+
+        # Если после префикса идёт "от [дата]" — названия встречи нет,
+        # показываем полную тему. Иначе — только название.
+        if remainder.lower().startswith("от "):
+            display = clean_subject
+        else:
+            display = remainder
+
+        dt = get_email_date(msg) or datetime.now()
+
+        # Извлекаем txt-содержимое (вложение или тело письма)
+        txts = extract_txt_attachments(msg)
+        txt_content = "\n\n---\n\n".join(txts) if txts else ""
+
+        matched.append((dt, display, txt_content))
+
+        # Гарантия: явно снимаем флаг \\Seen, если сервер его вдруг поставил.
+        # Yandex и некоторые провайдеры игнорируют PEEK и всё равно
+        # маркируют письмо как прочитанное.
+        try:
+            server.store(msg_id, "-FLAGS", "(\\Seen)")
+        except Exception:
+            pass
+
+    # Сортируем: самые свежие сверху — рекрутеру важно видеть
+    # последний созвон первым.
+    matched.sort(key=lambda x: x[0], reverse=True)
+    return matched
+
+
+def _format_list(matched: list[tuple[datetime, str]], title: str) -> str:
+    """Форматирует список конспектов в текст для отправки в Telegram."""
+    lines: list[str] = []
+    lines.append(f"{title} — всего {len(matched)}")
+    lines.append("")
+    for idx, (_, display) in enumerate(matched, 1):
+        lines.append(f"{idx}. {display}")
+    return "\n".join(lines)
+
+
+# ── Функции выборки писем ─────────────────────────────────────
+
 def fetch_notes(user_id: int) -> tuple[str, list]:
-    """Ищет НЕПРОЧИТАННЫЕ письма с темой, начинающейся с "Конспект встречи".
-    Возвращает (текст_для_вывода, список_совпадений)."""
+    """
+    Ищет НЕПРОЧИТАННЫЕ письма с темой "Конспект встречи".
+    
+    Бизнес-процесс: рекрутер приходит утром, нажимает /list,
+    видит только то, что пришло после его последнего захода 
+    (UNSEEN). Письма остаются непрочитанными — можно вернуться
+    и перепроверить в веб-почте.
+    """
     config = get_user_config(user_id)
     if not config:
         return ("❌ Почта не настроена. Используйте /setup для настройки.", [])
@@ -204,8 +349,12 @@ def fetch_notes(user_id: int) -> tuple[str, list]:
 
 
 def fetch_notes_last_week(user_id: int) -> tuple[str, list]:
-    """Ищет ВСЕ письма с темой, начинающейся с "Конспект встречи", за последние 7 дней.
-    Возвращает (текст_для_вывода, список_совпадений)."""
+    """
+    Ищет ВСЕ конспекты за последние 7 дней (не только непрочитанные).
+    
+    Бизнес-назначение: если рекрутер хочет пересмотреть, что было
+    на неделе — неважно, читал он это или нет.
+    """
     config = get_user_config(user_id)
     if not config:
         return ("❌ Почта не настроена. Используйте /setup для настройки.", [])
@@ -228,69 +377,9 @@ def fetch_notes_last_week(user_id: int) -> tuple[str, list]:
         server.logout()
 
 
-def _filter_and_extract(server, msg_ids: list[bytes]) -> list[tuple]:
-    """Принимает список ID писем, возвращает совпадающие по теме.
-       Каждый элемент: (datetime, display_text, txt_content).
-       Использует BODY.PEEK[] — НЕ устанавливает флаг \\Seen."""
-    matched: list[tuple] = []
-
-    for msg_id in msg_ids:
-        # BODY.PEEK[] читает письмо НЕ устанавливая флаг прочтения
-        typ, msg_data = server.fetch(msg_id, "(BODY.PEEK[])")
-        if typ != "OK":
-            continue
-
-        raw_email = msg_data[0][1]
-        msg = email.message_from_bytes(raw_email)
-
-        subject = decode_mime_header(msg.get("Subject", ""))
-        if not subject.lower().startswith(SUBJECT_FILTER.lower()):
-            continue
-
-        clean_subject = subject
-        for ch in ("«", "»", '"', "'"):
-            clean_subject = clean_subject.replace(ch, "")
-        clean_subject = clean_subject.strip()
-
-        remainder = subject[len(SUBJECT_FILTER):].strip()
-        for ch in ("«", "»", '"', "'"):
-            remainder = remainder.replace(ch, "")
-        remainder = remainder.strip()
-
-        if remainder.lower().startswith("от "):
-            display = clean_subject
-        else:
-            display = remainder
-
-        dt = get_email_date(msg) or datetime.now()
-
-        # Извлекаем txt-содержимое (вложение или тело письма)
-        txts = extract_txt_attachments(msg)
-        txt_content = "\n\n---\n\n".join(txts) if txts else ""
-
-        matched.append((dt, display, txt_content))
-
-        # Гарантия: явно снимаем флаг \\Seen, если сервер его вдруг поставил
-        try:
-            server.store(msg_id, "-FLAGS", "(\\Seen)")
-        except Exception:
-            pass
-
-    matched.sort(key=lambda x: x[0], reverse=True)
-    return matched
-
-
-def _format_list(matched: list[tuple[datetime, str]], title: str) -> str:
-    """Форматирует список в текст для Telegram."""
-    lines: list[str] = []
-    lines.append(f"{title} — всего {len(matched)}")
-    lines.append("")
-    for idx, (_, display) in enumerate(matched, 1):
-        lines.append(f"{idx}. {display}")
-    return "\n".join(lines)
-
-
-# ── Telegram Bot ───────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════
+# БЛОК TELEGRAM BOT
+# ═══════════════════════════════════════════════════════════════════
 
 import json
 from aiogram.fsm.state import State, StatesGroup
@@ -302,13 +391,20 @@ bot = Bot(token=TG_TOKEN)
 dp = Dispatcher()
 
 
-# ── Хранилище промптов ──────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════
+# БЛОК ПРОМПТОВ (Шаблоны для нейросети)
+# ═══════════════════════════════════════════════════════════════════
+# Бизнес-правило: у агентства несколько типов встреч. Каждый тип —
+# свой промпт (шаблон саммари). Например, "ежедневный Совет Директоров"
+# формирует строгий отчёт по разделам: операционные вопросы, кадры, 
+# коммерция, приоритеты. Промпт сопоставляется с конспектом по первому
+# слову названия.
 
 PROMPTS_FILE = Path(__file__).parent / "prompts.json"
 
 
 def _load_prompts() -> dict[str, str]:
-    """Загружает промпты из JSON-файла."""
+    """Загружает промпты пользователя: {тема: текст шаблона}."""
     if not PROMPTS_FILE.exists():
         return {}
     try:
@@ -322,13 +418,17 @@ def _load_prompts() -> dict[str, str]:
 
 
 def _save_prompts(prompts: dict[str, str]):
-    """Сохраняет промпты в JSON-файл."""
+    """Сохраняет промпты. Каждый промпт — это system_prompt для нейросети."""
     with open(PROMPTS_FILE, "w", encoding="utf-8") as f:
         json.dump(prompts, f, ensure_ascii=False, indent=2)
 
 
 def _format_prompt_list() -> str:
-    """Возвращает список промптов с командами управления."""
+    """
+    Форматирует список промптов с командами управления для отправки в Telegram.
+    Бизнес-правило: показываем пользователю не просто список, а сразу
+    кнопки действий — чтобы не пришлось запоминать команды.
+    """
     prompts = _load_prompts()
     lines = ["📜 **Мои промпты**"]
     lines.append("")
@@ -347,7 +447,11 @@ def _format_prompt_list() -> str:
 
 
 def _prompt_keyboard() -> InlineKeyboardMarkup:
-    """Инлайн-клавиатура с кнопками команд группы промптов."""
+    """
+    Инлайн-клавиатура для управления промптами.
+    Бизнес-правило: кнопки удобнее, чем запоминать команды.
+    Пользователь видит список и тут же может нажать «Добавить» или «Удалить».
+    """
     return InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="➕ Добавить", callback_data="prompt:add"),
@@ -361,7 +465,11 @@ def _prompt_keyboard() -> InlineKeyboardMarkup:
 
 
 def _first_prompt_keyboard() -> InlineKeyboardMarkup:
-    """Кнопки Да/Нет для добавления первого промпта."""
+    """
+    Кнопки Да/Нет для онбординга: когда промптов ещё нет,
+    предлагаем пользователю создать первый.
+    Бизнес-правило: пустой список — не тупик, а точка старта.
+    """
     return InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="➕ Да, добавить", callback_data="first_prompt:yes"),
@@ -374,16 +482,21 @@ def _first_prompt_keyboard() -> InlineKeyboardMarkup:
 
 @dp.callback_query(lambda c: c.data and c.data.startswith("prompt:"))
 async def prompt_buttons_callback(callback: CallbackQuery, state: FSMContext):
-    """Обрабатывает нажатия кнопок промптов."""
+    """
+    Обрабатывает нажатия инлайн-кнопок управления промптами.
+    Каждая кнопка запускает соответствующий FSM-диалог.
+    """
     action = callback.data.split(":", 1)[1]
     await callback.answer()  # убираем "часики" на кнопке
     message = callback.message
 
     if action == "add":
+        # Начинаем диалог добавления: шаг 1 — тема
         await message.answer("📝 Введите **тему** нового промпта:", parse_mode=ParseMode.MARKDOWN)
         await state.set_state(AddPromptState.topic)
 
     elif action == "edit":
+        # Показываем список доступных промптов и предлагаем выбрать
         prompts = _load_prompts()
         if not prompts:
             await message.answer(
@@ -401,6 +514,7 @@ async def prompt_buttons_callback(callback: CallbackQuery, state: FSMContext):
         await state.set_state(EditPromptState.topic)
 
     elif action == "text":
+        # Показываем список и предлагаем выбрать промпт для просмотра
         prompts = _load_prompts()
         if not prompts:
             await message.answer(
@@ -417,6 +531,7 @@ async def prompt_buttons_callback(callback: CallbackQuery, state: FSMContext):
         await state.set_state(GetPromptState.topic)
 
     elif action == "delete":
+        # Показываем список и предлагаем выбрать промпт для удаления
         prompts = _load_prompts()
         if not prompts:
             await message.answer(
@@ -438,7 +553,11 @@ async def prompt_buttons_callback(callback: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(lambda c: c.data and c.data.startswith("first_prompt:"))
 async def first_prompt_callback(callback: CallbackQuery, state: FSMContext):
-    """Обрабатывает нажатия кнопок "Да, добавить" / "Нет" при пустом списке промптов."""
+    """
+    Обрабатывает ответ "Да, добавить" / "Нет" при пустом списке промптов.
+    Бизнес-правило: пользователь не должен вводить текст "да" — 
+    достаточно нажать кнопку.
+    """
     action = callback.data.split(":", 1)[1]
     await callback.answer()
     message = callback.message
@@ -457,32 +576,42 @@ async def first_prompt_callback(callback: CallbackQuery, state: FSMContext):
         await state.clear()
 
 
-# ── FSM: Состояния диалогов ─────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════
+# БЛОК FSM (Finite State Machine — Диалоговые состояния)
+# ═══════════════════════════════════════════════════════════════════
+# aiogram использует FSM для многошаговых форм. Когда пользователь
+# вводит команду /add_prompt, бот переходит в состояние AddPromptState.topic,
+# ждёт тему, потом запрашивает текст и т.д.
 
 class AddPromptState(StatesGroup):
+    """Добавление промпта: шаг 1 = тема, шаг 2 = текст"""
     topic = State()
     text = State()
 
 
 class GetPromptState(StatesGroup):
+    """Просмотр промпта: шаг 1 = выбор темы/номера"""
     topic = State()
 
 
 class DeletePromptState(StatesGroup):
+    """Удаление промпта: шаг 1 = выбор темы/номера"""
     topic = State()
 
 
 class AskAddFirstPrompt(StatesGroup):
-    """Спрашивает, хочет ли пользователь добавить первый промпт."""
+    """Онбординг: спрашиваем пользователя, хочет ли он создать первый промпт"""
     waiting = State()
 
 
 class EditPromptState(StatesGroup):
+    """Редактирование промпта: шаг 1 = тема, шаг 2 = новый текст"""
     topic = State()
     text = State()
 
 
 class SetupState(StatesGroup):
+    """Настройка IMAP: 4 шага — email → сервер → логин → пароль"""
     email = State()
     server = State()
     login = State()
@@ -490,10 +619,18 @@ class SetupState(StatesGroup):
 
 
 class AiSetupState(StatesGroup):
+    """Настройка AI-провайдера: выбор провайдера → API key → модель"""
     provider = State()
     api_key = State()
     model = State()
 
+
+# ═══════════════════════════════════════════════════════════════════
+# БЛОК AI-ПРОВАЙДЕРОВ
+# ═══════════════════════════════════════════════════════════════════
+# Бизнес-требование: пользователь может выбрать любого провайдера
+# с OpenAI-совместимым API. Предустановлены OpenRouter, Hermes/Nous, 
+# OpenAI — плюс возможность указать свой endpoint.
 
 AI_PROVIDERS = {
     "openrouter": {
@@ -521,7 +658,7 @@ AI_PROVIDER_EMOJI = {
 
 
 def _ai_provider_keyboard() -> InlineKeyboardMarkup:
-    """Клавиатура выбора AI-провайдера."""
+    """Клавиатура выбора AI-провайдера при настройке /setup_ai."""
     kb = []
     for key, info in AI_PROVIDERS.items():
         emoji = AI_PROVIDER_EMOJI.get(key, "⚙️")
@@ -537,10 +674,24 @@ def _ai_provider_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=kb)
 
 
-# ── Клавиатура Саммари ────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════
+# БЛОК КНОПОК САММАРИ
+# ═══════════════════════════════════════════════════════════════════
+# Бизнес-логика: когда бот показывает список конспектов, под каждым
+# письмом находится кнопка. Если название конспекта начинается со слова,
+# совпадающего с темой промпта — кнопка зелёная "Саммари". 
+# Если промпт не найден — жёлтая "Выбрать промпт" с предложением создать.
+
 
 def _get_item_button(idx: int, display: str) -> InlineKeyboardMarkup | None:
-    """Возвращает inline-клавиатуру с одной кнопкой для пункта списка."""
+    """
+    Создаёт кнопку под конспектом: 🟢 Саммари (если есть подходящий промпт)
+    или 🟡 Выбрать промпт (если нет).
+    
+    Бизнес-правило сопоставления: название конспекта должно начинаться
+    с темы промпта (без учёта регистра). Например, промпт "План развития"
+    подойдёт к конспекту "План развития на Q2".
+    """
     prompts = _load_prompts()
     if not prompts:
         return None
@@ -571,8 +722,15 @@ def _get_item_button(idx: int, display: str) -> InlineKeyboardMarkup | None:
 
 @dp.callback_query(lambda c: c.data and c.data.startswith("summary:"))
 async def summary_callback(callback: CallbackQuery, state: FSMContext):
-    """Обрабатывает нажатие кнопки Саммари.
-    Формат callback_data: summary:IDX:PROMPT_TOPIC"""
+    """
+    Когда пользователь нажимает 🟢 Саммари #N:
+    - Берём txt-содержимое конспекта из кеша
+    - Берём текст промпта (шаблон саммари)
+    - Отправляем в нейросеть через call_ai()
+    - Показываем результат
+    
+    Формат callback_data: summary:IDX:PROMPT_TOPIC
+    """
     parts = callback.data.split(":", 2)
     if len(parts) < 3:
         await callback.answer("❌ Ошибка данных", show_alert=True)
@@ -583,7 +741,7 @@ async def summary_callback(callback: CallbackQuery, state: FSMContext):
 
     user_id = callback.from_user.id
 
-    # Загружаем из кеша
+    # Загружаем из кеша — конспекты с txt-содержимым
     items = _load_notes_cache(user_id)
     if idx < 0 or idx >= len(items):
         await callback.message.answer("❌ Конспект устарел. Запросите /list заново.")
@@ -602,13 +760,13 @@ async def summary_callback(callback: CallbackQuery, state: FSMContext):
         await callback.message.answer("❌ В письме не найден текст конспекта (txt-вложение).")
         return
 
-    # Показываем статус
+    # Показываем статус — нейросеть может думать до минуты
     status_msg = await callback.message.answer(
         f"⏳ Обрабатываю «{display}» через нейросеть...",
         parse_mode=ParseMode.MARKDOWN,
     )
 
-    # Вызываем AI
+    # Вызываем AI: system_prompt = текст промпта, user_text = конспект
     system_prompt = prompt_text
     user_text = f"Конспект встречи: «{display}»\n\n{txt_content}"
     result = await call_ai(user_id, system_prompt, user_text)
@@ -619,14 +777,15 @@ async def summary_callback(callback: CallbackQuery, state: FSMContext):
     except Exception:
         pass
 
-    # Выводим результат
+    # Выводим результат с заголовком
     header = f"🧠 **Саммари: {display}**\n\n---\n\n"
     full_text = header + result
 
+    # Telegram не принимает >4000 символов — режем
     if len(full_text) <= 4000:
         await callback.message.answer(full_text, parse_mode=ParseMode.MARKDOWN)
     else:
-        # Разбиваем на части
+        # Разбиваем на части: заголовок отдельно, текст кусками
         await callback.message.answer(header, parse_mode=ParseMode.MARKDOWN)
         for i in range(0, len(result), 3500):
             await callback.message.answer(result[i:i + 3500])
@@ -634,7 +793,13 @@ async def summary_callback(callback: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(lambda c: c.data and c.data.startswith("choose_prompt:"))
 async def choose_prompt_callback(callback: CallbackQuery, state: FSMContext):
-    """Обрабатывает нажатие кнопки Выбрать промпт."""
+    """
+    Когда пользователь нажимает 🟡 Выбрать промпт #N — предлагаем
+    создать подходящий промпт для этого типа конспекта.
+    
+    Бизнес-правило: подсказываем первое слово из названия конспекта
+    как тему нового промпта.
+    """
     parts = callback.data.split(":", 1)
     if len(parts) < 2:
         await callback.answer("❌ Ошибка данных", show_alert=True)
@@ -658,14 +823,21 @@ async def choose_prompt_callback(callback: CallbackQuery, state: FSMContext):
     )
 
 
+# ═══════════════════════════════════════════════════════════════════
+# КОМАНДЫ TELEGRAM — ПРОМПТЫ
+# ═══════════════════════════════════════════════════════════════════
+
+
 # ── Команда /prompt ─────────────────────────────────────────
 
 @dp.message(Command("prompt", "промпт", "промпты"))
 async def cmd_list_prompts(message: Message, state: FSMContext, command: CommandObject):
-    """Выводит список всех промптов и команды управления.
-       Поддерживает подкоманды: /prompt add, edit, text, delete"""
+    """Выводит список всех промптов с кнопками управления.
+       Поддерживает подкоманды: /prompt add, edit, text, delete.
+       Бизнес-правило: разные способы ввода — /prompt add (для тех,
+       кто знает), /add_prompt (прямая команда), кнопки (для всех)."""
 
-    # Проверяем подкоманды
+    # Проверяем подкоманды — пользователь может написать /prompt add
     if command.args:
         sub = command.args.strip().lower()
         if sub == "add":
@@ -752,7 +924,8 @@ async def cmd_list_prompts(message: Message, state: FSMContext, command: Command
 
 @dp.message(AskAddFirstPrompt.waiting)
 async def ask_add_first_prompt(message: Message, state: FSMContext):
-    """Обрабатывает ответ Да/Нет на предложение добавить первый промпт."""
+    """Обрабатывает текстовый ответ Да/Нет на предложение добавить первый промпт.
+       Используется, если пользователь не нажал инлайн-кнопку, а напечатал текст."""
     answer = message.text.strip().lower()
     if answer in ("да", "yes", "lf", "д", "y"):
         await state.set_state(AddPromptState.topic)
@@ -777,13 +950,17 @@ async def cmd_add_prompt_start(message: Message, state: FSMContext):
 
 @dp.message(AddPromptState.topic)
 async def add_prompt_topic(message: Message, state: FSMContext):
-    """Сохраняет тему и запрашивает текст промпта."""
+    """
+    Сохраняет тему промпта и запрашивает текст (шаблон саммари).
+    Бизнес-правило: темы промптов должны быть уникальны — это ключ
+    для сопоставления с конспектами.
+    """
     topic = message.text.strip()
     if not topic:
         await message.answer("⚠️ Тема не может быть пустой. Введите тему:")
         return
 
-    # Проверяем, нет ли уже такой темы
+    # Проверяем уникальность темы
     prompts = _load_prompts()
     if topic in prompts:
         await message.answer(
@@ -805,7 +982,11 @@ async def add_prompt_topic(message: Message, state: FSMContext):
 
 @dp.message(AddPromptState.text)
 async def add_prompt_text(message: Message, state: FSMContext):
-    """Сохраняет текст промпта и завершает диалог."""
+    """
+    Сохраняет текст промпта.
+    Бизнес-правило: после сохранения показываем обновлённый список,
+    чтобы пользователь видел результат.
+    """
     text = message.text.strip()
     if not text:
         await message.answer("⚠️ Текст промпта не может быть пустым. Введите текст:")
@@ -835,8 +1016,11 @@ async def add_prompt_text(message: Message, state: FSMContext):
 @dp.message(Command("text_prompt", "prompt_text"))
 async def cmd_text_prompt_start(message: Message, state: FSMContext):
     """
-    /text_prompt <номер> — сразу показывает текст промпта по номеру
+    /text_prompt <номер> — сразу показывает текст промпта (без диалога)
     /text_prompt — диалог: спрашивает тему
+    
+    Бизнес-правило: power user может написать /text_prompt 3 и сразу
+    получить текст. Новичок вводит /text_prompt и выбирает из списка.
     """
     prompts = _load_prompts()
     if not prompts:
@@ -850,12 +1034,13 @@ async def cmd_text_prompt_start(message: Message, state: FSMContext):
 
     sorted_topics = sorted(prompts.keys())
 
-    # Пробуем распарсить номер из команды
+    # Пробуем распарсить номер/тему из аргумента команды
     parts = message.text.strip().split(maxsplit=1)
     if len(parts) == 2:
         arg = parts[1].strip()
         try:
-            idx = int(arg) - 1  # конвертируем в 0-based
+            # Аргумент — число: ищем по индексу (1-based)
+            idx = int(arg) - 1
             if 0 <= idx < len(sorted_topics):
                 topic = sorted_topics[idx]
                 text = prompts[topic]
@@ -875,7 +1060,7 @@ async def cmd_text_prompt_start(message: Message, state: FSMContext):
                 )
                 return
         except ValueError:
-            # Аргумент — не число, возможно тема
+            # Аргумент — не число, возможно это тема промпта
             if arg in prompts:
                 text = prompts[arg]
                 full = f"📌 **{arg}**\n\n{text}"
@@ -889,7 +1074,7 @@ async def cmd_text_prompt_start(message: Message, state: FSMContext):
                     )
                 return
 
-    # Без аргументов — запускаем FSM диалог
+    # Без аргументов — запускаем FSM диалог выбора
     topics = "\n".join(f"• {t}" for t in sorted_topics)
     await message.answer(
         f"📜 **Доступные промпты:**\n{topics}\n\n"
@@ -901,7 +1086,10 @@ async def cmd_text_prompt_start(message: Message, state: FSMContext):
 
 @dp.message(GetPromptState.topic)
 async def text_prompt_show(message: Message, state: FSMContext):
-    """Показывает текст промпта по теме или номеру."""
+    """
+    Показывает текст промпта по теме или номеру (FSM-диалог).
+    Принимает как точное название темы, так и порядковый номер.
+    """
     arg = message.text.strip()
     prompts = _load_prompts()
     if not prompts:
@@ -912,7 +1100,7 @@ async def text_prompt_show(message: Message, state: FSMContext):
     sorted_topics = sorted(prompts.keys())
     topic: str | None = None
 
-    # Пробуем номер
+    # Сначала пробуем интерпретировать как номер
     try:
         idx = int(arg) - 1
         if 0 <= idx < len(sorted_topics):
@@ -920,11 +1108,12 @@ async def text_prompt_show(message: Message, state: FSMContext):
     except ValueError:
         pass
 
-    # Пробуем тему
+    # Если не номер — ищем по точному совпадению темы
     if topic is None and arg in prompts:
         topic = arg
 
     if topic is None:
+        # Ничего не нашли — показываем список и просим повторить
         topics = "\n".join(f"• {t}" for t in sorted_topics)
         await message.answer(
             f"⚠️ Не найдено. Доступные промпты:\n{topics}\n\n"
@@ -952,8 +1141,11 @@ async def text_prompt_show(message: Message, state: FSMContext):
 @dp.message(Command("delete_prompt", "prompt_delete"))
 async def cmd_delete_prompt_start(message: Message, state: FSMContext):
     """
-    /delete_prompt <номер> — сразу удаляет промпт по номеру
+    /delete_prompt <номер> — удаляет промпт без диалога
     /delete_prompt — диалог: спрашивает тему
+    
+    Бизнес-правило: после удаления показываем кнопки управления,
+    чтобы пользователь мог сразу добавить новый промпт.
     """
     prompts = _load_prompts()
     if not prompts:
@@ -967,7 +1159,7 @@ async def cmd_delete_prompt_start(message: Message, state: FSMContext):
 
     sorted_topics = sorted(prompts.keys())
 
-    # Пробуем распарсить номер из аргумента
+    # Пробуем распарсить номер/тему из аргумента
     parts = message.text.strip().split(maxsplit=1)
     if len(parts) == 2:
         arg = parts[1].strip()
@@ -1013,7 +1205,7 @@ async def cmd_delete_prompt_start(message: Message, state: FSMContext):
 
 @dp.message(DeletePromptState.topic)
 async def delete_prompt_confirm(message: Message, state: FSMContext):
-    """Удаляет промпт по теме или номеру."""
+    """Удаляет промпт по теме или номеру (FSM-диалог)."""
     arg = message.text.strip()
     prompts = _load_prompts()
     if not prompts:
@@ -1065,8 +1257,11 @@ async def delete_prompt_confirm(message: Message, state: FSMContext):
 @dp.message(Command("edit_prompt", "prompt_edit"))
 async def cmd_edit_prompt_start(message: Message, state: FSMContext):
     """
-    /edit_prompt <номер> — сразу запрашивает новый текст для промпта по номеру
-    /edit_prompt — диалог: спрашивает тему
+    /edit_prompt <номер> — сразу запрашивает новый текст для промпта
+    /edit_prompt — диалог: выбирает тему, потом запрашивает текст
+    
+    Бизнес-правило: перед вводом нового текста показываем старый (до 200 символов),
+    чтобы пользователь помнил, что он редактирует.
     """
     prompts = _load_prompts()
     if not prompts:
@@ -1080,7 +1275,7 @@ async def cmd_edit_prompt_start(message: Message, state: FSMContext):
 
     sorted_topics = sorted(prompts.keys())
 
-    # Пробуем распарсить номер из аргумента
+    # Пробуем распарсить номер/тему из аргумента
     parts = message.text.strip().split(maxsplit=1)
     if len(parts) == 2:
         arg = parts[1].strip()
@@ -1171,7 +1366,7 @@ async def edit_prompt_topic(message: Message, state: FSMContext):
 
 @dp.message(EditPromptState.text)
 async def edit_prompt_text(message: Message, state: FSMContext):
-    """Сохраняет новый текст промпта."""
+    """Сохраняет новый текст промпта и показывает обновлённый список."""
     new_text = message.text.strip()
     if not new_text:
         await message.answer("⚠️ Текст не может быть пустым. Введите текст:")
@@ -1197,10 +1392,19 @@ async def edit_prompt_text(message: Message, state: FSMContext):
     await message.answer(text, parse_mode=ParseMode.MARKDOWN, reply_markup=_prompt_keyboard())
 
 
+# ═══════════════════════════════════════════════════════════════════
+# КОМАНДЫ TELEGRAM — НАСТРОЙКА И ОСНОВНЫЕ
+# ═══════════════════════════════════════════════════════════════════
+
+
 # ── Команда /init — сброс и повторная настройка ────────────────
 
 async def _start_init(message: Message, state: FSMContext):
-    """Очищает настройки пользователя и запускает 4-шаговую настройку заново."""
+    """
+    Очищает настройки пользователя и запускает 4-шаговую настройку заново.
+    Бизнес-правило: если сменился пароль от почты или нужно переподключиться —
+    /init полностью очищает старые данные и начинает с нуля.
+    """
     user_id = message.from_user.id
 
     # Очищаем старые настройки
@@ -1219,7 +1423,9 @@ async def _start_init(message: Message, state: FSMContext):
 
 
 def _help_text() -> str:
-    """Возвращает полный текст справки."""
+    """Возвращает полный текст справки по всем командам бота.
+       Бизнес-правило: /help — это единый исчерпывающий справочник,
+       не разбитый на подкоманды. Все команды видны сразу."""
     return (
         "📚 **Полная справка по командам**\n\n"
         "🔧 **── Настройка ──**\n\n"
@@ -1284,6 +1490,10 @@ async def cmd_init(message: Message, state: FSMContext):
 
 @dp.message(Command("start"))
 async def cmd_start(message: Message, state: FSMContext):
+    """
+    Команда /start: если пользователь новый — сразу запускаем онбординг.
+    Если уже настроен — показываем приветствие и советуем /help.
+    """
     user_id = message.from_user.id
     config = get_user_config(user_id)
     if not config:
@@ -1308,8 +1518,17 @@ async def cmd_help(message: Message):
     await message.answer(_help_text(), parse_mode=ParseMode.MARKDOWN)
 
 
+# ── Команда /list (только непрочитанные) ─────────────────────
+
 @dp.message(Command("get_notes", "list", "конспекты", "конспект"))
 async def cmd_get_notes(message: Message):
+    """
+    /list — показывает НЕПРОЧИТАННЫЕ конспекты встреч.
+    
+    Бизнес-процесс: рекрутер нажимает /list, видит только письма,
+    которые пришли после его последнего визита. Письма НЕ помечаются
+    прочитанными — можно перепроверить в веб-почте.
+    """
     user = message.from_user
     logger.info("UNSEEN запрос от @%s", user.username or user.id)
 
@@ -1345,12 +1564,13 @@ async def cmd_get_notes(message: Message):
 
     await sent.delete()
 
-    # Сохраняем в кеш для кнопки Саммари
+    # Сохраняем txt-содержимое в кеш — нужно для кнопки Саммари
     _save_notes_cache(user.id, items)
 
     total = len(items)
     await message.answer(f"📋 **Новые конспекты встреч** — всего {total}", parse_mode=ParseMode.MARKDOWN)
 
+    # Каждый конспект — отдельное сообщение с собственной кнопкой
     for idx, (dt, display, _txt) in enumerate(items, 1):
         date_str = dt.strftime("%d.%m.%Y %H:%M")
         text = f"**{idx}.** {display}\n📅 {date_str}"
@@ -1358,8 +1578,14 @@ async def cmd_get_notes(message: Message):
         await message.answer(text, parse_mode=ParseMode.MARKDOWN, reply_markup=button)
 
 
+# ── Команда /list_all (все за неделю) ────────────────────────
+
 @dp.message(Command("list_all", "все_конспекты"))
 async def cmd_list_all(message: Message):
+    """
+    /list_all — показывает ВСЕ конспекты за последние 7 дней.
+    В отличие от /list — не фильтрует по UNSEEN.
+    """
     user = message.from_user
     logger.info("ALL WEEK запрос от @%s", user.username or user.id)
 
@@ -1406,7 +1632,13 @@ async def cmd_list_all(message: Message):
         await message.answer(text, parse_mode=ParseMode.MARKDOWN, reply_markup=button)
 
 
-# ── Команда /setup ────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════
+# КОМАНДА /setup — НАСТРОЙКА IMAP
+# ═══════════════════════════════════════════════════════════════════
+# Бизнес-процесс: пользователь вводит 4 параметра для подключения к почте.
+# После каждого шага показываем текущее значение (если это перенастройка).
+# Пустой Enter сохраняет старое значение — удобно, когда меняется только
+# пароль, а email и сервер те же.
 
 @dp.message(Command("setup"))
 async def cmd_setup_start(message: Message, state: FSMContext, command: CommandObject):
@@ -1430,7 +1662,11 @@ async def cmd_setup_start(message: Message, state: FSMContext, command: CommandO
 
 @dp.message(SetupState.email)
 async def setup_email(message: Message, state: FSMContext):
-    """Сохраняет email (или оставляет старый при пустом вводе) и запрашивает IMAP-сервер."""
+    """
+    Шаг 1: Email.
+    Если пользователь ввёл пустую строку и у него уже был сохранён email —
+    оставляем старый. Это позволяет менять только пароль, не перепечатывая всё.
+    """
     email = message.text.strip()
     if not email:
         # Пустой ввод — оставляем старое значение
@@ -1460,7 +1696,10 @@ async def setup_email(message: Message, state: FSMContext):
 
 @dp.message(SetupState.server)
 async def setup_server(message: Message, state: FSMContext):
-    """Сохраняет сервер (или оставляет старый при пустом вводе) и запрашивает логин."""
+    """
+    Шаг 2: IMAP-сервер.
+    Проверяем, что сервер содержит точку (например, imap.yandex.ru).
+    """
     server = message.text.strip()
     if not server or "." not in server:
         config = get_user_config(message.from_user.id)
@@ -1486,7 +1725,11 @@ async def setup_server(message: Message, state: FSMContext):
 
 @dp.message(SetupState.login)
 async def setup_login(message: Message, state: FSMContext):
-    """Сохраняет логин (или оставляет старый при пустом вводе) и запрашивает пароль."""
+    """
+    Шаг 3: Логин.
+    Обычно совпадает с email, но почтовые серверы могут требовать
+    имя пользователя без @домен.
+    """
     login = message.text.strip()
     if not login:
         config = get_user_config(message.from_user.id)
@@ -1512,7 +1755,11 @@ async def setup_login(message: Message, state: FSMContext):
 
 @dp.message(SetupState.password)
 async def setup_password(message: Message, state: FSMContext):
-    """Сохраняет пароль (или оставляет старый при пустом вводе), проверяет подключение и завершает."""
+    """
+    Шаг 4: Пароль приложения.
+    После ввода проверяем IMAP-подключение. Если всё ОК — сохраняем.
+    Если ошибка — сообщаем пользователю и даём попробовать снова через /setup.
+    """
     password = message.text.strip()
     if not password:
         config = get_user_config(message.from_user.id)
@@ -1528,7 +1775,7 @@ async def setup_password(message: Message, state: FSMContext):
     login = data.get("login", "")
     user_id = message.from_user.id
 
-    # Проверяем подключение
+    # Проверяем подключение — лучше ошибиться здесь, чем при /list
     status = await message.answer("🔄 Проверяю подключение...")
     try:
         test_server = imaplib.IMAP4_SSL(server, 993)
@@ -1568,10 +1815,11 @@ async def setup_password(message: Message, state: FSMContext):
         parse_mode=ParseMode.MARKDOWN,
     )
 
-    # Автоматически показываем справку
+    # Автоматически показываем справку — чтобы новый пользователь
+    # сразу видел, какие команды доступны.
     await message.answer(_help_text(), parse_mode=ParseMode.MARKDOWN)
 
-    # Спрашиваем, хочет ли пользователь настроить AI
+    # Спрашиваем, хочет ли пользователь настроить AI для Саммари
     await message.answer(
         "🤖 Хотите настроить подключение к нейросети?\n"
         "Это нужно для функции «Саммари».",
@@ -1585,20 +1833,26 @@ async def setup_password(message: Message, state: FSMContext):
     )
 
 
-# ── Кеш конспектов (для кнопки Саммари) ───────────────────
+# ═══════════════════════════════════════════════════════════════════
+# КЕШ КОНСПЕКТОВ (для кнопки Саммари)
+# ═══════════════════════════════════════════════════════════════════
+# Когда пользователь нажимает "Саммари #3" — у нас уже нет контекста
+# того /list, который он вызвал 5 минут назад. Поэтому txt-содержимое
+# каждого конспекта сохраняется в notes_cache.json сразу после /list.
+# Кнопка загружает конспект из кеша и отправляет в нейросеть.
 
 NOTES_CACHE_FILE = Path(__file__).parent / "notes_cache.json"
 
 
 def _save_notes_cache(user_id: int, items: list):
-    """Сохраняет список конспектов с txt-содержимым в кеш."""
+    """Сохраняет конспекты (с txt-содержимым) в кеш после /list или /list_all."""
     cache = {}
     if NOTES_CACHE_FILE.exists():
         try:
             cache = json.loads(NOTES_CACHE_FILE.read_text(encoding="utf-8"))
         except Exception:
             cache = {}
-    # Сериализуем datetime -> str
+    # Сериализуем datetime -> str, т.к. JSON не умеет в datetime
     serialized = []
     for dt, display, txt in items:
         serialized.append({
@@ -1626,12 +1880,25 @@ def _load_notes_cache(user_id: int) -> list:
     return items
 
 
-# ── Универсальная функция вызова нейросети ──────────────────
+# ═══════════════════════════════════════════════════════════════════
+# ФУНКЦИЯ ВЫЗОВА НЕЙРОСЕТИ (call_ai)
+# ═══════════════════════════════════════════════════════════════════
+# Универсальный вызов любого OpenAI-совместимого API.
+# Поддерживает OpenRouter, OpenAI, DeepSeek, vLLM и т.д.
 
 async def call_ai(user_id: int, system_prompt: str, user_text: str) -> str:
-    """Вызывает нейросеть через OpenAI-совместимый API.
+    """
+    Вызывает нейросеть через OpenAI-совместимый API.
     Настройки (endpoint, api_key, model) берутся из users.json для user_id.
-    Возвращает ответ ассистента или текст ошибки."""
+    
+    Бизнес-правила:
+    - Всегда возвращает строку (ответ или ошибку) — никогда не падает
+    - Таймаут 120 секунд — длинные конспекты требуют времени
+    - Для OpenRouter отправляет HTTP-Referer (требование их ToS)
+    
+    Returns:
+        str — ответ нейросети или сообщение об ошибке, начинающееся с ❌
+    """
     ai_config = get_ai_config(user_id)
     if not ai_config:
         return "❌ AI не настроен. Используйте `/setup_ai`"
@@ -1678,11 +1945,16 @@ async def call_ai(user_id: int, system_prompt: str, user_text: str) -> str:
         return f"❌ Ошибка: {e}"
 
 
-# ── Команда /setup_ai — настройка нейросети ────────────────
+# ═══════════════════════════════════════════════════════════════════
+# КОМАНДА /setup_ai — НАСТРОЙКА НЕЙРОСЕТИ
+# ═══════════════════════════════════════════════════════════════════
 
 @dp.callback_query(lambda c: c.data and c.data.startswith("ai_after_setup:"))
 async def ai_after_setup_callback(callback: CallbackQuery, state: FSMContext):
-    """Обрабатывает ответ на вопрос «настроить AI?» после IMAP setup."""
+    """
+    Обрабатывает ответ на вопрос «настроить AI?» после завершения IMAP setup.
+    Если пользователь нажал "Да" — запускаем /setup_ai.
+    """
     action = callback.data.split(":", 1)[1]
     await callback.answer()
     try:
@@ -1715,12 +1987,17 @@ async def cmd_setup_ai(message: Message, state: FSMContext):
 
 @dp.callback_query(lambda c: c.data and c.data.startswith("ai_provider:"))
 async def ai_provider_callback(callback: CallbackQuery, state: FSMContext):
-    """Обрабатывает выбор провайдера AI."""
+    """
+    Обрабатывает выбор AI-провайдера.
+    Если выбран предустановленный — endpoint известен, просим только API key.
+    Если "Свой вариант" — сначала endpoint, потом API key, потом модель.
+    """
     provider_key = callback.data.split(":", 1)[1]
     await callback.answer()
     await callback.message.delete()
 
     if provider_key == "custom":
+        # Свой endpoint: сохраняем пустой endpoint, просим ввести URL
         await state.update_data(ai_endpoint="", ai_provider_label="Свой вариант")
         await callback.message.answer(
             "🔗 Введите **API Endpoint URL**:\n\n"
@@ -1754,7 +2031,10 @@ async def ai_provider_callback(callback: CallbackQuery, state: FSMContext):
 
 @dp.message(AiSetupState.api_key)
 async def ai_setup_apikey(message: Message, state: FSMContext):
-    """Сохраняет API key и запрашивает модель."""
+    """
+    Сохраняет API key и запрашивает модель.
+    Если endpoint ещё не задан (custom путь) — сначала endpoint, потом модель.
+    """
     api_key = message.text.strip()
     if not api_key:
         await message.answer("⚠️ API Key не может быть пустым. Введите ключ:")
@@ -1771,9 +2051,7 @@ async def ai_setup_apikey(message: Message, state: FSMContext):
             "Например: `https://api.openai.com/v1`",
             parse_mode=ParseMode.MARKDOWN,
         )
-        # Перенаправляем на тот же state, но с флагом что api_key уже есть
         await state.set_state(AiSetupState.model)
-        # Сохраняем флаг что нужно спросить endpoint
         await state.update_data(_need_endpoint=True)
         return
 
@@ -1796,7 +2074,10 @@ async def ai_setup_apikey(message: Message, state: FSMContext):
 
 @dp.message(AiSetupState.model)
 async def ai_setup_model(message: Message, state: FSMContext):
-    """Сохраняет модель, завершает настройку AI."""
+    """
+    Сохраняет модель и завершает настройку AI.
+    Если был выбран custom путь — сначала получаем endpoint (через _need_endpoint).
+    """
     model = message.text.strip()
     if not model:
         await message.answer("⚠️ Название модели не может быть пустым. Введите модель:")
@@ -1806,10 +2087,9 @@ async def ai_setup_model(message: Message, state: FSMContext):
     api_key = data.get("ai_api_key", "")
     endpoint = data.get("ai_endpoint", "")
 
-    # Если endpoint ещё не задан (custom путь)
+    # Если endpoint ещё не задан (custom путь) — текущее сообщение это endpoint
     need_endpoint = data.get("_need_endpoint", False)
     if need_endpoint:
-        # Текущее сообщение — это endpoint, а не модель
         endpoint = model
         model = ""
         await state.update_data(ai_endpoint=endpoint, _need_endpoint=False)
@@ -1822,7 +2102,6 @@ async def ai_setup_model(message: Message, state: FSMContext):
         return
 
     if not endpoint:
-        # Крайний случай — не должно произойти
         await message.answer("❌ Ошибка: не указан endpoint. Начните заново: `/setup_ai`")
         await state.clear()
         return
@@ -1842,11 +2121,18 @@ async def ai_setup_model(message: Message, state: FSMContext):
     )
 
 
-# ── Неизвестные команды ─────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════
+# НЕИЗВЕСТНЫЕ КОМАНДЫ
+# ═══════════════════════════════════════════════════════════════════
+# Этот хендлер должен быть последним — он ловит всё, что не обработали
+# другие команды.
 
 @dp.message()
 async def unknown_command(message: Message):
-    """Ловит любые сообщения, начинающиеся с /, которые не обработали другие хендлеры."""
+    """
+    Ловит любые сообщения, начинающиеся с /, которые не обработали
+    другие хендлеры. Показывает подсказку /help.
+    """
     if message.text and message.text.startswith("/") and len(message.text) > 1:
         logger.info("Неизвестная команда: %s", message.text.split()[0])
         await message.answer(
@@ -1854,7 +2140,9 @@ async def unknown_command(message: Message):
         )
 
 
-# ── Запуск ─────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════
+# ЗАПУСК
+# ═══════════════════════════════════════════════════════════════════
 
 async def main():
     logger.info("🤖 Бот конспектов встреч запускается...")
