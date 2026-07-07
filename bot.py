@@ -308,12 +308,13 @@ def _filter_and_extract(server, msg_ids: list[bytes]) -> list[tuple]:
     return matched
 
 
-def _format_list(matched: list[tuple[datetime, str]], title: str) -> str:
-    """Форматирует список конспектов в текст для отправки в Telegram."""
+def _format_list(matched: list[tuple[datetime, str, str]], title: str) -> str:
+    """Форматирует список конспектов в текст для отправки в Telegram.
+       Каждый элемент: (datetime, display_text, txt_content)."""
     lines: list[str] = []
     lines.append(f"{title} — всего {len(matched)}")
     lines.append("")
-    for idx, (_, display) in enumerate(matched, 1):
+    for idx, (_, display, _) in enumerate(matched, 1):
         lines.append(f"{idx}. {display}")
     return "\n".join(lines)
 
@@ -1425,32 +1426,33 @@ async def _start_init(message: Message, state: FSMContext):
 def _help_text() -> str:
     """Возвращает полный текст справки по всем командам бота.
        Бизнес-правило: /help — это единый исчерпывающий справочник,
-       не разбитый на подкоманды. Все команды видны сразу."""
+       не разбитый на подкоманды. Все команды видны сразу.
+       Команды с модификаторами (/setup init, /prompt add) идут первыми."""
     return (
         "📚 **Полная справка по командам**\n\n"
         "🔧 **── Настройка ──**\n\n"
-        "`/setup`\n"
-        "  Настройка IMAP-подключения к почте.\n"
-        "  4 шага: Email → IMAP-сервер → Логин → Пароль.\n"
-        "  После ввода проверяет подключение и сохраняет.\n\n"
         "`/init` или `/setup init`\n"
         "  **Сбросить** все настройки почты и настроить\n"
         "  заново. Полностью очищает email, IMAP, логин\n"
         "  и пароль, после чего запускает 4 шага настройки.\n\n"
         "  При первом запуске бота команда `/start`\n"
         "  автоматически запускает `/init`.\n\n"
+        "`/setup`\n"
+        "  Настройка IMAP-подключения к почте.\n"
+        "  4 шага: Email → IMAP-сервер → Логин → Пароль.\n"
+        "  После ввода проверяет подключение и сохраняет.\n\n"
         "`/setup_ai` или `/setup_llm`\n"
         "  Настройка подключения к нейросети.\n"
         "  Выбор провайдера (OpenRouter, Hermes/Nous,\n"
         "  OpenAI, свой вариант) → API Key → Модель.\n"
         "  Нужно для функции «Саммари».\n\n"
         "📬 **── Конспекты встреч ──**\n\n"
+        "`/list_all` или `/все_конспекты`\n"
+        "  Показать **все** конспекты за последние 7 дней.\n\n"
         "`/list` или `/конспекты`\n"
         "  Показать только **непрочитанные** конспекты.\n"
         "  Флаг UNSEEN НЕ снимается — письма остаются\n"
         "  непрочитанными в почте.\n\n"
-        "`/list_all` или `/все_конспекты`\n"
-        "  Показать **все** конспекты за последние 7 дней.\n\n"
         "🤖 **── Промпты (для нейросети) ──**\n\n"
         "`/prompt` или `/промпты`\n"
         "  Список всех сохранённых промптов\n"
@@ -1664,19 +1666,13 @@ async def cmd_setup_start(message: Message, state: FSMContext, command: CommandO
 async def setup_email(message: Message, state: FSMContext):
     """
     Шаг 1: Email.
-    Если пользователь ввёл пустую строку и у него уже был сохранён email —
-    оставляем старый. Это позволяет менять только пароль, не перепечатывая всё.
+    Пользователь обязан ввести email. Пустой ввод не допускается.
     """
     email = message.text.strip()
     if not email:
-        # Пустой ввод — оставляем старое значение
-        config = get_user_config(message.from_user.id)
-        if config and config.get("email"):
-            email = config["email"]
-        else:
-            await message.answer("⚠️ Email не может быть пустым. Введите адрес электронной почты:")
-            return
-    elif "@" not in email:
+        await message.answer("⚠️ Email не может быть пустым. Введите адрес электронной почты:")
+        return
+    if "@" not in email:
         await message.answer("⚠️ Введите корректный email (например: ivan@example.ru):")
         return
     await state.update_data(email=email)
@@ -1687,8 +1683,7 @@ async def setup_email(message: Message, state: FSMContext):
         f"✅ Email: `{email}`\n\n"
         f"**IMAP-сервер** ({current}):\n"
         "Введите адрес IMAP-сервера\n"
-        "(например: `imap.yandex.ru`, `imap.mail.ru`):\n\n"
-        "💡 _Оставьте пустым, чтобы оставить текущее значение_",
+        "(например: `imap.yandex.ru`, `imap.mail.ru`):",
         parse_mode=ParseMode.MARKDOWN,
     )
     await state.set_state(SetupState.server)
@@ -1698,16 +1693,12 @@ async def setup_email(message: Message, state: FSMContext):
 async def setup_server(message: Message, state: FSMContext):
     """
     Шаг 2: IMAP-сервер.
-    Проверяем, что сервер содержит точку (например, imap.yandex.ru).
+    Пользователь обязан ввести сервер (например, imap.yandex.ru).
     """
     server = message.text.strip()
     if not server or "." not in server:
-        config = get_user_config(message.from_user.id)
-        if config and config.get("server"):
-            server = config["server"]
-        else:
-            await message.answer("⚠️ Введите корректный IMAP-сервер (например: imap.yandex.ru):\n\n💡 _Оставьте пустым, чтобы оставить текущее значение_")
-            return
+        await message.answer("⚠️ Введите корректный IMAP-сервер (например: imap.yandex.ru):")
+        return
     await state.update_data(server=server)
 
     config = get_user_config(message.from_user.id)
@@ -1716,8 +1707,7 @@ async def setup_server(message: Message, state: FSMContext):
         f"✅ Сервер: `{server}`\n\n"
         f"**Логин** ({current}):\n"
         "Введите логин для подключения к IMAP\n"
-        "(обычно совпадает с email):\n\n"
-        "💡 _Оставьте пустым, чтобы оставить текущее значение_",
+        "(обычно совпадает с email):",
         parse_mode=ParseMode.MARKDOWN,
     )
     await state.set_state(SetupState.login)
@@ -1727,17 +1717,12 @@ async def setup_server(message: Message, state: FSMContext):
 async def setup_login(message: Message, state: FSMContext):
     """
     Шаг 3: Логин.
-    Обычно совпадает с email, но почтовые серверы могут требовать
-    имя пользователя без @домен.
+    Пользователь обязан ввести логин. Пустой ввод не допускается.
     """
     login = message.text.strip()
     if not login:
-        config = get_user_config(message.from_user.id)
-        if config and config.get("login"):
-            login = config["login"]
-        else:
-            await message.answer("⚠️ Логин не может быть пустым. Введите логин:\n\n💡 _Оставьте пустым, чтобы оставить текущее значение_")
-            return
+        await message.answer("⚠️ Логин не может быть пустым. Введите логин:")
+        return
     await state.update_data(login=login)
 
     config = get_user_config(message.from_user.id)
@@ -1746,8 +1731,7 @@ async def setup_login(message: Message, state: FSMContext):
         f"✅ Логин: `{login}`\n\n"
         f"**Пароль** ({current}):\n"
         "Введите пароль приложения для IMAP\n"
-        "(для Яндекса — создайте пароль приложения в настройках почты):\n\n"
-        "💡 _Оставьте пустым, чтобы оставить текущее значение_",
+        "(для Яндекса — создайте пароль приложения в настройках почты):",
         parse_mode=ParseMode.MARKDOWN,
     )
     await state.set_state(SetupState.password)
@@ -1757,17 +1741,13 @@ async def setup_login(message: Message, state: FSMContext):
 async def setup_password(message: Message, state: FSMContext):
     """
     Шаг 4: Пароль приложения.
+    Пользователь обязан ввести пароль. Пустой ввод не допускается.
     После ввода проверяем IMAP-подключение. Если всё ОК — сохраняем.
-    Если ошибка — сообщаем пользователю и даём попробовать снова через /setup.
     """
     password = message.text.strip()
     if not password:
-        config = get_user_config(message.from_user.id)
-        if config and config.get("password"):
-            password = config["password"]
-        else:
-            await message.answer("⚠️ Пароль не может быть пустым. Введите пароль:\n\n💡 _Оставьте пустым, чтобы оставить текущее значение_")
-            return
+        await message.answer("⚠️ Пароль не может быть пустым. Введите пароль приложения:")
+        return
 
     data = await state.get_data()
     email = data.get("email", "")
