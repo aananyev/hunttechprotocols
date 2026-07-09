@@ -63,6 +63,9 @@ MAX_MSG_LEN = 3800
 # Файл исключён из git — в нём пароли приложений от IMAP и API-ключи.
 USERS_FILE = Path(__file__).parent / "users.json"
 
+# NEW_COMMS_FILE stores conspect IDs already shown via /list new.
+NEW_COMMS_FILE = Path(__file__).parent / "new_comms.json"
+
 
 # ═══════════════════════════════════════════════════════════════════
 # БЛОК ХРАНЕНИЯ ДАННЫХ
@@ -74,6 +77,48 @@ USERS_FILE = Path(__file__).parent / "users.json"
 
 
 # ── Хранилище пользовательских настроек почты ─────────────────
+
+# ---- Storage for /list new already-shown IDs ---------------
+
+def _load_new_comms() -> dict:
+    """Load already-shown conspect IDs: {user_id: [msg_id1, ...]}"""
+    if not NEW_COMMS_FILE.exists():
+        return {}
+    try:
+        with open(NEW_COMMS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return data
+    except (json.JSONDecodeError, IOError):
+        pass
+    return {}
+
+
+def _save_new_comms(data: dict):
+    """Save shown conspect IDs."""
+    with open(NEW_COMMS_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def _mark_new_comms_shown(user_id: int, msg_ids: list[str]):
+    """Mark conspect IDs as already shown via /list new."""
+    data = _load_new_comms()
+    key = str(user_id)
+    if key not in data:
+        data[key] = []
+    existing = set(data[key])
+    for mid in msg_ids:
+        if mid not in existing:
+            data[key].append(mid)
+            existing.add(mid)
+    _save_new_comms(data)
+
+
+def _get_new_comms_for_user(user_id: int) -> set:
+    """Return set of already-shown conspect IDs for a user."""
+    data = _load_new_comms()
+    return set(data.get(str(user_id), []))
+
 
 def _load_users() -> dict:
     """Загружает учётные записи пользователей: {user_id: {email, server, port, password, ai?}}"""
@@ -384,6 +429,37 @@ def fetch_notes(user_id: int) -> tuple[str, list]:
         if not matched:
             return ("📭 Нет непрочитанных писем с темой «Конспект встречи».", [])
         return (_format_list(matched, "📋 **Новые конспекты встреч**"), matched)
+    finally:
+        server.close()
+        server.logout()
+
+
+def fetch_new_notes(user_id: int) -> tuple[str, list]:
+    """
+    Return conspects not yet shown via /list new.
+    IDs are saved in new_comms.json after display.
+    """
+    config = get_user_config(user_id)
+    if not config:
+        return ("Mail not configured. Use /setup.", [])
+    server = _connect_imap(config)
+    try:
+        typ, data = server.search(None, "UNSEEN")
+        all_ids = data[0].split() if data[0] else []
+        if not all_ids:
+            return ("No unread emails.", [])
+        matched = _filter_and_extract(server, all_ids)
+        if not matched:
+            return ("No new meeting notes.", [])
+        seen = _get_new_comms_for_user(user_id)
+        new_items = []
+        for dt, display, txt in matched:
+            uid = f"{dt.timestamp()}:{display}"
+            if uid not in seen:
+                new_items.append((dt, display, txt))
+        if not new_items:
+            return ("No new conspects since last check.", [])
+        return (_format_list(new_items, "New conspects (first time)"), new_items)
     finally:
         server.close()
         server.logout()
@@ -1703,6 +1779,16 @@ async def cmd_get_notes(message: Message):
     которые пришли после его последнего визита. Письма НЕ помечаются
     прочитанными — можно перепроверить в веб-почте.
     """
+    # Redirect /list new and /list all
+    if message.text and len(message.text.split()) > 1:
+        parts = message.text.strip().split(maxsplit=1)
+        if len(parts) == 2:
+            arg = parts[1].strip().lower()
+            if arg in ("new", "novye"):
+                return await cmd_list_new(message)
+            elif arg == "all":
+                return await cmd_list_all(message)
+
     user = message.from_user
     logger.info("UNSEEN запрос от @%s", user.username or user.id)
 
@@ -1755,6 +1841,55 @@ async def cmd_get_notes(message: Message):
 # ── Команда /list_all (все за неделю) ────────────────────────
 
 @dp.message(Command("list_all", "все_конспекты"))
+# ---- Command /list new (only not-yet-shown conspects) ------
+
+@dp.message(Command("list_new", "novye_konspekty"))
+async def cmd_list_new(message: Message):
+    """Show only conspects not yet displayed via /list new."""
+    user = message.from_user
+    logger.info("NEW NOTES request from @%s", user.username or user.id)
+
+    if not get_user_config(user.id):
+        await message.answer(
+            "Mail not configured yet. Use /setup.",
+        )
+        return
+
+    sent = await message.answer("Searching for new conspects...")
+
+    try:
+        _, items = fetch_new_notes(user.id)
+    except imaplib.IMAP4.error as e:
+        await sent.edit_text(f"IMAP error: {e}")
+        return
+    except Exception as e:
+        await sent.edit_text(f"Error: {e}")
+        import traceback
+        traceback.print_exc()
+        return
+
+    if not items:
+        await message.answer("No new conspects.")
+        await sent.delete()
+        return
+
+    await sent.delete()
+
+    msg_ids = [f"{dt.timestamp()}:{display}" for dt, display, _txt in items]
+    _mark_new_comms_shown(user.id, msg_ids)
+
+    _save_notes_cache(user.id, items)
+
+    total = len(items)
+    await message.answer(f"New conspects: {total} total", parse_mode=ParseMode.MARKDOWN)
+
+    for idx, (dt, display, _txt) in enumerate(items, 1):
+        date_str = dt.strftime("%d.%m.%Y %H:%M")
+        text = f"**{idx}.** {display}\n{date_str}"
+        button = _get_item_button(idx, display)
+        await message.answer(text, parse_mode=ParseMode.MARKDOWN, reply_markup=button)
+
+
 async def cmd_list_all(message: Message):
     """
     /list_all — показывает ВСЕ конспекты за последние 7 дней.
