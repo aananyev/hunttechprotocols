@@ -888,18 +888,12 @@ AI_PROVIDERS = {
         "endpoint": "https://api.openai.com/v1",
         "hint_model": "gpt-4o",
     },
-    "meta-llama": {
-        "label": "Meta Llama",
-        "endpoint": "https://openrouter.ai/api/v1",
-        "hint_model": "meta-llama/llama-4-maverick",
-    },
 }
 
 AI_PROVIDER_EMOJI = {
     "openrouter": "🟣",
     "hermes": "🟢",
     "openai": "🔵",
-    "meta-llama": "🟠",
 }
 
 
