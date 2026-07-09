@@ -2153,7 +2153,7 @@ async def cmd_start(message: Message, state: FSMContext):
     )
 
 
-@dp.message(Command("help", "htlp", "помощь", "команды"))
+@dp.message(Command("help", "помощь", "команды"))
 async def cmd_help(message: Message, command: CommandObject = None):
     """
     /help -- full help. /help <section> -- specific section.
