@@ -22,6 +22,10 @@ from email.utils import parsedate_to_datetime
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+import io
+import tempfile
+import zipfile
+import xml.etree.ElementTree as ET
 
 # ── Логирование ──────────────────────────────────────────────────
 # Логи нужны, чтобы отслеживать работу бота в фоне — кто и когда
@@ -816,9 +820,10 @@ async def first_prompt_callback(callback: CallbackQuery, state: FSMContext):
 # ждёт тему, потом запрашивает текст и т.д.
 
 class AddPromptState(StatesGroup):
-    """Добавление промпта: шаг 1 = тема, шаг 2 = текст"""
+    """Добавление промпта: шаг 1 = тема/файл, шаг 2 = текст, + ожидание темы из файла"""
     topic = State()
     text = State()
+    waiting_topic_from_file = State()
 
 
 class GetPromptState(StatesGroup):
@@ -1068,7 +1073,104 @@ async def choose_prompt_callback(callback: CallbackQuery, state: FSMContext):
 # ═══════════════════════════════════════════════════════════════════
 
 
-# ── Команда /prompt ─────────────────────────────────────────
+# ── Вспомогательные функции для загрузки файлов ──────────
+
+async def _extract_text_from_file(message: Message) -> str | None:
+    """Downloads and extracts text from an attached file.
+       Supported: txt, docx, pdf, rtf, doc, pages."""
+    if not message.document:
+        return None
+
+    file_name = message.document.file_name or "file"
+    ext = Path(file_name).suffix.lower()
+
+    try:
+        tg_file = await bot.get_file(message.document.file_id)
+        temp_dir = tempfile.mkdtemp()
+        local_path = Path(temp_dir) / file_name
+        await bot.download_file(tg_file.file_path, destination=str(local_path))
+    except Exception as e:
+        logger.error(f"Error downloading file: {e}")
+        return None
+
+    try:
+        if ext == ".txt":
+            text = local_path.read_text(encoding="utf-8", errors="replace")
+
+        elif ext == ".docx":
+            from docx import Document
+            doc = Document(str(local_path))
+            text = "\n".join(p.text for p in doc.paragraphs)
+
+        elif ext == ".pdf":
+            from pypdf import PdfReader
+            reader = PdfReader(str(local_path))
+            text = "\n".join(page.extract_text() or "" for page in reader.pages)
+
+        elif ext == ".rtf":
+            from striprtf.striprtf import rtf_to_text
+            raw = local_path.read_text(encoding="utf-8", errors="replace")
+            text = rtf_to_text(raw)
+
+        elif ext == ".doc":
+            import olefile
+            try:
+                ole = olefile.OleFileIO(str(local_path))
+                if ole.exists('WordDocument'):
+                    data = ole.openstream('WordDocument').read()
+                    text = data.decode("utf-16-le", errors="replace")
+                    text = "".join(c for c in text if c.isprintable() or c in "\n\r\t")
+                else:
+                    text = ""
+                ole.close()
+            except Exception:
+                text = ""
+            if not text.strip():
+                text = local_path.read_bytes().decode("utf-8", errors="replace")
+                text = "".join(c for c in text if c.isprintable() or c in "\n\r\t")
+
+        elif ext == ".pages":
+            with zipfile.ZipFile(str(local_path), "r") as zf:
+                xml_candidates = [n for n in zf.namelist() if n.endswith(".xml") and "index" in n.lower()]
+                xml_candidates += [n for n in zf.namelist() if n.endswith(".xml")]
+                text = ""
+                for xml_name in xml_candidates:
+                    try:
+                        xml_content = zf.read(xml_name)
+                        root = ET.fromstring(xml_content)
+                        texts = []
+                        for elem in root.iter():
+                            if elem.text and elem.text.strip():
+                                texts.append(elem.text.strip())
+                        if texts:
+                            text = "\n".join(texts)
+                            break
+                    except Exception:
+                        continue
+
+        else:
+            return None
+
+        return text.strip()
+
+    except Exception as e:
+        logger.error(f"Error extracting from {file_name}: {e}")
+        return None
+    finally:
+        import shutil
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def _detect_title_from_text(text: str) -> str | None:
+    """Detect prompt theme from first non-empty line."""
+    lines = [l.strip() for l in text.split("\n") if l.strip()]
+    if not lines:
+        return None
+    first = lines[0]
+    if len(first) <= 100 and not first.startswith(("-", "*", "1.", "2.", "3.", "4.", "5.")):
+        return first
+    return None
+
 
 @dp.message(Command("prompt", "промпт", "промпты"))
 async def cmd_list_prompts(message: Message, state: FSMContext, command: CommandObject):
@@ -1081,8 +1183,34 @@ async def cmd_list_prompts(message: Message, state: FSMContext, command: Command
     if command.args:
         sub = command.args.strip().lower()
         if sub == "add":
+            # Check if theme is in the command: /prompt add "Theme"
+            parts = command.args.strip().split(maxsplit=1)
+            if len(parts) > 1:
+                topic = parts[1].strip().strip(chr(34)).strip("'").strip()
+                if topic:
+                    prompts = _load_prompts()
+                    if topic in prompts:
+                        await message.answer(
+                            f"Prompt with topic \"{topic}\" already exists! "
+                            f"Current text:\n`{prompts[topic][:200]}`\n\n"
+                            "Enter a **different** topic:",
+                            parse_mode=ParseMode.MARKDOWN,
+                        )
+                        await state.set_state(AddPromptState.topic)
+                        return
+                    await state.update_data(topic=topic)
+                    await message.answer(
+                        f"Topic \"{topic}\" accepted.\n\n"
+                        "Now enter the **text** of the prompt:\n"
+                        "_(or attach a file: txt, docx, pdf, rtf, doc, pages)_",
+                        parse_mode=ParseMode.MARKDOWN,
+                    )
+                    await state.set_state(AddPromptState.text)
+                    return
+
             await message.answer(
-                "📝 Введите **тему** нового промпта:",
+                "Enter the **topic** of the new prompt:\n"
+                "_(or attach a file - topic will be detected from first line)_",
                 parse_mode=ParseMode.MARKDOWN,
             )
             await state.set_state(AddPromptState.topic)
@@ -1194,10 +1322,51 @@ async def add_prompt_topic(message: Message, state: FSMContext):
     Сохраняет тему промпта и запрашивает текст (шаблон саммари).
     Бизнес-правило: темы промптов должны быть уникальны — это ключ
     для сопоставления с конспектами.
+    Поддерживает загрузку файла для автоматического определения темы.
     """
+    # Если пользователь прислал файл — извлекаем текст и определяем тему
+    if message.document:
+        file_text = await _extract_text_from_file(message)
+        if file_text:
+            detected = _detect_title_from_text(file_text)
+            if detected:
+                topic = detected
+                prompts = _load_prompts()
+                if topic in prompts:
+                    await message.answer(
+                        f"⚠️ Промпт с темой «{topic}» уже существует!\n"
+                        f"Текущий текст:\n`{prompts[topic][:200]}`\n\n"
+                        "Введите **другую** тему или пришлите другой файл:",
+                        parse_mode=ParseMode.MARKDOWN,
+                    )
+                    return
+                await state.update_data(topic=topic, file_text=file_text)
+                await message.answer(
+                    f"✅ Из файла определена тема: **«{topic}»**\\n\\n"
+                    "Теперь введите **текст** промпта или пришлите другой файл:\n"
+                    "_(если оставить пустым — будет использован текст из файла)_",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+                await state.set_state(AddPromptState.text)
+                return
+            else:
+                # Не удалось определить тему — сохраняем текст, спрашиваем тему
+                preview = file_text[:100].replace("\n", " ")
+                await state.update_data(file_text=file_text)
+                await message.answer(
+                    f"📄 Текст из файла (первые 100 символов):\n`{preview}...`\n\n"
+                    "Не удалось автоматически определить тему.\n"
+                    "Введите **тему** этого промпта вручную:",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+                await state.set_state(AddPromptState.waiting_topic_from_file)
+                return
+        await message.answer("⚠️ Не удалось извлечь текст из файла. Попробуйте другой формат или введите текст:")
+        return
+
     topic = message.text.strip()
     if not topic:
-        await message.answer("⚠️ Тема не может быть пустой. Введите тему:")
+        await message.answer("⚠️ Тема не может быть пустой. Введите тему или пришлите файл:")
         return
 
     # Проверяем уникальность темы
@@ -1214,26 +1383,39 @@ async def add_prompt_topic(message: Message, state: FSMContext):
     await state.update_data(topic=topic)
     await message.answer(
         f"✅ Тема «{topic}» принята.\n\n"
-        "Теперь введите **текст** промпта:",
+        "Теперь введите **текст** промпта:\n"
+        "_(или пришлите файл: txt, docx, pdf, rtf, doc, pages)_",
         parse_mode=ParseMode.MARKDOWN,
     )
     await state.set_state(AddPromptState.text)
-
-
 @dp.message(AddPromptState.text)
 async def add_prompt_text(message: Message, state: FSMContext):
     """
     Сохраняет текст промпта.
     Бизнес-правило: после сохранения показываем обновлённый список,
     чтобы пользователь видел результат.
+    Поддерживает загрузку файла как текста промпта.
     """
-    text = message.text.strip()
-    if not text:
-        await message.answer("⚠️ Текст промпта не может быть пустым. Введите текст:")
-        return
-
     data = await state.get_data()
-    topic = data["topic"]
+    topic = data.get("topic")
+
+    # Если пользователь прислал файл — извлекаем текст
+    if message.document:
+        file_text = await _extract_text_from_file(message)
+        if file_text:
+            text = file_text
+        else:
+            await message.answer("⚠️ Не удалось извлечь текст из файла. Попробуйте другой формат или введите текст:")
+            return
+    else:
+        text = message.text.strip()
+        if not text:
+            # Если есть file_text из предыдущего шага — используем его
+            if data.get("file_text"):
+                text = data["file_text"]
+            else:
+                await message.answer("⚠️ Текст промпта не может быть пустым. Введите текст или пришлите файл:")
+                return
 
     prompts = _load_prompts()
     prompts[topic] = text
@@ -1247,9 +1429,55 @@ async def add_prompt_text(message: Message, state: FSMContext):
     await state.clear()
 
     # Автоматически показываем обновлённый список
-    text = _format_prompt_list()
-    await message.answer(text, parse_mode=ParseMode.MARKDOWN, reply_markup=_prompt_keyboard())
+    list_text = _format_prompt_list()
+    await message.answer(list_text, parse_mode=ParseMode.MARKDOWN, reply_markup=_prompt_keyboard())
 
+# ── Обработчик для ручного ввода темы после загрузки файла ──
+
+@dp.message(AddPromptState.waiting_topic_from_file)
+async def add_prompt_topic_from_file(message: Message, state: FSMContext):
+    """
+    Пользователь загрузил файл, но тема не определилась автоматически.
+    Спрашиваем тему вручную, затем переходим к вводу текста.
+    """
+    topic = message.text.strip()
+    if not topic:
+        await message.answer("⚠️ Тема не может быть пустой. Введите тему:")
+        return
+
+    data = await state.get_data()
+    file_text = data.get("file_text", "")
+
+    prompts = _load_prompts()
+    if topic in prompts:
+        await message.answer(
+            f"⚠️ Промпт с темой «{topic}» уже существует!\n"
+            f"Текущий текст:\n`{prompts[topic][:200]}`\n\n"
+            "Введите **другую** тему:",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    await state.update_data(topic=topic)
+    if file_text:
+        # Текст из файла уже есть — сохраняем сразу
+        prompts[topic] = file_text
+        _save_prompts(prompts)
+        await message.answer(
+            f"🧠 **Промпт «{topic}» добавлен в память.**\n\n"
+            f"📄 Длина: {len(file_text)} символов (из файла)",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        await state.clear()
+        list_text = _format_prompt_list()
+        await message.answer(list_text, parse_mode=ParseMode.MARKDOWN, reply_markup=_prompt_keyboard())
+    else:
+        await message.answer(
+            f"✅ Тема «{topic}» принята.\n\n"
+            "Теперь введите **текст** промпта или пришлите файл:",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        await state.set_state(AddPromptState.text)
 
 # ── Команда /text_prompt ─────────────────────────────────────
 
