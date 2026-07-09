@@ -926,7 +926,7 @@ AI_PROVIDERS = {
     "siliconflow": {
         "label": "SiliconFlow 🇨🇳",
         "endpoint": "https://api.siliconflow.cn/v1",
-        "hint_model": "deepseek-ai/DeepSeek-V3",
+        "hint_model": "Qwen/Qwen2.5-72B-Instruct",
     },
     "gigachat": {
         "label": "GigaChat (Сбер) 🇷🇺",
