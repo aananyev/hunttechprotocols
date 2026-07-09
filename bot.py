@@ -124,6 +124,51 @@ def _get_new_comms_for_user(user_id: int) -> set:
     return set(data.get(str(user_id), []))
 
 
+# ── Трекер отправленных cron-уведомлений ──────────────────
+# Отдельный файл, не влияющий на /list new.
+
+NOTIFIED_FILE = Path(__file__).parent / "notified_comms.json"
+
+
+def _load_notified() -> dict:
+    """Load notified conspect IDs: {user_id: [uid, ...]}"""
+    if not NOTIFIED_FILE.exists():
+        return {}
+    try:
+        with open(NOTIFIED_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return data
+    except (json.JSONDecodeError, IOError):
+        pass
+    return {}
+
+
+def _save_notified(data: dict):
+    with open(NOTIFIED_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def _get_notified_comms_for_user(user_id: int) -> set:
+    """Return set of conspect IDs already notified via cron."""
+    data = _load_notified()
+    return set(data.get(str(user_id), []))
+
+
+def _mark_notified(user_id: int, msg_ids: list[str]):
+    """Mark conspect IDs as already notified (cron), without affecting /list new."""
+    data = _load_notified()
+    key = str(user_id)
+    if key not in data:
+        data[key] = []
+    existing = set(data[key])
+    for mid in msg_ids:
+        if mid not in existing:
+            data[key].append(mid)
+            existing.add(mid)
+    _save_notified(data)
+
+
 def _load_users() -> dict:
     """Загружает учётные записи пользователей: {user_id: {email, server, port, password, ai?}}"""
     if not USERS_FILE.exists():
@@ -3234,15 +3279,24 @@ async def main():
 
                         header, items = fetch_new_notes(user_id)
                         if items:
-                            msg_ids = []
-                            for idx, (dt, display, txt) in enumerate(items, 1):
+                            # Фильтруем те, о которых уже уведомляли
+                            notified = _get_notified_comms_for_user(user_id)
+                            new_notifications = []
+                            for dt, display, txt in items:
+                                uid = f"{dt.timestamp()}:{display}"
+                                if uid not in notified:
+                                    new_notifications.append((dt, display, txt))
+
+                            if not new_notifications:
+                                continue
+
+                            for idx, (dt, display, txt) in enumerate(new_notifications, 1):
                                 date_str = dt.strftime("%d.%m.%Y %H:%M")
                                 text = (
                                     f"🔔 **Новый конспект встречи!**\n\n"
                                     f"**{idx}.** {display}\n"
                                     f"📅 {date_str}"
                                 )
-                                msg_ids.append(f"{dt.timestamp()}:{display}")
                                 try:
                                     await bot.send_message(
                                         chat_id=user_id,
@@ -3254,8 +3308,9 @@ async def main():
                                         "Не удалось отправить уведомление user %s: %s",
                                         uid_str, e,
                                     )
-                            # Помечаем как показанные, чтобы не дублировать
-                            _mark_new_comms_shown(user_id, msg_ids)
+                            # Сохраняем в кеш для кнопки Саммари
+                            notified_ids = [f"{dt.timestamp()}:{display}" for dt, display, _txt in new_notifications]
+                            _mark_notified(user_id, notified_ids)
                             _save_notes_cache(user_id, items)
 
                     except Exception as e:
