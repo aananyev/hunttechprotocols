@@ -144,6 +144,46 @@ def get_ai_config(user_id: int) -> dict | None:
 
 
 # ═══════════════════════════════════════════════════════════════════
+# ФУНКЦИИ ДЛЯ YANDEX WIKI
+# ═══════════════════════════════════════════════════════════════════
+# Яндекс Вики — корпоративный вики-сервис из состава Яндекс 360 для бизнеса.
+# Бизнес-правило: после того как нейросеть сгенерировала саммари совещания,
+# его можно опубликовать как страницу в Яндекс Вики. Тогда все члены Совета
+# директоров видят утверждённые протоколы в едином корпоративном хранилище,
+# а не только в Telegram-чате.
+#
+# Аутентификация: IAM-токен (Yandex Cloud) или OAuth-токен Яндекс ID.
+# Токен передаётся в заголовке Authorization: Bearer <token>.
+# Получить IAM-токен: https://cloud.yandex.com/en/docs/iam/operations/iam-token/create
+# API endpoint: https://api.wiki.yandex.net/v1/
+
+
+def save_wiki_config(user_id: int, iam_token: str, org_id: str = ""):
+    """Сохраняет настройки Яндекс Вики: IAM-токен и ID организации.
+       Бизнес-правило: org_id нужен для доступа к wiki корпорации,
+       если у пользователя несколько организаций. Если org_id не указан,
+       API использует организацию по умолчанию."""
+    users = _load_users()
+    key = str(user_id)
+    if key not in users:
+        users[key] = {}
+    users[key]["wiki"] = {
+        "iam_token": iam_token,
+        "org_id": org_id,
+    }
+    _save_users(users)
+
+
+def get_wiki_config(user_id: int) -> dict | None:
+    """Возвращает настройки Яндекс Вики или None.
+       Без настроек wiki команды /wiki_test и публикация не работают."""
+    config = get_user_config(user_id)
+    if config and "wiki" in config:
+        return config["wiki"]
+    return None
+
+
+# ═══════════════════════════════════════════════════════════════════
 # БЛОК ОБРАБОТКИ ПОЧТЫ (IMAP)
 # ═══════════════════════════════════════════════════════════════════
 # Бизнес-процесс: каждое утро после совещания Совета директоров 
@@ -379,8 +419,123 @@ def fetch_notes_last_week(user_id: int) -> tuple[str, list]:
 
 
 # ═══════════════════════════════════════════════════════════════════
-# БЛОК TELEGRAM BOT
+# ФУНКЦИИ ДЛЯ YANDEX WIKI API
 # ═══════════════════════════════════════════════════════════════════
+# Бизнес-логика: Яндекс Вики — это корпоративная база знаний.
+# Мы используем её как хранилище утверждённых протоколов совещаний.
+# Сгенерированное нейросетью саммари можно опубликовать как страницу,
+# чтобы все члены команды имели к нему доступ.
+#
+# API: https://api.wiki.yandex.net/v1/
+# Аутентификация: IAM-токен Яндекс Облака или OAuth Яндекс ID.
+# Токен передаётся в заголовке Authorization: Bearer <token>.
+
+
+WIKI_API_BASE = "https://api.wiki.yandex.net/v1"
+
+
+async def _test_wiki_connection(iam_token: str, org_id: str = "") -> str:
+    """
+    Проверяет подключение к Яндекс Вики API.
+    
+    Бизнес-правило: перед публикацией страницы нужно убедиться,
+    что API-доступ работает. Тест получает информацию о текущем
+    пользователе и список последних страниц.
+    
+    Возвращает отформатированный отчёт с результатами проверки.
+    Если проверка не удалась — возвращает строку с ❌.
+    """
+    headers = {
+        "Authorization": f"Bearer {iam_token}",
+        "Content-Type": "application/json",
+    }
+    # Если указана организация — добавляем заголовок
+    if org_id:
+        headers["X-Org-ID"] = org_id
+
+    report_parts = []
+    all_ok = True
+
+    # ── Тест 1: получение информации о пользователе ────────────────
+    # Проверяем, что токен валиден и API отвечает.
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(f"{WIKI_API_BASE}/users/me", headers=headers)
+            if resp.status_code == 200:
+                user_data = resp.json()
+                login = user_data.get("login", "неизвестно")
+                email = user_data.get("email", "не указан")
+                report_parts.append(
+                    f"✅ **Пользователь:** `{login}` ({email})"
+                )
+            elif resp.status_code == 401:
+                report_parts.append("❌ **Ошибка авторизации (401):** IAM-токен недействителен или истёк.")
+                all_ok = False
+            else:
+                report_parts.append(f"❌ **Ошибка API ({resp.status_code}):** {resp.text[:200]}")
+                all_ok = False
+    except httpx.TimeoutException:
+        report_parts.append("❌ **Таймаут:** Яндекс Вики не ответил за 15 секунд.")
+        all_ok = False
+    except Exception as e:
+        report_parts.append(f"❌ **Ошибка подключения:** {e}")
+        all_ok = False
+
+    # ── Тест 2: список страниц (проверяем доступ на чтение) ────────
+    # Пробуем получить список кластеров или страниц, чтобы убедиться,
+    # что у пользователя есть права на чтение wiki.
+    if all_ok:
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                resp = await client.get(
+                    f"{WIKI_API_BASE}/pages",
+                    headers=headers,
+                    params={"pageSize": 5},
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    pages = data.get("pages", [])
+                    if pages:
+                        report_parts.append(
+                            f"✅ **Доступ к страницам:** получено {len(pages)} страниц"
+                        )
+                        # Показываем примеры страниц
+                        for p in pages[:3]:
+                            title = p.get("title", "без названия")
+                            slug = p.get("slug", "?")
+                            report_parts.append(f"   📄 `{title}` (/{slug})")
+                    else:
+                        report_parts.append("✅ **Доступ к страницам:** есть, но страниц пока нет.")
+                elif resp.status_code == 403:
+                    report_parts.append("⚠️ **Нет прав на чтение страниц.** Проверьте настройки доступа в Яндекс Вики.")
+                else:
+                    report_parts.append(f"⚠️ **Не удалось получить страницы:** HTTP {resp.status_code}")
+        except Exception as e:
+            report_parts.append(f"⚠️ **Ошибка при получении страниц:** {e}")
+
+    # ── Тест 3: информация о кластере (организации) ────────────────
+    # Узнаём, к какому кластеру/организации привязан токен.
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(f"{WIKI_API_BASE}/clusters", headers=headers)
+            if resp.status_code == 200:
+                clusters = resp.json()
+                if isinstance(clusters, list) and clusters:
+                    for c in clusters:
+                        report_parts.append(f"🏢 **Кластер:** `{c.get('id', '?')}` — {c.get('title', '')}")
+                elif isinstance(clusters, dict):
+                    report_parts.append(f"🏢 **Кластер:** `{clusters.get('id', '?')}`")
+            # Не все аккаунты имеют доступ к кластерам — это нормально
+    except Exception:
+        pass
+
+    # Формируем итоговый отчёт
+    if all_ok:
+        title = "✅ **Подключение к Яндекс Вики работает!**\n\n"
+    else:
+        title = "❌ **Подключение к Яндекс Вики НЕ работает.**\n\n"
+
+    return title + "\n".join(report_parts)
 
 import json
 from aiogram.fsm.state import State, StatesGroup
@@ -624,6 +779,14 @@ class AiSetupState(StatesGroup):
     provider = State()
     api_key = State()
     model = State()
+
+
+class WikiSetupState(StatesGroup):
+    """Настройка Яндекс Вики: IAM-токен → (опционально) ID организации.
+       Бизнес-правило: IAM-токен — ключ доступа к API Яндекс Вики.
+       Org ID нужен, если у компании несколько организаций в Яндекс 360."""
+    iam_token = State()
+    org_id = State()
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -1480,7 +1643,16 @@ def _help_text() -> str:
         "`/help` или `/htlp` или `/помощь`\n"
         "  Эта справка.\n\n"
         "`/start`\n"
-        "  Краткое приветствие."
+        "  Краткое приветствие.\n\n"
+        "📚 **── Яндекс Вики ──**\n\n"
+        "`/setup_wiki`\n"
+        "  Настройка подключения к Яндекс Вики — корпоративной\n"
+        "  базе знаний. Потребуется IAM-токен из Яндекс Облака.\n"
+        "  Нужно для публикации саммари в вики.\n\n"
+        "`/wiki_test` или `/wikistat`\n"
+        "  Проверка подключения к Яндекс Вики. Показывает\n"
+        "  информацию о пользователе, доступных страницах\n"
+        "  и кластере организации."
     )
 
 
@@ -2099,6 +2271,148 @@ async def ai_setup_model(message: Message, state: FSMContext):
         "Теперь кнопка «Саммари» будет работать!",
         parse_mode=ParseMode.MARKDOWN,
     )
+
+
+# ═══════════════════════════════════════════════════════════════════
+# КОМАНДА /setup_wiki — НАСТРОЙКА YANDEX WIKI
+# ═══════════════════════════════════════════════════════════════════
+# Бизнес-логика: Яндекс Вики — корпоративная база знаний.
+# Настройка состоит из IAM-токена (обязательно) и ID организации (опционально).
+# IAM-токен можно получить в Яндекс Облаке:
+# https://cloud.yandex.com/en/docs/iam/operations/iam-token/create
+#
+# Эти же настройки используются для публикации саммари в вики.
+
+
+@dp.message(Command("setup_wiki"))
+async def cmd_setup_wiki(message: Message, state: FSMContext):
+    """Начинает настройку Яндекс Вики: запрашивает IAM-токен.
+       Бизнес-правило: используем те же настройки, что и для IMAP
+       (пользователь уже авторизован в Яндекс 360), но для API
+       нужен отдельный IAM-токен."""
+    config = get_wiki_config(message.from_user.id)
+    current = "••••••••" if config and config.get("iam_token") else "не задан"
+    await message.answer(
+        "📚 **Настройка Яндекс Вики**\n\n"
+        "Яндекс Вики — корпоративная база знаний. "
+        "Сюда можно публиковать саммари совещаний.\n\n"
+        f"🔑 **IAM-токен** ({current}):\n"
+        "Вставьте IAM-токен для доступа к API Яндекс Вики.\n\n"
+        "Как получить токен:\n"
+        "1. Перейдите в https://cloud.yandex.com\n"
+        "2. Создайте сервисный аккаунт\n"
+        "3. Сгенерируйте IAM-токен\n\n"
+        "Или используйте OAuth-токен Яндекс ID:\n"
+        "https://oauth.yandex.ru/",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    await state.set_state(WikiSetupState.iam_token)
+
+
+@dp.message(WikiSetupState.iam_token)
+async def setup_wiki_token(message: Message, state: FSMContext):
+    """Сохраняет IAM-токен и запрашивает ID организации (опционально).
+       Бизнес-правило: токен — единственное обязательное поле.
+       Org ID нужен только в мульти-организационных конфигурациях."""
+    iam_token = message.text.strip()
+    if not iam_token:
+        await message.answer("⚠️ IAM-токен не может быть пустым. Вставьте токен:")
+        return
+
+    # Проверяем токен — сразу делаем тестовый запрос к API
+    status = await message.answer("🔄 Проверяю IAM-токен...")
+    try:
+        wiki_config = get_wiki_config(message.from_user.id)
+        org_id = wiki_config.get("org_id", "") if wiki_config else ""
+        test_result = await _test_wiki_connection(iam_token, org_id)
+        if test_result.startswith("❌"):
+            await status.edit_text(
+                f"{test_result}\n\n"
+                "Попробуйте ещё раз. Получите новый токен и введите его:\n"
+                "https://cloud.yandex.com/en/docs/iam/operations/iam-token/create",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return
+    except Exception as e:
+        await status.edit_text(
+            f"❌ Ошибка при проверке токена: {e}\n\n"
+            "Попробуйте ещё раз. Введите IAM-токен:",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    # Токен валиден — сохраняем и спрашиваем org_id
+    await state.update_data(iam_token=iam_token)
+    await status.edit_text(
+        "✅ **IAM-токен принят!**\n\n"
+        "🏢 **ID организации** (опционально):\n"
+        "Если у вас несколько организаций в Яндекс 360, "
+        "укажите ID нужной.\n"
+        "Если организация одна — просто отправьте `/skip`\n"
+        "или оставьте поле пустым.",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    await state.set_state(WikiSetupState.org_id)
+
+
+@dp.message(WikiSetupState.org_id)
+async def setup_wiki_org_id(message: Message, state: FSMContext):
+    """Сохраняет ID организации (опционально) и завершает настройку.
+       Пустой ввод или /skip — пропускаем org_id."""
+    text = message.text.strip().lower()
+    if text and text != "/skip":
+        org_id = text
+    else:
+        org_id = ""
+
+    data = await state.get_data()
+    iam_token = data["iam_token"]
+    user_id = message.from_user.id
+
+    save_wiki_config(user_id, iam_token, org_id)
+    await state.clear()
+
+    # Показываем отчёт о подключении
+    report = await _test_wiki_connection(iam_token, org_id)
+    await message.answer(report, parse_mode=ParseMode.MARKDOWN)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# КОМАНДА /wiki_test — ПРОВЕРКА ПОДКЛЮЧЕНИЯ К YANDEX WIKI
+# ═══════════════════════════════════════════════════════════════════
+# Бизнес-логика: пользователь хочет убедиться, что wiki настроена
+# и работает, прежде чем публиковать туда страницы.
+
+
+@dp.message(Command("wiki_test", "wikistat"))
+async def cmd_wiki_test(message: Message):
+    """Проверяет подключение к Яндекс Вики и показывает отчёт.
+       Бизнес-правило: перед каждой публикацией в wiki рекомендуется
+       проверять доступность API."""
+    user_id = message.from_user.id
+    wiki_config = get_wiki_config(user_id)
+    if not wiki_config:
+        await message.answer(
+            "❌ Яндекс Вики не настроена.\n\n"
+            "Используйте `/setup_wiki` чтобы настроить:\n"
+            "1️⃣ IAM-токен (обязательно)\n"
+            "2️⃣ ID организации (опционально)",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    status = await message.answer("🔄 Проверяю подключение к Яндекс Вики...")
+    try:
+        report = await _test_wiki_connection(
+            wiki_config["iam_token"],
+            wiki_config.get("org_id", ""),
+        )
+        await status.edit_text(report, parse_mode=ParseMode.MARKDOWN)
+    except Exception as e:
+        await status.edit_text(
+            f"❌ Ошибка: {e}",
+            parse_mode=ParseMode.MARKDOWN,
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════
