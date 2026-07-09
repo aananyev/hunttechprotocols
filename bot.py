@@ -878,27 +878,69 @@ class WikiSetupState(StatesGroup):
 # OpenAI — плюс возможность указать свой endpoint.
 
 AI_PROVIDERS = {
-    "openrouter": {
-        "label": "OpenRouter",
-        "endpoint": "https://openrouter.ai/api/v1",
-        "hint_model": "deepseek/deepseek-v4-flash",
-    },
-    "hermes": {
-        "label": "Hermes / Nous",
-        "endpoint": "https://openrouter.ai/api/v1",
-        "hint_model": "nousresearch/hermes-4",
-    },
     "openai": {
         "label": "OpenAI",
         "endpoint": "https://api.openai.com/v1",
         "hint_model": "gpt-4o",
     },
+    "openrouter": {
+        "label": "OpenRouter",
+        "endpoint": "https://openrouter.ai/api/v1",
+        "hint_model": "deepseek/deepseek-v4-flash",
+    },
+    "deepseek": {
+        "label": "DeepSeek 🇨🇳",
+        "endpoint": "https://api.deepseek.com/v1",
+        "hint_model": "deepseek-chat",
+    },
+    "qwen": {
+        "label": "Qwen (Alibaba) 🇨🇳",
+        "endpoint": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        "hint_model": "qwen-max",
+    },
+    "gemini": {
+        "label": "Google Gemini",
+        "endpoint": "https://generativelanguage.googleapis.com/v1beta/openai/",
+        "hint_model": "gemini-2.0-flash-001",
+    },
+    "zhipu": {
+        "label": "Zhipu AI / GLM 🇨🇳",
+        "endpoint": "https://open.bigmodel.cn/api/paas/v4",
+        "hint_model": "glm-4-flash",
+    },
+    "moonshot": {
+        "label": "Moonshot / Kimi 🇨🇳",
+        "endpoint": "https://api.moonshot.cn/v1",
+        "hint_model": "moonshot-v1-8k",
+    },
+    "nebius": {
+        "label": "Nebius AI Studio",
+        "endpoint": "https://api.studio.nebius.ai/v1/",
+        "hint_model": "meta-llama/llama-4-maverick",
+    },
+    "together": {
+        "label": "Together AI",
+        "endpoint": "https://api.together.xyz/v1",
+        "hint_model": "meta-llama/Llama-4-Maverick-17B-128E-Instruct",
+    },
+    "siliconflow": {
+        "label": "SiliconFlow 🇨🇳",
+        "endpoint": "https://api.siliconflow.cn/v1",
+        "hint_model": "deepseek-ai/DeepSeek-V3",
+    },
 }
 
 AI_PROVIDER_EMOJI = {
-    "openrouter": "🟣",
-    "hermes": "🟢",
     "openai": "🔵",
+    "openrouter": "🟣",
+    "deepseek": "🔴",
+    "qwen": "🔶",
+    "gemini": "🟡",
+    "zhipu": "🔮",
+    "moonshot": "🌙",
+    "nebius": "🔥",
+    "together": "🤝",
+    "siliconflow": "💠",
 }
 
 
