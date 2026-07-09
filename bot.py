@@ -1662,76 +1662,95 @@ async def _start_init(message: Message, state: FSMContext):
     await state.set_state(SetupState.email)
 
 
-def _help_text() -> str:
-    """Возвращает полный текст справки по всем командам бота.
-       Бизнес-правило: /help — это единый исчерпывающий справочник,
-       не разбитый на подкоманды. Все команды видны сразу.
-       Команды с модификаторами (/setup init, /prompt add) идут первыми."""
-    return (
-        "📚 **Полная справка по командам**\n\n"
-        "🔧 **── Настройка ──**\n\n"
-        "`/init` или `/setup init`\n"
-        "  **Сбросить** все настройки почты и настроить\n"
-        "  заново. Полностью очищает email, IMAP, логин\n"
-        "  и пароль, после чего запускает 4 шага настройки.\n\n"
-        "  При первом запуске бота команда `/start`\n"
-        "  автоматически запускает `/init`.\n\n"
-        "`/setup`\n"
-        "  Настройка IMAP-подключения к почте.\n"
-        "  4 шага: Email → IMAP-сервер → Логин → Пароль.\n"
-        "  После ввода проверяет подключение и сохраняет.\n\n"
-        "`/setup_ai` или `/setup_llm`\n"
-        "  Настройка подключения к нейросети.\n"
-        "  Выбор провайдера (OpenRouter, Hermes/Nous,\n"
-        "  OpenAI, свой вариант) → API Key → Модель.\n"
-        "  Нужно для функции «Саммари».\n\n"
-        "📬 **── Конспекты встреч ──**\n\n"
-        "`/list_all` или `/все_конспекты`\n"
-        "  Показать **все** конспекты за последние 7 дней.\n\n"
-        "`/list` или `/конспекты`\n"
-        "  Показать только **непрочитанные** конспекты.\n"
-        "  Флаг UNSEEN НЕ снимается — письма остаются\n"
-        "  непрочитанными в почте.\n\n"
-        "🤖 **── Промпты (для нейросети) ──**\n\n"
-        "`/prompt` или `/промпты`\n"
-        "  Список всех сохранённых промптов\n"
-        "  с инлайн-кнопками управления.\n"
-        "  Подкоманды: `/prompt add`, `edit`, `text`, `delete`\n\n"
-        "`/add_prompt` или `/prompt_add` или `/prompt add`\n"
-        "  Добавить новый промпт.\n"
-        "  Бот спросит тему и текст.\n\n"
-        "`/edit_prompt` или `/prompt_edit` или `/prompt edit`\n"
-        "  Редактировать промпт.\n"
-        "  Варианты:\n"
-        "  • `/edit_prompt 1` — по номеру\n"
-        "  • `/edit_prompt` — диалог\n\n"
-        "`/text_prompt` или `/prompt_text` или `/prompt text`\n"
-        "  Показать текст промпта.\n"
-        "  Варианты:\n"
-        "  • `/text_prompt 1` — по номеру\n"
-        "  • `/text_prompt` — диалог\n\n"
-        "`/delete_prompt` или `/prompt_delete` или `/prompt delete`\n"
-        "  Удалить промпт.\n"
-        "  Варианты:\n"
-        "  • `/delete_prompt 1` — по номеру\n"
-        "  • `/delete_prompt` — диалог\n\n"
-        "ℹ️ **── Прочее ──**\n\n"
-        "`/help` или `/htlp` или `/помощь`\n"
-        "  Эта справка.\n\n"
-        "`/start`\n"
-        "  Краткое приветствие.\n\n"
-        "📚 **── Яндекс Вики ──**\n\n"
-        "`/setup_wiki`\n"
-        "  Настройка подключения к Яндекс Вики — корпоративной\n"
-        "  базе знаний. Потребуется IAM-токен из Яндекс Облака.\n"
-        "  Нужно для публикации саммари в вики.\n\n"
-        "`/wiki_test` или `/wikistat`\n"
-        "  Проверка подключения к Яндекс Вики. Показывает\n"
-        "  информацию о пользователе, доступных страницах\n"
-        "  и кластере организации."
+
+# ---- Help sections -------------------------------------------------
+
+HELP_SETUP = (
+    "🔧 **Настройка**\n\n"
+    "`/start`\n"
+    "  Приветствие. При первом запуске запускает `/init`.\n\n"
+    "`/init` или `/setup init`\n"
+    "  Сбросить все настройки почты и настроить заново.\n"
+    "  4 шага: Email, IMAP-сервер, логин, пароль.\n\n"
+    "`/setup`\n"
+    "  Настройка IMAP-подключения к почте:\n"
+    "  4 шага: Email, IMAP-сервер, логин, пароль.\n"
+    "  Пустой Enter в шаге сохраняет текущее значение.\n\n"
+    "`/setup ai`\n"
+    "  Настройка нейросети для «Саммари».\n"
+    "`/setup wiki`\n"
+    "  Настройка подключения к Яндекс Вики.\n"
+    "  Нужно для публикации саммари в вики.\n"
+)
+
+HELP_LIST = (
+    "📬 **Конспекты встреч**\n\n"
+    "`/list`\n"
+    "  Непрочитанные конспекты. Флаг UNSEEN НЕ снимается.\n"
+    "`/list all`\n"
+    "  Все конспекты за последние 7 дней.\n"
+    "`/list new`\n"
+    "  Новые конспекты (не показанные ранее через эту команду).\n"
+    "  ID сохраняются -- повторно не выводятся.\n"
+)
+
+HELP_PROMPT = (
+    "🤖 **Промпты (для нейросети)**\n\n"
+    "`/prompt`\n"
+    "  Список промптов с кнопками управления.\n"
+    "  Подкоманды:\n"
+    "  * `/prompt add` -- добавить\n"
+    "  * `/prompt edit <номер>` -- редактировать\n"
+    "  * `/prompt text <номер>` -- текст\n"
+    "  * `/prompt delete <номер>` -- удалить\n"
+)
+
+HELP_WIKI = (
+    "📚 **Яндекс Вики**\n\n"
+    "`/setup wiki`\n"
+    "  Настройка подключения к Яндекс Вики.\n"
+    "  Потребуется IAM-токен из Яндекс Облака.\n"
+    "`/wiki test`\n"
+    "  Проверка подключения. Показывает информацию\n"
+    "  о пользователе и доступных страницах.\n"
+)
+
+HELP_OTHER = (
+    "ℹ️ **Прочее**\n\n"
+    "`/help` или `/помощь` или `/команды`\n"
+    "  Эта справка.\n\n"
+    "`/help <раздел>`\n"
+    "  Разделы: `setup`, `list`/`notes`, `prompt`, `wiki`.\n\n"
+    "`/start`\n"
+    "  Краткое приветствие.\n"
+)
+
+HELP_ALL_SECTIONS = {
+    "setup": ("🔧 Настройка", HELP_SETUP),
+    "list": ("📬 Конспекты", HELP_LIST),
+    "notes": ("📬 Конспекты", HELP_LIST),
+    "prompt": ("🤖 Промпты", HELP_PROMPT),
+    "wiki": ("📚 Яндекс Вики", HELP_WIKI),
+}
+
+
+def _help_text(section=None):
+    """Return help text. section=None|"all"=full, or a section name."""
+    intro = "📚 **Справка по командам**\n\n"
+    full = (
+        f"{HELP_SETUP}\n\n"
+        f"{HELP_LIST}\n\n"
+        f"{HELP_PROMPT}\n\n"
+        f"{HELP_WIKI}\n\n"
+        f"{HELP_OTHER}"
     )
-
-
+    if not section or section == "all":
+        return intro + full
+    entry = HELP_ALL_SECTIONS.get(section.lower())
+    if entry:
+        return intro + entry[1]
+    known = "`, `/help ".join(k for k in sorted(HELP_ALL_SECTIONS.keys()) if k != "notes")
+    return f"❗️ Неизвестный раздел `{section}`. Используйте: `/help {known}` или `/help all`."
 @dp.message(Command("init"))
 async def cmd_init(message: Message, state: FSMContext):
     """Сбрасывает все настройки почты и запускает настройку заново."""
@@ -1763,9 +1782,12 @@ async def cmd_start(message: Message, state: FSMContext):
 
 
 @dp.message(Command("help", "htlp", "помощь", "команды"))
-async def cmd_help(message: Message):
-    """Показывает полную справку по всем командам бота."""
-    await message.answer(_help_text(), parse_mode=ParseMode.MARKDOWN)
+async def cmd_help(message: Message, command: CommandObject = None):
+    """
+    /help -- full help. /help <section> -- specific section.
+    """
+    section = command.args.strip().lower() if command and command.args else None
+    await message.answer(_help_text(section), parse_mode=ParseMode.MARKDOWN)
 
 
 # ── Команда /list (только непрочитанные) ─────────────────────
@@ -1973,14 +1995,25 @@ async def cmd_setup_start(message: Message, state: FSMContext, command: CommandO
 async def setup_email(message: Message, state: FSMContext):
     """
     Шаг 1: Email.
-    Пользователь обязан ввести email. Пустой ввод не допускается.
+    Пользователь обязан ввести корректный email. Пустой ввод не допускается.
+    Проверяем формат: local-part@domain.tld
     """
+    import re
     email = message.text.strip()
     if not email:
         await message.answer("⚠️ Email не может быть пустым. Введите адрес электронной почты:")
         return
-    if "@" not in email:
-        await message.answer("⚠️ Введите корректный email (например: ivan@example.ru):")
+
+    # Проверка формата email: что-то@домен.что-то
+    email_pattern = re.compile(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$')
+    if not email_pattern.match(email):
+        await message.answer(
+            "⚠️ Некорректный формат email.\n\n"
+            "Пример правильного адреса: `ivan@example.ru`\n"
+            "Email должен содержать `@` и домен (например, `.ru`, `.com`).\n\n"
+            "Введите email ещё раз:",
+            parse_mode=ParseMode.MARKDOWN,
+        )
         return
     await state.update_data(email=email)
 
@@ -2000,11 +2033,33 @@ async def setup_email(message: Message, state: FSMContext):
 async def setup_server(message: Message, state: FSMContext):
     """
     Шаг 2: IMAP-сервер.
-    Пользователь обязан ввести сервер (например, imap.yandex.ru).
+    Пользователь обязан ввести корректный хост IMAP-сервера.
+    Проверяем формат: valid hostname (например, imap.yandex.ru).
     """
+    import re
     server = message.text.strip()
-    if not server or "." not in server:
-        await message.answer("⚠️ Введите корректный IMAP-сервер (например: imap.yandex.ru):")
+    if not server:
+        await message.answer("⚠️ IMAP-сервер не может быть пустым. Введите адрес сервера:")
+        return
+
+    # Проверка формата hostname: буквы, цифры, точки, дефисы
+    hostname_pattern = re.compile(r'^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?$')
+    if not hostname_pattern.match(server):
+        await message.answer(
+            "⚠️ Некорректный формат IMAP-сервера.\n\n"
+            "Пример правильного адреса: `imap.yandex.ru`\n"
+            "Имя сервера должно содержать хотя бы одну точку\n"
+            "и состоять только из букв, цифр, точек и дефисов.\n\n"
+            "Введите адрес IMAP-сервера ещё раз:",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    if "." not in server:
+        await message.answer(
+            "⚠️ IMAP-сервер должен содержать домен (например: `imap.yandex.ru`).\n\n"
+            "Введите адрес IMAP-сервера ещё раз:",
+            parse_mode=ParseMode.MARKDOWN,
+        )
         return
     await state.update_data(server=server)
 
