@@ -928,6 +928,16 @@ AI_PROVIDERS = {
         "endpoint": "https://api.siliconflow.cn/v1",
         "hint_model": "deepseek-ai/DeepSeek-V3",
     },
+    "gigachat": {
+        "label": "GigaChat (Сбер) 🇷🇺",
+        "endpoint": "https://gigachat.devices.sberbank.ru/api/v1/",
+        "hint_model": "GigaChat:30+",
+    },
+    "yandexgpt": {
+        "label": "YandexGPT 🇷🇺",
+        "endpoint": "https://llm.api.cloud.yandex.net/beta/openai/v1/",
+        "hint_model": "yandexgpt-lite",
+    },
 }
 
 AI_PROVIDER_EMOJI = {
@@ -941,6 +951,8 @@ AI_PROVIDER_EMOJI = {
     "nebius": "🔥",
     "together": "🤝",
     "siliconflow": "💠",
+    "gigachat": "💜",
+    "yandexgpt": "🟩",
 }
 
 
