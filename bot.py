@@ -2082,7 +2082,7 @@ HELP_WIKI = (
     "`/setup wiki`\n"
     "  Настройка подключения к Яндекс Вики.\n"
     "  Потребуется IAM-токен из Яндекс Облака.\n"
-    "`/wiki test`\n"
+    "`/wiki test` или `/wiki stat`\n"
     "  Проверка подключения. Показывает информацию\n"
     "  о пользователе и доступных страницах.\n"
 )
@@ -3202,11 +3202,26 @@ async def setup_wiki_org_id(message: Message, state: FSMContext):
 # и работает, прежде чем публиковать туда страницы.
 
 
+# ── Команда /wiki test / /wiki stat ──────────────────────────
+
+@dp.message(Command("wiki"))
+async def cmd_wiki(message: Message, command: CommandObject):
+    """Обрабатывает /wiki test и /wiki stat как синонимы /wiki_test и /wikistat."""
+    if command.args and command.args.strip().lower() in ("test", "stat"):
+        await cmd_wiki_test(message)
+    else:
+        await message.answer(
+            "📚 **Яндекс Вики**\n\n"
+            "• `/wiki test` — проверить подключение\n"
+            "• `/wiki stat` — то же самое\n"
+            "• `/setup wiki` — настроить подключение",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+
+
 @dp.message(Command("wiki_test", "wikistat"))
 async def cmd_wiki_test(message: Message):
-    """Проверяет подключение к Яндекс Вики и показывает отчёт.
-       Бизнес-правило: перед каждой публикацией в wiki рекомендуется
-       проверять доступность API."""
+    """Проверяет подключение к Яндекс Вики и показывает отчёт."""
     user_id = message.from_user.id
     wiki_config = get_wiki_config(user_id)
     if not wiki_config:
