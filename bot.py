@@ -943,16 +943,16 @@ AI_PROVIDERS = {
 AI_PROVIDER_EMOJI = {
     "openai": "🔵",
     "openrouter": "🟣",
-    "deepseek": "🔴",
+    "deepseek": "🐋",
     "qwen": "🔶",
-    "gemini": "🟡",
-    "zhipu": "🔮",
+    "gemini": "✨",
+    "zhipu": "💬",
     "moonshot": "🌙",
     "nebius": "🔥",
     "together": "🤝",
-    "siliconflow": "💠",
-    "gigachat": "💜",
-    "yandexgpt": "🟩",
+    "siliconflow": "💎",
+    "gigachat": "🟢",
+    "yandexgpt": "🔴",
 }
 
 
