@@ -3213,6 +3213,63 @@ async def unknown_command(message: Message):
 
 async def main():
     logger.info("🤖 Бот конспектов встреч запускается...")
+
+    # ── Фоновая проверка почты каждые 5 минут ───────────────
+    async def check_new_conspects():
+        """Проверяет новые конспекты для всех пользователей, у кого
+           настроена почта. Отправляет уведомление в Telegram."""
+        while True:
+            try:
+                await asyncio.sleep(300)  # 5 минут
+                users = _load_users()
+                if not users:
+                    continue
+
+                for uid_str in users:
+                    try:
+                        user_id = int(uid_str)
+                        config = users[uid_str]
+                        if not config.get("email") or not config.get("password"):
+                            continue
+
+                        header, items = fetch_new_notes(user_id)
+                        if items:
+                            msg_ids = []
+                            for idx, (dt, display, txt) in enumerate(items, 1):
+                                date_str = dt.strftime("%d.%m.%Y %H:%M")
+                                text = (
+                                    f"🔔 **Новый конспект встречи!**\n\n"
+                                    f"**{idx}.** {display}\n"
+                                    f"📅 {date_str}"
+                                )
+                                msg_ids.append(f"{dt.timestamp()}:{display}")
+                                try:
+                                    await bot.send_message(
+                                        chat_id=user_id,
+                                        text=text,
+                                        parse_mode=ParseMode.MARKDOWN,
+                                    )
+                                except Exception as e:
+                                    logger.error(
+                                        "Не удалось отправить уведомление user %s: %s",
+                                        uid_str, e,
+                                    )
+                            # Помечаем как показанные, чтобы не дублировать
+                            _mark_new_comms_shown(user_id, msg_ids)
+                            _save_notes_cache(user_id, items)
+
+                    except Exception as e:
+                        logger.error(
+                            "Ошибка фоновой проверки для user %s: %s", uid_str, e,
+                        )
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error("Ошибка в фоновом цикле проверки почты: %s", e)
+
+    # Запускаем фоновую задачу
+    asyncio.create_task(check_new_conspects())
+
     await dp.start_polling(bot)
 
 
