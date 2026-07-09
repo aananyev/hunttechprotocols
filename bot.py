@@ -1904,6 +1904,14 @@ HELP_SETUP = (
     "  Настройка IMAP-подключения к почте:\n"
     "  4 шага: Email, IMAP-сервер, логин, пароль.\n"
     "  Пустой Enter в шаге сохраняет текущее значение.\n\n"
+    "`/setup show all`\n"
+    "  Показать все настройки текущего пользователя.\n"
+    "`/setup show account`\n"
+    "  Показать настройки доступа к почте.\n"
+    "`/setup show ai`\n"
+    "  Показать настройки нейросети.\n"
+    "`/setup show wiki`\n"
+    "  Показать настройки Яндекс Вики.\n\n"
     "`/setup ai`\n"
     "  Настройка нейросети для «Саммари».\n"
     "`/setup wiki`\n"
@@ -2199,14 +2207,144 @@ async def cmd_list_all(message: Message):
 # Пустой Enter сохраняет старое значение — удобно, когда меняется только
 # пароль, а email и сервер те же.
 
+# ── Функция показа настроек /setup show ────────────────────
+
+async def _cmd_setup_show(message: Message, arg: str):
+    """Показывает настройки текущего пользователя.
+       /setup show all     — все настройки
+       /setup show account — почта и IMAP
+       /setup show ai      — AI-настройки
+       /setup show wiki    — Яндекс Вики
+    """
+    user_id = message.from_user.id
+    config = get_user_config(user_id)
+    parts = arg.split(maxsplit=1)
+
+    if len(parts) < 2:
+        await message.answer(
+            "ℹ️ **Показ настроек**\n\n"
+            "Использование:\n"
+            "• `/setup show all` — все настройки\n"
+            "• `/setup show account` — доступ к почте\n"
+            "• `/setup show ai` — нейросеть\n"
+            "• `/setup show wiki` — Яндекс Вики",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    section = parts[1]
+
+    if section == "all":
+        lines = ["📋 **Все настройки пользователя**\n"]
+
+        # Account
+        lines.append("**📧 Доступ к почте:**")
+        if config:
+            lines.append(f"  • Email: `{config.get('email', 'не задан')}`")
+            lines.append(f"  • IMAP-сервер: `{config.get('server', 'не задан')}`")
+            lines.append(f"  • Порт: `{config.get('port', 993)}`")
+            lines.append(f"  • Логин: `{config.get('login', 'не задан')}`")
+            lines.append(f"  • Пароль: {'✅ задан' if config.get('password') else '❌ не задан'}")
+        else:
+            lines.append("  ❌ **Не настроено.** Используйте `/setup`")
+        lines.append("")
+
+        # AI
+        lines.append("**🤖 Нейросеть (AI):**")
+        ai = get_ai_config(user_id)
+        if ai:
+            lines.append(f"  • Endpoint: `{ai.get('endpoint', 'не задан')}`")
+            lines.append(f"  • API ключ: {'✅ задан' if ai.get('api_key') else '❌ не задан'}")
+            lines.append(f"  • Модель: `{ai.get('model', 'не задана')}`")
+        else:
+            lines.append("  ❌ **Не настроено.** Используйте `/setup ai`")
+        lines.append("")
+
+        # Wiki
+        lines.append("**📚 Яндекс Вики:**")
+        wiki = get_wiki_config(user_id)
+        if wiki:
+            lines.append(f"  • IAM-токен: {'✅ задан' if wiki.get('iam_token') else '❌ не задан'}")
+            lines.append(f"  • ID организации: `{wiki.get('org_id', 'не указан') or 'не указан'}`")
+        else:
+            lines.append("  ❌ **Не настроено.** Используйте `/setup wiki`")
+
+        await message.answer("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+
+    elif section == "account":
+        if not config:
+            await message.answer(
+                "❌ **Доступ к почте не настроен.**\n\n"
+                "Используйте `/setup` для настройки.",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return
+        await message.answer(
+            "📧 **Доступ к почте**\n\n"
+            f"• Адрес: `{config.get('email', 'не задан')}`\n"
+            f"• IMAP-сервер: `{config.get('server', 'не задан')}`\n"
+            f"• Порт: `{config.get('port', 993)}`\n"
+            f"• Логин: `{config.get('login', 'не задан')}`\n"
+            f"• Пароль: {'✅ задан' if config.get('password') else '❌ не задан'}",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+
+    elif section == "ai":
+        ai = get_ai_config(user_id)
+        if not ai:
+            await message.answer(
+                "❌ **Нейросеть не настроена.**\n\n"
+                "Используйте `/setup ai` для настройки.",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return
+        await message.answer(
+            "🤖 **Настройки нейросети (AI)**\n\n"
+            f"• Endpoint: `{ai.get('endpoint', 'не задан')}`\n"
+            f"• API ключ: {'✅ задан' if ai.get('api_key') else '❌ не задан'}\n"
+            f"• Модель: `{ai.get('model', 'не задана')}`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+
+    elif section == "wiki":
+        wiki = get_wiki_config(user_id)
+        if not wiki:
+            await message.answer(
+                "❌ **Яндекс Вики не настроена.**\n\n"
+                "Используйте `/setup wiki` для настройки.",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return
+        await message.answer(
+            "📚 **Настройки Яндекс Вики**\n\n"
+            f"• IAM-токен: {'✅ задан' if wiki.get('iam_token') else '❌ не задан'}\n"
+            f"• ID организации: `{wiki.get('org_id', 'не указан') or 'не указан'}`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+
+    else:
+        await message.answer(
+            f"❌ Неизвестная секция: `{section}`.\n\n"
+            "Доступно: `all`, `account`, `ai`, `wiki`.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+
+
 @dp.message(Command("setup"))
 async def cmd_setup_start(message: Message, state: FSMContext, command: CommandObject):
     """Начинает настройку почты. /setup init — сброс и настройка заново."""
 
     # Проверяем аргумент /setup init
-    if command.args and command.args.strip().lower() == "init":
-        await _start_init(message, state)
-        return
+    if command.args:
+        arg = command.args.strip().lower()
+
+        if arg == "init":
+            await _start_init(message, state)
+            return
+
+        if arg.startswith("show"):
+            await _cmd_setup_show(message, arg)
+            return
 
     config = get_user_config(message.from_user.id)
     current = config["email"] if config else "не задан"
