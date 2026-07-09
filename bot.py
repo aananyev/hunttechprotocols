@@ -955,6 +955,39 @@ AI_PROVIDER_EMOJI = {
     "yandexgpt": "🔴",
 }
 
+# ── Популярные модели для каждого провайдера ──────────────
+
+AI_MODELS_PER_PROVIDER = {
+    "openai": ["gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "gpt-4", "gpt-3.5-turbo"],
+    "openrouter": [
+        "deepseek/deepseek-v4-flash", "deepseek/deepseek-chat",
+        "anthropic/claude-sonnet-4", "anthropic/claude-3.5-haiku",
+        "google/gemini-2.0-flash-001",
+        "meta-llama/llama-4-maverick", "qwen/qwen-max",
+    ],
+    "deepseek": ["deepseek-chat", "deepseek-reasoner", "deepseek-v3"],
+    "qwen": ["qwen-max", "qwen-plus", "qwen-turbo", "qwen2.5-72b-instruct"],
+    "gemini": ["gemini-2.0-flash-001", "gemini-2.0-pro", "gemini-1.5-pro", "gemini-1.5-flash"],
+    "zhipu": ["glm-4-flash", "glm-4-plus", "glm-4-air", "glm-4-0520"],
+    "moonshot": ["moonshot-v1-8k", "moonshot-v1-32k", "moonshot-v1-128k"],
+    "nebius": [
+        "meta-llama/llama-4-maverick", "mistralai/mistral-large",
+        "deepseek/deepseek-chat", "Qwen/Qwen2.5-72B-Instruct",
+    ],
+    "together": [
+        "meta-llama/Llama-4-Maverick-17B-128E-Instruct",
+        "mistralai/Mixtral-8x22B-Instruct-v0.1",
+        "Qwen/Qwen2.5-72B-Instruct",
+    ],
+    "siliconflow": [
+        "Qwen/Qwen2.5-72B-Instruct", "deepseek-ai/DeepSeek-V3",
+        "meta-llama/Meta-Llama-3.3-70B-Instruct",
+        "Pro/Llama-4-Maverick-17B-128E",
+    ],
+    "gigachat": ["GigaChat:30+", "GigaChat-Pro", "GigaChat-Plus"],
+    "yandexgpt": ["yandexgpt-lite", "yandexgpt", "yandexgpt-pro"],
+}
+
 
 def _ai_provider_keyboard() -> InlineKeyboardMarkup:
     """Клавиатура выбора AI-провайдера при настройке /setup_ai."""
@@ -1967,7 +2000,11 @@ HELP_SETUP = (
     "`/setup show wiki`\n"
     "  Показать настройки Яндекс Вики.\n\n"
     "`/setup ai`\n"
-    "  Настройка нейросети для «Саммари».\n"
+    "  Настройка нейросети для «Саммари». Популярные модели\n"
+    "  показываются при выборе провайдера.\n"
+    "`/setup ai test`\n"
+    "  Проверить подключение к нейросети. Отправляет тестовый\n"
+    "  запрос и показывает результат.\n"
     "`/setup wiki`\n"
     "  Настройка подключения к Яндекс Вики.\n"
     "  Нужно для публикации саммари в вики.\n"
@@ -2384,6 +2421,41 @@ async def _cmd_setup_show(message: Message, arg: str):
         )
 
 
+
+# ── Команда /setup ai test ─────────────────────────────────
+
+async def _cmd_setup_ai_test(message: Message):
+    """Тестирует текущее AI-подключение."""
+    user_id = message.from_user.id
+    ai_config = get_ai_config(user_id)
+
+    if not ai_config:
+        await message.answer(
+            "❌ **AI не настроен.**\n\n"
+            "Используйте `/setup ai` чтобы настроить нейросеть.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    endpoint = ai_config.get("endpoint", "")
+    api_key = ai_config.get("api_key", "")
+    model = ai_config.get("model", "")
+
+    await message.answer(
+        f"⏳ Тестирую подключение к **{model}**...\n"
+        f"🔗 `{endpoint}`",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+    result = await _test_ai_connection(endpoint, api_key, model)
+    await message.answer(
+        f"🧪 **Результат теста AI**\n\n"
+        f"🔗 Endpoint: `{endpoint}`\n"
+        f"📝 Модель: `{model}`\n\n"
+        f"{result}",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
 @dp.message(Command("setup"))
 async def cmd_setup_start(message: Message, state: FSMContext, command: CommandObject):
     """Начинает настройку почты. /setup init — сброс и настройка заново."""
@@ -2403,6 +2475,11 @@ async def cmd_setup_start(message: Message, state: FSMContext, command: CommandO
         if arg == "ai":
             # Перенаправляем на настройку нейросети
             await cmd_setup_ai(message, state)
+            return
+
+        if arg == "ai test":
+            # Тестирование AI-подключения
+            await _cmd_setup_ai_test(message)
             return
 
         if arg == "wiki":
@@ -2717,6 +2794,53 @@ async def call_ai(user_id: int, system_prompt: str, user_text: str) -> str:
         return f"❌ Ошибка: {e}"
 
 
+# ── Тестирование AI-подключения ──────────────────────────
+
+async def _test_ai_connection(endpoint: str, api_key: str, model: str) -> str:
+    """Проверяет подключение к AI-провайдеру.
+       Отправляет короткий запрос и возвращает отчёт.
+    """
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    if "openrouter" in endpoint.lower():
+        headers["HTTP-Referer"] = "https://t.me/hunttech_protocols_bot"
+        headers["X-Title"] = "HunttechProtocolsBot"
+
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "user", "content": "Ответь одним словом: привет"},
+        ],
+        "max_tokens": 10,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            response = await client.post(
+                f"{endpoint}/chat/completions",
+                headers=headers,
+                json=payload,
+            )
+            if response.status_code == 200:
+                result = response.json()
+                reply = result["choices"][0]["message"]["content"]
+                return f"✅ Подключение успешно!\\nОтвет модели: «{reply.strip()}»"
+            elif response.status_code == 401:
+                return "❌ Ошибка авторизации (401). Проверьте API-ключ."
+            elif response.status_code == 404:
+                return "❌ Модель не найдена (404). Проверьте название модели."
+            else:
+                return f"❌ Ошибка API ({response.status_code}): {response.text[:300]}"
+    except httpx.TimeoutException:
+        return "❌ Таймаут: сервер не ответил за 15 секунд. Проверьте endpoint."
+    except httpx.ConnectError:
+        return "❌ Не удалось подключиться к серверу. Проверьте endpoint."
+    except Exception as e:
+        return f"❌ Ошибка: {e}"
+
+
 # ═══════════════════════════════════════════════════════════════════
 # КОМАНДА /setup_ai — НАСТРОЙКА НЕЙРОСЕТИ
 # ═══════════════════════════════════════════════════════════════════
@@ -2789,6 +2913,8 @@ async def ai_provider_callback(callback: CallbackQuery, state: FSMContext):
     await state.update_data(
         ai_endpoint=provider["endpoint"],
         ai_provider_label=provider["label"],
+        _provider_key=provider_key,
+        _hint_model=provider.get("hint_model", "gpt-4o"),
     )
 
     await callback.message.answer(
@@ -2830,15 +2956,22 @@ async def ai_setup_apikey(message: Message, state: FSMContext):
     await state.update_data(ai_api_key=api_key)
     await state.update_data(_need_endpoint=False)
 
-    # Показываем подсказку по модели
-    provider_label = data.get("ai_provider_label", "")
+    # Показываем список популярных моделей для выбранного провайдера
+    data = await state.get_data()
+    provider_key = data.get("_provider_key", "")
     hint = data.get("_hint_model", "gpt-4o")
+
+    models_list = AI_MODELS_PER_PROVIDER.get(provider_key, [])
+    models_section = ""
+    if models_list:
+        items = "\n".join(f"  • `{m}`" for m in models_list)
+        models_section = f"\n📋 **Популярные модели {data.get('ai_provider_label', '')}:**\n{items}\n\n"
+
     await message.answer(
-        f"📝 Введите **название модели**:\n\n"
-        f"Например: `{hint}`\n"
-        f"• Для OpenRouter: `deepseek/deepseek-v4-flash`\n"
-        f"• Для OpenAI: `gpt-4o`, `gpt-4o-mini`\n"
-        f"• Любая другая модель провайдера",
+        f"📝 **Введите название модели**:\n\n"
+        f"{models_section}"
+        f"💡 Например: `{hint}`\n"
+        f"_(или выберите из списка выше и просто скопируйте)_",
         parse_mode=ParseMode.MARKDOWN,
     )
     await state.set_state(AiSetupState.model)
@@ -2884,13 +3017,33 @@ async def ai_setup_model(message: Message, state: FSMContext):
 
     provider_label = data.get("ai_provider_label", "Пользовательский")
     await message.answer(
-        f"✅ **AI-настройки сохранены!**\n\n"
-        f"🧩 Провайдер: `{provider_label}`\n"
-        f"🔗 Endpoint: `{endpoint}`\n"
-        f"📝 Модель: `{model}`\n\n"
-        "Теперь кнопка «Саммари» будет работать!",
+        f"⏳ Проверяю подключение к **{provider_label}**...",
         parse_mode=ParseMode.MARKDOWN,
     )
+
+    test_result = await _test_ai_connection(endpoint, api_key, model)
+
+    if test_result.startswith("✅"):
+        await message.answer(
+            f"✅ **AI-настройки сохранены!**\n\n"
+            f"🧩 Провайдер: `{provider_label}`\n"
+            f"🔗 Endpoint: `{endpoint}`\n"
+            f"📝 Модель: `{model}`\n\n"
+            f"**{test_result}**\n\n"
+            "Теперь кнопка «Саммари» будет работать!",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    else:
+        await message.answer(
+            f"⚠️ **AI-настройки сохранены**, но тест не прошёл:\n\n"
+            f"🧩 Провайдер: `{provider_label}`\n"
+            f"🔗 Endpoint: `{endpoint}`\n"
+            f"📝 Модель: `{model}`\n\n"
+            f"{test_result}\n\n"
+            "Проверьте ключ и модель. Введите `/setup ai` для перенастройки "
+            "или `/setup show ai` для просмотра текущих настроек.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════
