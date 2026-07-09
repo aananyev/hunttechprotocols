@@ -2334,7 +2334,7 @@ async def _cmd_setup_show(message: Message, arg: str):
 async def cmd_setup_start(message: Message, state: FSMContext, command: CommandObject):
     """Начинает настройку почты. /setup init — сброс и настройка заново."""
 
-    # Проверяем аргумент /setup init
+    # Проверяем аргумент
     if command.args:
         arg = command.args.strip().lower()
 
@@ -2344,6 +2344,16 @@ async def cmd_setup_start(message: Message, state: FSMContext, command: CommandO
 
         if arg.startswith("show"):
             await _cmd_setup_show(message, arg)
+            return
+
+        if arg == "ai":
+            # Перенаправляем на настройку нейросети
+            await cmd_setup_ai(message, state)
+            return
+
+        if arg == "wiki":
+            # Перенаправляем на настройку Яндекс Вики
+            await cmd_setup_wiki(message, state)
             return
 
     config = get_user_config(message.from_user.id)
