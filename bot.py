@@ -246,34 +246,92 @@ def get_ai_config(user_id: int) -> dict | None:
 # директоров видят утверждённые протоколы в едином корпоративном хранилище,
 # а не только в Telegram-чате.
 #
-# Аутентификация: IAM-токен (Yandex Cloud) или OAuth-токен Яндекс ID.
-# Токен передаётся в заголовке Authorization: Bearer <token>.
-# Получить IAM-токен: https://cloud.yandex.com/en/docs/iam/operations/iam-token/create
+# Аутентификация: IAM-токен Яндекc Облака через JWT (авторизованный ключ сервисного аккаунта).
+# Токен передаётся в заголовке Authorization: Bearer ***
+# Авторизованный ключ: Yandex Cloud Console → Сервисные аккаунты → Ключи → Авторизованный ключ
+# Роль: wiki.editor или wiki.admin
 # API endpoint: https://api.wiki.yandex.net/v1/
 
 
-def save_wiki_config(user_id: int, iam_token: str, org_id: str = ""):
-    """Сохраняет настройки Яндекс Вики: IAM-токен и ID организации.
-       Бизнес-правило: org_id нужен для доступа к wiki корпорации,
-       если у пользователя несколько организаций. Если org_id не указан,
-       API использует организацию по умолчанию."""
+def save_wiki_config(user_id: int, authorized_key: str, org_id: str = "", mode: str = ""):
+    """Сохраняет настройки Яндекс Вики: авторизованный ключ сервисного аккаунта и ID организации.
+       Бизнес-правило: authorized_key — это JSON с полями id, service_account_id, private_key.
+       IAM-токен получается свежим через JWT при каждом запросе к Wiki API.
+       org_id сохраняется только если передан непустой; если не передан — сохраняется старый.
+       mode: 'auto' (автопубликация), 'button' (по кнопке), 'off' (выкл) — по умолчанию 'off'."""
     users = _load_users()
     key = str(user_id)
     if key not in users:
         users[key] = {}
+    old_wiki = users[key].get("wiki", {})
+    existing_org_id = old_wiki.get("org_id", "")
     users[key]["wiki"] = {
-        "iam_token": iam_token,
-        "org_id": org_id,
+        "authorized_key": authorized_key,
+        "org_id": org_id or existing_org_id,  # не затираем старый org_id
+        "mode": mode or old_wiki.get("mode", "off"),  # сохраняем старый режим или off
     }
+    # Очищаем старые поля, если были
+    users[key]["wiki"].pop("api_key", None)
+    users[key]["wiki"].pop("client_id", None)
+    users[key]["wiki"].pop("client_secret", None)
+    users[key]["wiki"].pop("oauth_token", None)
     _save_users(users)
 
 
 def get_wiki_config(user_id: int) -> dict | None:
     """Возвращает настройки Яндекс Вики или None.
-       Без настроек wiki команды /wiki_test и публикация не работают."""
+       Без настроек wiki команды /wiki_test, /setup wiki test и публикация не работают."""
     config = get_user_config(user_id)
     if config and "wiki" in config:
         return config["wiki"]
+    return None
+
+
+def get_wiki_mode(user_id: int) -> str:
+    """Возвращает режим публикации в Wiki: 'auto', 'button' или 'off' (по умолчанию)."""
+    wiki_config = get_wiki_config(user_id)
+    if wiki_config:
+        return wiki_config.get("mode", "off")
+    return "off"
+
+
+async def _get_wiki_token(wiki_config: dict) -> str | None:
+    """Получает токен для Wiki API из конфига.
+       Если есть authorized_key — создаёт JWT и получает IAM-токен.
+       Если есть client_id/client_secret (старый формат) — получает OAuth-токен (fallback).
+       Возвращает токен (str) или None."""
+    auth_key = wiki_config.get("authorized_key")
+    if auth_key:
+        # Пробуем распарсить как JSON и создать JWT
+        import json
+        try:
+            key_json = json.loads(auth_key) if isinstance(auth_key, str) else auth_key
+            jwt_token = _create_jwt_from_authorized_key(key_json)
+            if jwt_token:
+                return await _get_yandex_iam_token_from_jwt(jwt_token)
+            else:
+                logger.error("Не удалось создать JWT из authorized_key")
+                return None
+        except json.JSONDecodeError as e:
+            logger.error(f"authorized_key не является валидным JSON: {e}")
+            return None
+
+    # Старый формат (API-ключ — не работает с IAM REST API, но пробуем для совместимости)
+    api_key = wiki_config.get("api_key")
+    if api_key:
+        logger.warning("API-ключ не поддерживается напрямую, нужен авторизованный ключ")
+        return None
+
+    # Старый формат (OAuth через ClientID/ClientSecret) — fallback
+    client_id = wiki_config.get("client_id")
+    client_secret = wiki_config.get("client_secret")
+    if client_id and client_secret:
+        logger.warning(
+            "Используется устаревший OAuth-формат для wiki. "
+            "Рекомендуется перенастроить через /setup wiki"
+        )
+        return await _get_yandex_oauth_token(client_id, client_secret)
+
     return None
 
 
@@ -559,6 +617,166 @@ def fetch_notes_last_week(user_id: int) -> tuple[str, list]:
 WIKI_API_BASE = "https://api.wiki.yandex.net/v1"
 
 
+async def _get_yandex_oauth_token(client_id: str, client_secret: str) -> str | None:
+    """
+    Получает OAuth-токен Яндекс ID через Client Credentials flow.
+    
+    POST https://oauth.yandex.ru/token
+    grant_type=client_credentials
+    
+    Пробует комбинации: body params / Basic Auth, со scope / без scope.
+    
+    Возвращает access_token или None при ошибке.
+    """
+    scopes_to_try = [None, "wiki:read_write", "cloud_api", "wiki_api"]
+    
+    for use_basic in [False, True]:
+        for scope in scopes_to_try:
+            method_desc = "Basic Auth" if use_basic else "body params"
+            scope_desc = f"scope={scope}" if scope else "без scope"
+            label = f"{method_desc}/{scope_desc}"
+
+            try:
+                kwargs = {
+                    "data": {"grant_type": "client_credentials"},
+                    "headers": {"Content-Type": "application/x-www-form-urlencoded"},
+                }
+
+                if scope:
+                    kwargs["data"]["scope"] = scope
+
+                if use_basic:
+                    import base64
+                    auth_str = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
+                    kwargs["headers"]["Authorization"] = f"Basic {auth_str}"
+                else:
+                    kwargs["data"]["client_id"] = client_id
+                    kwargs["data"]["client_secret"] = client_secret
+
+                async with httpx.AsyncClient(timeout=15) as client:
+                    resp = await client.post("https://oauth.yandex.ru/token", **kwargs)
+
+                if resp.status_code == 200:
+                    data = resp.json()
+                    token = data.get("access_token")
+                    if token:
+                        logger.info(f"✓ OAuth-токен получен ({label})")
+                        return token
+                    else:
+                        logger.warning(
+                            f"Статус 200, но access_token отсутствует "
+                            f"({label}): {resp.text[:300]}"
+                        )
+                        return None
+
+                # Логируем детали ошибки
+                logger.warning(
+                    f"✗ OAuth ({label}) — HTTP {resp.status_code}: "
+                    f"{resp.text[:300]}"
+                )
+
+            except Exception as e:
+                logger.error(
+                    f"✗ OAuth ({label}) — "
+                    f"исключение: {type(e).__name__}: {e}"
+                )
+
+    logger.error("Все комбинации аутентификации не сработали.")
+    return None
+
+
+def _create_jwt_from_authorized_key(key_json: dict) -> str | None:
+    """
+    Создаёт JWT для аутентификации сервисного аккаунта Яндекc Облака
+    из авторизованного ключа (Authorized Key).
+
+    Алгоритм: PS256 (RSASSA-PSS с SHA-256)
+    JWT payload: {"iss": service_account_id, "aud": "...", "iat": ..., "exp": ...}
+    """
+    try:
+        import jwt as pyjwt
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa, padding
+        from cryptography.hazmat.primitives import hashes
+        import time
+
+        service_account_id = key_json.get("service_account_id")
+        key_id = key_json.get("id")
+        private_key_pem = key_json.get("private_key")
+
+        if not all([service_account_id, key_id, private_key_pem]):
+            logger.error("JWT: отсутствуют поля в ключе (service_account_id, id, private_key)")
+            return None
+
+        # Загружаем приватный ключ
+        private_key = serialization.load_pem_private_key(
+            private_key_pem.encode(),
+            password=None,
+        )
+
+        # Создаём JWT
+        now = int(time.time())
+        payload = {
+            "iss": service_account_id,
+            "aud": "https://iam.api.cloud.yandex.net/iam/v1/tokens",
+            "iat": now,
+            "exp": now + 3600,  # 1 час
+        }
+
+        headers = {
+            "alg": "PS256",
+            "kid": key_id,
+            "typ": "JWT",
+        }
+
+        token = pyjwt.encode(payload, private_key, algorithm="PS256", headers=headers)
+        logger.info(f"✓ JWT создан для сервисного аккаунта {service_account_id[:10]}...")
+        return token
+
+    except Exception as e:
+        logger.error(f"✗ Ошибка создания JWT: {type(e).__name__}: {e}")
+        return None
+
+
+async def _get_yandex_iam_token_from_jwt(jwt_token: str) -> str | None:
+    """
+    Обменивает JWT на IAM-токен Яндекc Облака.
+
+    POST https://iam.api.cloud.yandex.net/iam/v1/tokens
+    {"jwt": "..."}
+    """
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.post(
+                "https://iam.api.cloud.yandex.net/iam/v1/tokens",
+                json={"jwt": jwt_token},
+            )
+
+        debug_msg = f"IAM из JWT: HTTP {resp.status_code} — {resp.text[:500]}"
+        logger.warning(debug_msg)
+        with open("/tmp/iam_debug.log", "a") as f:
+            f.write(f"{debug_msg}\n")
+
+        if resp.status_code == 200:
+            data = resp.json()
+            token = data.get("iamToken")
+            if token:
+                logger.info("✓ IAM-токен получен через JWT")
+                return token
+            else:
+                logger.warning(f"Статус 200, но iamToken отсутствует: {resp.text[:300]}")
+                return None
+
+        return None
+
+    except Exception as e:
+        err_msg = f"✗ IAM из JWT: исключение {type(e).__name__}: {e}"
+        logger.error(err_msg)
+        with open("/tmp/iam_debug.log", "a") as f:
+            f.write(f"{err_msg}\n")
+        return None
+
+
 async def _test_wiki_connection(iam_token: str, org_id: str = "") -> str:
     """
     Проверяет подключение к Яндекс Вики API.
@@ -661,6 +879,73 @@ async def _test_wiki_connection(iam_token: str, org_id: str = "") -> str:
         title = "❌ **Подключение к Яндекс Вики НЕ работает.**\n\n"
 
     return title + "\n".join(report_parts)
+
+
+async def publish_to_wiki(title: str, content: str, wiki_config: dict) -> tuple[bool, str]:
+    """
+    Публикует страницу в Яндекс Вики.
+    
+    Бизнес-правило: после генерации AI-саммари конспекта встречи,
+    страница автоматически (или по кнопке) публикуется в корпоративной
+    Яндекс Вики, чтобы все члены Совета директоров видели протокол.
+    
+    API: POST {WIKI_API_BASE}/pages — создаёт новую страницу.
+    Если страница с таким title уже существует — создаст дубликат
+    (Wiki позволяет страницы с одинаковыми названиями в разных разделах).
+    
+    Args:
+        title: название страницы (например, «Совет директоров 2026-07-10»)
+        content: markdown-содержимое страницы
+        wiki_config: словарь с authorized_key и org_id
+    
+    Returns:
+        (success: bool, message: str) — результат и ссылка или ошибка
+    """
+    token = await _get_wiki_token(wiki_config)
+    if not token:
+        return False, "❌ Не удалось получить IAM-токен для Яндекс Вики."
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+    org_id = wiki_config.get("org_id", "")
+    if org_id:
+        headers["X-Org-ID"] = org_id
+
+    payload = {
+        "title": title,
+        "content": content,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                f"{WIKI_API_BASE}/pages",
+                headers=headers,
+                json=payload,
+            )
+            if resp.status_code in (200, 201):
+                data = resp.json()
+                page_slug = data.get("slug", "?")
+                page_url = f"https://wiki.yandex.ru/{page_slug}"
+                if org_id:
+                    page_url += f"?orgId={org_id}"
+                return True, f"✅ Страница опубликована: {page_url}"
+            elif resp.status_code == 401:
+                return False, "❌ Ошибка авторизации (401): IAM-токен недействителен."
+            elif resp.status_code == 403:
+                return False, (
+                    "❌ Нет прав на создание страниц (403).\n"
+                    "Проверьте, что сервисный аккаунт имеет роль `wiki.editor`."
+                )
+            else:
+                return False, f"❌ Ошибка Wiki API ({resp.status_code}): {resp.text[:300]}"
+    except httpx.TimeoutException:
+        return False, "❌ Таймаут: Яндекс Вики не ответил за 30 секунд."
+    except Exception as e:
+        return False, f"❌ Ошибка подключения к Wiki: {e}"
+
 
 import json
 from aiogram.fsm.state import State, StatesGroup
@@ -908,11 +1193,10 @@ class AiSetupState(StatesGroup):
 
 
 class WikiSetupState(StatesGroup):
-    """Настройка Яндекс Вики: IAM-токен → (опционально) ID организации.
-       Бизнес-правило: IAM-токен — ключ доступа к API Яндекс Вики.
-       Org ID нужен, если у компании несколько организаций в Яндекс 360."""
-    iam_token = State()
-    org_id = State()
+    """Настройка Яндекс Вики: API-ключ сервисного аккаунта Яндекc Облака.
+       Бизнес-правило: API-ключ создаётся в Yandex Cloud Console для сервисного аккаунта
+       с ролью wiki.editor. После ввода ключа бот получает IAM-токен и проверяет Wiki API."""
+    api_key = State()
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -1167,6 +1451,28 @@ async def summary_callback(callback: CallbackQuery, state: FSMContext):
         for i in range(0, len(result), 3500):
             await callback.message.answer(result[i:i + 3500])
 
+    # ── Авто-публикация в Wiki или кнопка ─────────────────────
+    wiki_config = get_wiki_config(user_id)
+    if wiki_config and wiki_config.get("authorized_key"):
+        wiki_mode = get_wiki_mode(user_id)
+        if wiki_mode == "auto":
+            # Автоматическая публикация в Wiki
+            page_title = f"{prompt_topic} {datetime.now().strftime('%Y-%m-%d')}"
+            success, msg = await publish_to_wiki(page_title, result, wiki_config)
+            await callback.message.answer(msg, parse_mode=ParseMode.MARKDOWN)
+        elif wiki_mode == "button":
+            # Кнопка «Опубликовать в Wiki»
+            kb = InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(
+                    text="📤 Опубликовать в Wiki",
+                    callback_data=f"publish_wiki:{idx_str}:{prompt_topic}"
+                )
+            ]])
+            await callback.message.answer(
+                "📚 Хотите опубликовать это саммари в Яндекс Вики?",
+                reply_markup=kb,
+            )
+
 
 @dp.callback_query(lambda c: c.data and c.data.startswith("choose_prompt:"))
 async def choose_prompt_callback(callback: CallbackQuery, state: FSMContext):
@@ -1198,6 +1504,76 @@ async def choose_prompt_callback(callback: CallbackQuery, state: FSMContext):
         f"Или используйте `/prompt` для управления промптами.",
         parse_mode=ParseMode.MARKDOWN,
     )
+
+
+# ── Callback-хендлер для кнопки «📤 Опубликовать в Wiki» ────
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("publish_wiki:"))
+async def publish_wiki_callback(callback: CallbackQuery, state: FSMContext):
+    """
+    Когда пользователь нажимает «📤 Опубликовать в Wiki»:
+    - Достаём саммари из кеша (повторно генерируем через AI)
+    - Публикуем в Яндекс Вики
+    - Показываем результат
+    
+    Формат callback_data: publish_wiki:IDX:PROMPT_TOPIC
+    """
+    parts = callback.data.split(":", 2)
+    if len(parts) < 3:
+        await callback.answer("❌ Ошибка данных", show_alert=True)
+        return
+    _, idx_str, prompt_topic = parts
+    idx = int(idx_str) - 1
+    await callback.answer()
+
+    user_id = callback.from_user.id
+
+    # Проверяем настройки Wiki
+    wiki_config = get_wiki_config(user_id)
+    if not wiki_config or not wiki_config.get("authorized_key"):
+        await callback.message.answer(
+            "❌ **Яндекс Вики не настроен.**\n"
+            "Настройте через `/setup wiki`.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    # Загружаем конспект и промпт из кеша
+    items = _load_notes_cache(user_id)
+    if idx < 0 or idx >= len(items):
+        await callback.message.answer("❌ Конспект устарел. Запросите /list заново.")
+        return
+
+    _dt, display, txt_content = items[idx]
+    prompts = _load_prompts()
+    prompt_text = prompts.get(prompt_topic, "")
+    if not prompt_text or not txt_content:
+        await callback.message.answer("❌ Данные конспекта или промпта не найдены.")
+        return
+
+    # Повторно генерируем саммари (или можно было кешировать, но проще перегенерировать)
+    status_msg = await callback.message.answer(
+        f"⏳ Генерирую саммари для «{display}»...",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+    system_prompt = prompt_text
+    user_text = f"Конспект встречи: «{display}»\n\n{txt_content}"
+    result = await call_ai(user_id, system_prompt, user_text)
+
+    try:
+        await status_msg.delete()
+    except Exception:
+        pass
+
+    if result.startswith("❌"):
+        await callback.message.answer(result)
+        return
+
+    # Публикуем в Wiki
+    page_title = f"{prompt_topic} {datetime.now().strftime('%Y-%m-%d')}"
+    success, msg = await publish_to_wiki(page_title, result, wiki_config)
+    await callback.message.answer(msg, parse_mode=ParseMode.MARKDOWN)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -2080,8 +2456,17 @@ HELP_PROMPT = (
 HELP_WIKI = (
     "📚 **Яндекс Вики**\n\n"
     "`/setup wiki`\n"
-    "  Настройка подключения к Яндекс Вики.\n"
-    "  Потребуется IAM-токен из Яндекс Облака.\n"
+    "  Настройка подключения к Яндекс Вики (IAM через JWT).\n"
+    "  Потребуется JSON авторизованного ключа сервисного аккаунта.\n"
+    "`/setup wiki test`\n"
+    "  Проверка подключения к Яндекс Вики.\n"
+    "`/setup wiki org <ID>`\n"
+    "  Указать ID организации Яндекс 360 для бизнеса.\n"
+    "`/setup wiki mode auto|button|off`\n"
+    "  Режим публикации:\n"
+    "  • `auto` — сразу после AI саммари → в Wiki\n"
+    "  • `button` — кнопка «📤 В Wiki» под саммари\n"
+    "  • `off` — публикация отключена (по умолчанию)\n"
     "`/wiki test` или `/wiki stat`\n"
     "  Проверка подключения. Показывает информацию\n"
     "  о пользователе и доступных страницах.\n"
@@ -2400,8 +2785,20 @@ async def _cmd_setup_show(message: Message, arg: str):
         lines.append("**📚 Яндекс Вики:**")
         wiki = get_wiki_config(user_id)
         if wiki:
-            lines.append(f"  • IAM-токен: {'✅ задан' if wiki.get('iam_token') else '❌ не задан'}")
+            has_key = bool(wiki.get("authorized_key"))
+            has_api = bool(wiki.get("api_key"))
+            has_old_oauth = bool(wiki.get("client_id") and wiki.get("client_secret"))
+            lines.append(f"  • Авторизованный ключ: {'✅ задан' if has_key else '❌ не задан'}")
+            if has_api:
+                lines.append("  • ⚠️ API-ключ не поддерживается — ")
+                lines.append("    перенастройте через `/setup wiki`")
+            if has_old_oauth:
+                lines.append("  • ⚠️ Используется **устаревший OAuth-формат** — ")
+                lines.append("    перенастройте через `/setup wiki`")
             lines.append(f"  • ID организации: `{wiki.get('org_id', 'не указан') or 'не указан'}`")
+            mode = wiki.get("mode", "off")
+            mode_labels = {"auto": "🚀 Авто", "button": "📤 По кнопке", "off": "⏸️ Выкл"}
+            lines.append(f"  • Режим публикации: {mode_labels.get(mode, mode)}")
         else:
             lines.append("  ❌ **Не настроено.** Используйте `/setup wiki`")
 
@@ -2451,12 +2848,23 @@ async def _cmd_setup_show(message: Message, arg: str):
                 parse_mode=ParseMode.MARKDOWN,
             )
             return
-        await message.answer(
-            "📚 **Настройки Яндекс Вики**\n\n"
-            f"• IAM-токен: {'✅ задан' if wiki.get('iam_token') else '❌ не задан'}\n"
+        has_key = bool(wiki.get("authorized_key"))
+        has_old = bool(wiki.get("client_id") and wiki.get("client_secret"))
+        mode = wiki.get("mode", "off")
+        mode_labels = {"auto": "🚀 Авто (сразу в Wiki)", "button": "📤 По кнопке", "off": "⏸️ Выключено"}
+        lines = [
+            "📚 **Настройки Яндекс Вики**\n",
+            f"• JWT-ключ: {'✅ задан' if has_key else '❌ не задан'}",
+        ]
+        if has_old:
+            lines.append("• ⚠️ Старый OAuth-формат — перенастройте через `/setup wiki`")
+        lines.extend([
             f"• ID организации: `{wiki.get('org_id', 'не указан') or 'не указан'}`",
-            parse_mode=ParseMode.MARKDOWN,
-        )
+            f"• Режим публикации: {mode_labels.get(mode, mode)}",
+            "",
+            "Для проверки используйте `/setup wiki test` или `/wiki test`.",
+        ])
+        await message.answer("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
     else:
         await message.answer(
@@ -2527,9 +2935,82 @@ async def cmd_setup_start(message: Message, state: FSMContext, command: CommandO
             await _cmd_setup_ai_test(message)
             return
 
+        if arg == "wiki test":
+            # Тестирование подключения к Яндекс Вики
+            await cmd_setup_wiki_test(message)
+            return
+
         if arg == "wiki":
             # Перенаправляем на настройку Яндекс Вики
             await cmd_setup_wiki(message, state)
+            return
+
+        if arg.startswith("wiki org "):
+            # Установка ID организации для Яндекс Вики
+            org_id = arg[len("wiki org "):].strip()
+            if not org_id:
+                await message.answer(
+                    "⚠️ Укажите ID организации.\n"
+                    "Пример: `/setup wiki org bpf1234567890abcdef`",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+                return
+            user_id = message.from_user.id
+            wiki_config = get_wiki_config(user_id)
+            if not wiki_config or not wiki_config.get("authorized_key"):
+                await message.answer(
+                    "❌ **Сначала настройте Яндекс Вики через `/setup wiki`.**",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+                return
+            # Обновляем org_id
+            wiki_config["org_id"] = org_id
+            users = _load_users()
+            key = str(user_id)
+            if key in users:
+                users[key]["wiki"] = wiki_config
+                _save_users(users)
+            await message.answer(
+                f"✅ **ID организации сохранён:** `{org_id}`\n\n"
+                "Проверьте подключение: `/wiki test`",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return
+
+        if arg.startswith("wiki mode"):
+            # Смена режима публикации в Wiki
+            mode = arg[len("wiki mode"):].strip()
+            if mode not in ("auto", "button", "off"):
+                await message.answer(
+                    "⚠️ **Неверный режим.**\n"
+                    "Используйте: `/setup wiki mode auto|button|off`\n\n"
+                    "• `auto` — сразу после AI саммари публикуется в Wiki\n"
+                    "• `button` — под саммари кнопка «📤 В Wiki»\n"
+                    "• `off` — публикация в Wiki отключена",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+                return
+            user_id = message.from_user.id
+            wiki_config = get_wiki_config(user_id)
+            if not wiki_config or not wiki_config.get("authorized_key"):
+                await message.answer(
+                    "❌ **Сначала настройте Яндекс Вики через `/setup wiki`.**",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+                return
+            # Обновляем mode
+            wiki_config["mode"] = mode
+            users = _load_users()
+            key = str(user_id)
+            if key in users:
+                users[key]["wiki"] = wiki_config
+                _save_users(users)
+            mode_labels = {"auto": "🚀 Авто (сразу в Wiki)", "button": "📤 По кнопке", "off": "⏸️ Выключено"}
+            await message.answer(
+                f"✅ **Режим публикации в Wiki:** {mode_labels.get(mode, mode)}\n\n"
+                f"Текущий режим: `/setup show wiki`",
+                parse_mode=ParseMode.MARKDOWN,
+            )
             return
 
     config = get_user_config(message.from_user.id)
@@ -3092,107 +3573,153 @@ async def ai_setup_model(message: Message, state: FSMContext):
 
 
 # ═══════════════════════════════════════════════════════════════════
-# КОМАНДА /setup_wiki — НАСТРОЙКА YANDEX WIKI
+# КОМАНДА /setup_wiki — НАСТРОЙКА YANDEX WIKI (IAM через JWT)
 # ═══════════════════════════════════════════════════════════════════
 # Бизнес-логика: Яндекс Вики — корпоративная база знаний.
-# Настройка состоит из IAM-токена (обязательно) и ID организации (опционально).
-# IAM-токен можно получить в Яндекс Облаке:
-# https://cloud.yandex.com/en/docs/iam/operations/iam-token/create
-#
-# Эти же настройки используются для публикации саммари в вики.
+# Пользователь создаёт авторизованный ключ (Authorized Key) сервисного аккаунта
+# в Yandex Cloud Console (роль wiki.editor/wiki.admin).
+# Бот создаёт JWT из ключа, обменивает на IAM-токен через iam.api.cloud.yandex.net
+# и проверяет подключение к API Яндекс Вики.
 
 
 @dp.message(Command("setup_wiki"))
 async def cmd_setup_wiki(message: Message, state: FSMContext):
-    """Начинает настройку Яндекс Вики: запрашивает IAM-токен.
-       Бизнес-правило: используем те же настройки, что и для IMAP
-       (пользователь уже авторизован в Яндекс 360), но для API
-       нужен отдельный IAM-токен."""
+    """Начинает настройку Яндекс Вики: запрашивает JSON авторизованного ключа.
+       Бизнес-правило: авторизованный ключ создаётся в Yandex Cloud Console
+       для сервисного аккаунта с ролью wiki.editor.
+       После ввода JSON бот создаёт JWT, получает IAM-токен и проверяет Wiki API."""
     config = get_wiki_config(message.from_user.id)
-    current = "••••••••" if config and config.get("iam_token") else "не задан"
+    current = "✅ задан" if config and config.get("authorized_key") else "не задан"
     await message.answer(
-        "📚 **Настройка Яндекс Вики**\n\n"
+        "📚 **Настройка Яндекс Вики (IAM через JWT)**\n\n"
         "Яндекс Вики — корпоративная база знаний. "
         "Сюда можно публиковать саммари совещаний.\n\n"
-        f"🔑 **IAM-токен** ({current}):\n"
-        "Вставьте IAM-токен для доступа к API Яндекс Вики.\n\n"
-        "Как получить токен:\n"
-        "1. Перейдите в https://cloud.yandex.com\n"
-        "2. Создайте сервисный аккаунт\n"
-        "3. Сгенерируйте IAM-токен\n\n"
-        "Или используйте OAuth-токен Яндекс ID:\n"
-        "https://oauth.yandex.ru/",
+        f"🔑 **Авторизованный ключ** ({current})\n\n"
+        "Вставьте **содержимое JSON-файла** авторизованного ключа\n"
+        "сервисного аккаунта Яндекc Облака.\n\n"
+        "**Как получить:**\n"
+        "1️⃣ **Yandex Cloud Console** → Сервисные аккаунты\n"
+        "2️⃣ Выберите сервисный аккаунт (с ролью **`wiki.editor`**)\n"
+        "3️⃣ Вкладка **Ключи** → **Создать авторизованный ключ**\n"
+        "4️⃣ Скачается JSON-файл — откройте и скопируйте ВСЁ его содержимое\n"
+        "5️⃣ Вставьте сюда одной строкой или как есть (многострочный JSON)\n\n"
+        "JSON должен содержать поля: `id`, `service_account_id`, `private_key`",
         parse_mode=ParseMode.MARKDOWN,
     )
-    await state.set_state(WikiSetupState.iam_token)
+    await state.set_state(WikiSetupState.api_key)
 
 
-@dp.message(WikiSetupState.iam_token)
-async def setup_wiki_token(message: Message, state: FSMContext):
-    """Сохраняет IAM-токен и запрашивает ID организации (опционально).
-       Бизнес-правило: токен — единственное обязательное поле.
-       Org ID нужен только в мульти-организационных конфигурациях."""
-    iam_token = message.text.strip()
-    if not iam_token:
-        await message.answer("⚠️ IAM-токен не может быть пустым. Вставьте токен:")
+@dp.message(WikiSetupState.api_key)
+async def setup_wiki_authorized_key(message: Message, state: FSMContext):
+    """Принимает JSON авторизованного ключа, создаёт JWT, получает IAM-токен, тестирует.
+       Бизнес-правило: authorized_key — JSON с полями id, service_account_id, private_key."""
+    raw = message.text.strip()
+    if not raw:
+        await message.answer("⚠️ JSON авторизованного ключа не может быть пустым. Вставьте содержимое JSON-файла:")
         return
 
-    # Проверяем токен — сразу делаем тестовый запрос к API
-    status = await message.answer("🔄 Проверяю IAM-токен...")
+    # Пробуем распарсить JSON
+    import json
     try:
-        wiki_config = get_wiki_config(message.from_user.id)
-        org_id = wiki_config.get("org_id", "") if wiki_config else ""
-        test_result = await _test_wiki_connection(iam_token, org_id)
-        if test_result.startswith("❌"):
-            await status.edit_text(
-                f"{test_result}\n\n"
-                "Попробуйте ещё раз. Получите новый токен и введите его:\n"
-                "https://cloud.yandex.com/en/docs/iam/operations/iam-token/create",
-                parse_mode=ParseMode.MARKDOWN,
-            )
-            return
-    except Exception as e:
+        key_json = json.loads(raw)
+    except json.JSONDecodeError:
+        await message.answer(
+            "❌ **Не удалось распарсить JSON.**\n\n"
+            "Убедитесь, что вы скопировали весь JSON-файл.\n"
+            "JSON должен начинаться с `{` и заканчиваться на `}`.\n\n"
+            "Введите `/setup wiki` чтобы попробовать снова.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        await state.clear()
+        return
+
+    # Проверяем обязательные поля
+    if not key_json.get("id") or not key_json.get("service_account_id") or not key_json.get("private_key"):
+        missing = []
+        if not key_json.get("id"): missing.append("`id`")
+        if not key_json.get("service_account_id"): missing.append("`service_account_id`")
+        if not key_json.get("private_key"): missing.append("`private_key`")
+        await message.answer(
+            f"❌ **В JSON отсутствуют поля:** {', '.join(missing)}\n\n"
+            "Убедитесь, что вы скачали именно **авторизованный ключ**\n"
+            "(Authorized Key), а не API-ключ.\n\n"
+            "Введите `/setup wiki` чтобы попробовать снова.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        await state.clear()
+        return
+
+    user_id = message.from_user.id
+    status = await message.answer("🔄 Создаю JWT и получаю IAM-токен...")
+
+    # Создаём JWT из ключа
+    jwt_token = _create_jwt_from_authorized_key(key_json)
+    if not jwt_token:
+        await state.clear()
         await status.edit_text(
-            f"❌ Ошибка при проверке токена: {e}\n\n"
-            "Попробуйте ещё раз. Введите IAM-токен:",
+            "❌ **Не удалось создать JWT.**\n\n"
+            "Возможно, приватный ключ повреждён или имеет неверный формат.\n"
+            "Создайте новый авторизованный ключ в Yandex Cloud Console.",
             parse_mode=ParseMode.MARKDOWN,
         )
         return
 
-    # Токен валиден — сохраняем и спрашиваем org_id
-    await state.update_data(iam_token=iam_token)
+    await status.edit_text("🔄 JWT создан. Получаю IAM-токен...")
+
+    # Получаем IAM-токен
+    iam_token = await _get_yandex_iam_token_from_jwt(jwt_token)
+    if not iam_token:
+        await state.clear()
+        await status.edit_text(
+            "❌ **Не удалось получить IAM-токен.**\n\n"
+            "Проверьте, что сервисный аккаунт существует и активен.\n"
+            "Возможно, ключ был отозван. Подробности в логах бота.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    await status.edit_text("🔄 IAM-токен получен. Проверяю подключение к Яндекс Вики...")
+
+    # Сохраняем ключ ДО теста — чтобы можно было перетестировать без повторного ввода
+    # org_id не передаём — сохранится старый, если был
+    save_wiki_config(user_id, json.dumps(key_json))
+
+    # Проверяем подключение к Wiki API (используем org_id из только что сохранённого конфига)
+    saved_org_id = get_wiki_config(user_id).get("org_id", "")
+    report = await _test_wiki_connection(iam_token, saved_org_id)
+
+    if report.startswith("❌"):
+        await state.clear()
+        org_hint = ""
+        if not saved_org_id:
+            org_hint = (
+                "\n\n**💡 Не указан ID организации!**\n"
+                "Найдите ID в Yandex Cloud Console:\n"
+                "Организация → Управление организацией\n"
+                "и введите `/setup wiki org <ID_организации>`\n"
+            )
+        await status.edit_text(
+            f"❌ **IAM-токен получен, но подключение к Вики не прошло.**\n\n"
+            f"{report}"
+            f"{org_hint}",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    await state.clear()
     await status.edit_text(
-        "✅ **IAM-токен принят!**\n\n"
-        "🏢 **ID организации** (опционально):\n"
-        "Если у вас несколько организаций в Яндекс 360, "
-        "укажите ID нужной.\n"
-        "Если организация одна — просто отправьте `/skip`\n"
-        "или оставьте поле пустым.",
+        f"✅ **Яндекс Вики настроена!**\n\n"
+        f"{report}",
         parse_mode=ParseMode.MARKDOWN,
     )
-    await state.set_state(WikiSetupState.org_id)
 
 
-@dp.message(WikiSetupState.org_id)
-async def setup_wiki_org_id(message: Message, state: FSMContext):
-    """Сохраняет ID организации (опционально) и завершает настройку.
-       Пустой ввод или /skip — пропускаем org_id."""
-    text = message.text.strip().lower()
-    if text and text != "/skip":
-        org_id = text
-    else:
-        org_id = ""
-
-    data = await state.get_data()
-    iam_token = data["iam_token"]
-    user_id = message.from_user.id
-
-    save_wiki_config(user_id, iam_token, org_id)
-    await state.clear()
-
-    # Показываем отчёт о подключении
-    report = await _test_wiki_connection(iam_token, org_id)
-    await message.answer(report, parse_mode=ParseMode.MARKDOWN)
+# ═══════════════════════════════════════════════════════════════════
+@dp.message(Command("setup_wiki_test"))
+async def cmd_setup_wiki_test(message: Message):
+    """Проверяет подключение к Яндекс Вики через /setup wiki test.
+       Получает свежий OAuth-токен и тестирует API."""
+    await cmd_wiki_test(message)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -3214,30 +3741,58 @@ async def cmd_wiki(message: Message, command: CommandObject):
             "📚 **Яндекс Вики**\n\n"
             "• `/wiki test` — проверить подключение\n"
             "• `/wiki stat` — то же самое\n"
-            "• `/setup wiki` — настроить подключение",
+            "• `/setup wiki` — настроить подключение (IAM через JWT)\n"
+            "• `/setup wiki test` — проверить подключение",
             parse_mode=ParseMode.MARKDOWN,
         )
 
 
 @dp.message(Command("wiki_test", "wikistat"))
 async def cmd_wiki_test(message: Message):
-    """Проверяет подключение к Яндекс Вики и показывает отчёт."""
+    """Проверяет подключение к Яндекс Вики и показывает отчёт.
+       Получает свежий IAM-токен через API-ключ сервисного аккаунта."""
     user_id = message.from_user.id
     wiki_config = get_wiki_config(user_id)
     if not wiki_config:
         await message.answer(
             "❌ Яндекс Вики не настроена.\n\n"
-            "Используйте `/setup_wiki` чтобы настроить:\n"
-            "1️⃣ IAM-токен (обязательно)\n"
-            "2️⃣ ID организации (опционально)",
+            "Используйте `/setup wiki` чтобы настроить:\n"
+            "1️⃣ Yandex Cloud Console → Сервисные аккаунты\n"
+            "2️⃣ Создать авторизованный ключ с ролью wiki.editor",
             parse_mode=ParseMode.MARKDOWN,
         )
         return
 
-    status = await message.answer("🔄 Проверяю подключение к Яндекс Вики...")
+    # Проверяем наличие любого формата ключа
+    has_auth_key = bool(wiki_config.get("authorized_key"))
+    has_api_key = bool(wiki_config.get("api_key"))
+    has_old_oauth = bool(wiki_config.get("client_id") and wiki_config.get("client_secret"))
+
+    if not has_auth_key and not has_api_key and not has_old_oauth:
+        await message.answer(
+            "❌ **Ключ не найден.**\n\n"
+            "Перенастройте Яндекс Вики через `/setup wiki`.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    status = await message.answer("🔄 Получаю свежий токен...")
+
+    # Получаем токен через универсальную функцию
+    token = await _get_wiki_token(wiki_config)
+    if not token:
+        await status.edit_text(
+            "❌ **Не удалось получить токен.**\n\n"
+            "Проверьте авторизованный ключ. Возможно, он отозван.\n"
+            "Перенастройте через `/setup wiki`.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    await status.edit_text("🔄 Проверяю подключение к Яндекс Вики...")
     try:
         report = await _test_wiki_connection(
-            wiki_config["iam_token"],
+            token,
             wiki_config.get("org_id", ""),
         )
         await status.edit_text(report, parse_mode=ParseMode.MARKDOWN)
