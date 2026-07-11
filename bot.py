@@ -27,6 +27,8 @@ import tempfile
 import zipfile
 import xml.etree.ElementTree as ET
 
+import db  # Модуль PostgreSQL (включается при наличии DB_HOST в .env)
+
 # ── Логирование ──────────────────────────────────────────────────
 # Логи нужны, чтобы отслеживать работу бота в фоне — кто и когда
 # запрашивал конспекты, были ли ошибки IMAP/AI.
@@ -253,12 +255,13 @@ def get_ai_config(user_id: int) -> dict | None:
 # API endpoint: https://api.wiki.yandex.net/v1/
 
 
-def save_wiki_config(user_id: int, authorized_key: str, org_id: str = "", mode: str = ""):
+def save_wiki_config(user_id: int, authorized_key: str, org_id: str = "", mode: str = "", folder: str = ""):
     """Сохраняет настройки Яндекс Вики: авторизованный ключ сервисного аккаунта и ID организации.
        Бизнес-правило: authorized_key — это JSON с полями id, service_account_id, private_key.
        IAM-токен получается свежим через JWT при каждом запросе к Wiki API.
        org_id сохраняется только если передан непустой; если не передан — сохраняется старый.
-       mode: 'auto' (автопубликация), 'button' (по кнопке), 'off' (выкл) — по умолчанию 'off'."""
+       mode: 'auto' (автопубликация), 'button' (по кнопке), 'off' (выкл) — по умолчанию 'off'.
+       folder: slug раздела Wiki, куда публиковать страницы (например, 'hr_meetings')."""
     users = _load_users()
     key = str(user_id)
     if key not in users:
@@ -267,8 +270,9 @@ def save_wiki_config(user_id: int, authorized_key: str, org_id: str = "", mode: 
     existing_org_id = old_wiki.get("org_id", "")
     users[key]["wiki"] = {
         "authorized_key": authorized_key,
-        "org_id": org_id or existing_org_id,  # не затираем старый org_id
-        "mode": mode or old_wiki.get("mode", "off"),  # сохраняем старый режим или off
+        "org_id": org_id or existing_org_id,
+        "mode": mode or old_wiki.get("mode", "off"),
+        "folder": folder or old_wiki.get("folder", ""),
     }
     # Очищаем старые поля, если были
     users[key]["wiki"].pop("api_key", None)
@@ -293,6 +297,34 @@ def get_wiki_mode(user_id: int) -> str:
     if wiki_config:
         return wiki_config.get("mode", "off")
     return "off"
+
+
+# ── Хранилище настроек PostgreSQL ──────────────────────────
+
+
+def save_db_config(user_id: int, host: str, port: int, name: str, user: str, password: str):
+    """Сохраняет настройки подключения к PostgreSQL в users.json.
+       Только пользователь-администратор может настраивать БД."""
+    users = _load_users()
+    key = str(user_id)
+    if key not in users:
+        users[key] = {}
+    users[key]["db"] = {
+        "host": host,
+        "port": port,
+        "name": name,
+        "user": user,
+        "password": password,
+    }
+    _save_users(users)
+
+
+def get_db_config(user_id: int) -> dict | None:
+    """Возвращает настройки PostgreSQL или None."""
+    config = get_user_config(user_id)
+    if config and "db" in config:
+        return config["db"]
+    return None
 
 
 async def _get_wiki_token(wiki_config: dict) -> str | None:
@@ -435,16 +467,14 @@ def _filter_and_extract(server, msg_ids: list[bytes]) -> list[tuple]:
     Письма НЕ ДОЛЖНЫ помечаться как прочитанные. Используем BODY.PEEK[]
     вместо RFC822, плюс явно снимаем флаг \\Seen — двойная защита.
     
-    Отображение темы: если тема вида "Конспект встречи [Название]",
-    показываем только "[Название]". Если "Конспект встречи от 01.01"
-    (без названия), показываем полную тему.
+    Возвращает список кортежей:
+        (datetime, display, txt_content, email_msg_id, email_from)
     """
     matched: list[tuple] = []
 
     for msg_id in msg_ids:
         # BODY.PEEK[] — единственный правильный способ читать письмо
-        # не снимая флаг UNSEEN. Если использовать RFC822, сервер
-        # автоматически пометит письмо прочитанным.
+        # не снимая флаг UNSEEN.
         typ, msg_data = server.fetch(msg_id, "(BODY.PEEK[])")
         if typ != "OK":
             continue
@@ -453,14 +483,9 @@ def _filter_and_extract(server, msg_ids: list[bytes]) -> list[tuple]:
         msg = email.message_from_bytes(raw_email)
 
         subject = decode_mime_header(msg.get("Subject", ""))
-        # Бизнес-правило: отбираем только письма по нашей теме.
-        # Кириллица может быть в разной кодировке, поэтому сравниваем
-        # в нижнем регистре.
         if not subject.lower().startswith(SUBJECT_FILTER.lower()):
             continue
 
-        # Формируем отображаемый заголовок: убираем кавычки вокруг темы,
-        # отсекаем префикс "Конспект встречи".
         clean_subject = subject
         for ch in ("«", "»", '"', "'"):
             clean_subject = clean_subject.replace(ch, "")
@@ -471,8 +496,6 @@ def _filter_and_extract(server, msg_ids: list[bytes]) -> list[tuple]:
             remainder = remainder.replace(ch, "")
         remainder = remainder.strip()
 
-        # Если после префикса идёт "от [дата]" — названия встречи нет,
-        # показываем полную тему. Иначе — только название.
         if remainder.lower().startswith("от "):
             display = clean_subject
         else:
@@ -480,15 +503,15 @@ def _filter_and_extract(server, msg_ids: list[bytes]) -> list[tuple]:
 
         dt = get_email_date(msg) or datetime.now()
 
-        # Извлекаем txt-содержимое (вложение или тело письма)
         txts = extract_txt_attachments(msg)
         txt_content = "\n\n---\n\n".join(txts) if txts else ""
 
-        matched.append((dt, display, txt_content))
+        email_msg_id = msg.get("Message-ID", "") or ""
+        email_from = decode_mime_header(msg.get("From", ""))
+        imap_msg_id = msg_id.decode() if isinstance(msg_id, bytes) else str(msg_id)
 
-        # Гарантия: явно снимаем флаг \\Seen, если сервер его вдруг поставил.
-        # Yandex и некоторые провайдеры игнорируют PEEK и всё равно
-        # маркируют письмо как прочитанное.
+        matched.append((dt, display, txt_content, email_msg_id, email_from, imap_msg_id))
+
         try:
             server.store(msg_id, "-FLAGS", "(\\Seen)")
         except Exception:
@@ -500,14 +523,14 @@ def _filter_and_extract(server, msg_ids: list[bytes]) -> list[tuple]:
     return matched
 
 
-def _format_list(matched: list[tuple[datetime, str, str]], title: str) -> str:
+def _format_list(matched: list, title: str) -> str:
     """Форматирует список конспектов в текст для отправки в Telegram.
-       Каждый элемент: (datetime, display_text, txt_content)."""
+       Каждый элемент: (datetime, display_text, txt_content, ...)."""
     lines: list[str] = []
     lines.append(f"{title} — всего {len(matched)}")
     lines.append("")
-    for idx, (_, display, _) in enumerate(matched, 1):
-        lines.append(f"{idx}. {display}")
+    for idx, item in enumerate(matched, 1):
+        lines.append(f"{idx}. {item[1]}")
     return "\n".join(lines)
 
 
@@ -535,6 +558,17 @@ def fetch_notes(user_id: int) -> tuple[str, list]:
         matched = _filter_and_extract(server, unseen_ids)
         if not matched:
             return ("📭 Нет непрочитанных писем с темой «Конспект встречи».", [])
+        # Сохраняем конспекты в PostgreSQL (асинхронно, fire-and-forget)
+        try:
+            loop = asyncio.get_event_loop()
+            for item in matched:
+                dt, disp, txt, email_msg_id, frm, imap_msg_id = item[0], item[1], item[2], item[3], item[4], item[5]
+                if email_msg_id:
+                    loop.create_task(
+                        db.save_meeting(email_msg_id, user_id, frm, f"{SUBJECT_FILTER}: {disp}", dt, txt, imap_msg_id)
+                    )
+        except RuntimeError:
+            pass
         return (_format_list(matched, "📋 **Новые конспекты встреч**"), matched)
     finally:
         server.close()
@@ -560,12 +594,24 @@ def fetch_new_notes(user_id: int) -> tuple[str, list]:
             return ("No new meeting notes.", [])
         seen = _get_new_comms_for_user(user_id)
         new_items = []
-        for dt, display, txt in matched:
+        for item in matched:
+            dt, display, txt, email_msg_id, email_from, imap_msg_id = item[0], item[1], item[2], item[3], item[4], item[5]
             uid = f"{dt.timestamp()}:{display}"
             if uid not in seen:
-                new_items.append((dt, display, txt))
+                new_items.append(item)
         if not new_items:
             return ("No new conspects since last check.", [])
+        # Сохраняем в PostgreSQL (асинхронно, fire-and-forget)
+        try:
+            loop = asyncio.get_event_loop()
+            for item in new_items:
+                dt, disp, txt, email_msg_id, frm, imap_msg_id = item[0], item[1], item[2], item[3], item[4], item[5]
+                if email_msg_id:
+                    loop.create_task(
+                        db.save_meeting(email_msg_id, user_id, frm, f"{SUBJECT_FILTER}: {disp}", dt, txt, imap_msg_id)
+                    )
+        except RuntimeError:
+            pass
         return (_format_list(new_items, "New conspects (first time)"), new_items)
     finally:
         server.close()
@@ -592,7 +638,7 @@ def fetch_notes_last_week(user_id: int) -> tuple[str, list]:
         now = datetime.now()
         week_ago = now.timestamp() - 7 * 24 * 3600
         matched = _filter_and_extract(server, all_ids)
-        matched = [(dt, r, t) for dt, r, t in matched if dt.timestamp() >= week_ago]
+        matched = [item for item in matched if item[0].timestamp() >= week_ago]
         if not matched:
             return ("📭 За последнюю неделю нет конспектов встреч.", [])
         return (_format_list(matched, "📋 **Конспекты встреч за неделю**"), matched)
@@ -917,6 +963,10 @@ async def publish_to_wiki(title: str, content: str, wiki_config: dict) -> tuple[
         "title": title,
         "content": content,
     }
+    # Если указана папка (slug родительского раздела) — добавляем parent
+    folder = wiki_config.get("folder", "")
+    if folder:
+        payload["parent"] = folder
 
     try:
         async with httpx.AsyncClient(timeout=30) as client:
@@ -945,6 +995,31 @@ async def publish_to_wiki(title: str, content: str, wiki_config: dict) -> tuple[
         return False, "❌ Таймаут: Яндекс Вики не ответил за 30 секунд."
     except Exception as e:
         return False, f"❌ Ошибка подключения к Wiki: {e}"
+
+
+# ═══════════════════════════════════════════════════════════════════
+# ФУНКЦИЯ: ПОМЕТИТЬ ПИСЬМО ПРОЧИТАННЫМ В IMAP
+# ═══════════════════════════════════════════════════════════════════
+
+
+def _set_email_read(user_id: int, imap_msg_id: str) -> bool:
+    """Помечает письмо по IMAP msg_id как прочитанное (флаг \\Seen).
+       После успешной цепочки AI→Wiki→БД — письмо уходит из /list."""
+    config = get_user_config(user_id)
+    if not config:
+        return False
+    try:
+        server = _connect_imap(config)
+        try:
+            server.store(imap_msg_id.encode(), "+FLAGS", "(\\Seen)")
+            logger.info("📩 Письмо %s помечено прочитанным (%s)", imap_msg_id, user_id)
+            return True
+        finally:
+            server.close()
+            server.logout()
+    except Exception as e:
+        logger.error("❌ Пометка письма %s: %s", imap_msg_id, e)
+        return False
 
 
 import json
@@ -1199,6 +1274,21 @@ class WikiSetupState(StatesGroup):
     api_key = State()
 
 
+class DbSetupState(StatesGroup):
+    """Настройка PostgreSQL: 5 шагов — хост, порт, имя БД, пользователь, пароль.
+       Доступна только администратору (AlekseyAnanyev)."""
+    host = State()
+    port = State()
+    name = State()
+    user = State()
+    password = State()
+
+
+class SetupSingleField(StatesGroup):
+    """Одношаговая настройка одного поля почты (/setup email|imap|login|password)."""
+    value = State()
+
+
 # ═══════════════════════════════════════════════════════════════════
 # БЛОК AI-ПРОВАЙДЕРОВ
 # ═══════════════════════════════════════════════════════════════════
@@ -1408,7 +1498,11 @@ async def summary_callback(callback: CallbackQuery, state: FSMContext):
         await callback.message.answer("❌ Конспект устарел. Запросите /list заново.")
         return
 
-    _dt, display, txt_content = items[idx]
+    item = items[idx]
+    _dt = item[0]
+    display = item[1]
+    txt_content = item[2]
+    imap_id = item[5] if len(item) >= 6 else ""
 
     # Загружаем промпт
     prompts = _load_prompts()
@@ -1431,6 +1525,34 @@ async def summary_callback(callback: CallbackQuery, state: FSMContext):
     system_prompt = prompt_text
     user_text = f"Конспект встречи: «{display}»\n\n{txt_content}"
     result = await call_ai(user_id, system_prompt, user_text)
+
+    # ── Сохраняем в PostgreSQL ───────────────────────────────
+    if db.DB_POOL and not result.startswith("❌"):
+        ai_config = get_ai_config(user_id)
+        ai_model = (ai_config or {}).get("model", "unknown")
+        wiki = get_wiki_config(user_id)
+        wiki_published = bool(wiki and wiki.get("authorized_key") and get_wiki_mode(user_id) == "auto")
+        try:
+            meeting_id = await db.get_meeting_by_msg_id(prompt_topic)
+            # fallback — сохраняем с фейковым msg_id
+            if not meeting_id:
+                meeting_id = await db.save_meeting(
+                    f"manual:{prompt_topic}:{datetime.now().isoformat()}",
+                    user_id, "", f"{SUBJECT_FILTER}: {display}",
+                    datetime.now(), txt_content,
+                )
+            if meeting_id:
+                await db.save_summary(
+                    meeting_id=meeting_id,
+                    user_id=user_id,
+                    prompt_topic=prompt_topic,
+                    ai_model=ai_model,
+                    summary_text=result,
+                    wiki_published=wiki_published,
+                    wiki_url="",
+                )
+        except Exception as e:
+            logger.error("❌ Ошибка сохранения саммари в БД: %s", e)
 
     # Удаляем статус
     try:
@@ -1472,6 +1594,11 @@ async def summary_callback(callback: CallbackQuery, state: FSMContext):
                 "📚 Хотите опубликовать это саммари в Яндекс Вики?",
                 reply_markup=kb,
             )
+
+    # ── Помечаем письмо прочитанным ───────────────────────────
+    # Если AI успешно сгенерировал саммари — письмо уходит из /list
+    if not result.startswith("❌") and imap_id:
+        _set_email_read(user_id, imap_id)
 
 
 @dp.callback_query(lambda c: c.data and c.data.startswith("choose_prompt:"))
@@ -1545,6 +1672,7 @@ async def publish_wiki_callback(callback: CallbackQuery, state: FSMContext):
         return
 
     _dt, display, txt_content = items[idx]
+    imap_id = items[idx][5] if len(items[idx]) >= 6 else ""
     prompts = _load_prompts()
     prompt_text = prompts.get(prompt_topic, "")
     if not prompt_text or not txt_content:
@@ -1561,6 +1689,32 @@ async def publish_wiki_callback(callback: CallbackQuery, state: FSMContext):
     user_text = f"Конспект встречи: «{display}»\n\n{txt_content}"
     result = await call_ai(user_id, system_prompt, user_text)
 
+    # ── Сохраняем в PostgreSQL ───────────────────────────────
+    if db.DB_POOL and not result.startswith("❌"):
+        ai_config = get_ai_config(user_id)
+        ai_model = (ai_config or {}).get("model", "unknown")
+        try:
+            meeting_id = await db.get_meeting_by_msg_id(prompt_topic)
+            if not meeting_id:
+                meeting_id = await db.save_meeting(
+                    f"manual:{prompt_topic}:{datetime.now().isoformat()}",
+                    user_id, "", f"{SUBJECT_FILTER}: {display}",
+                    datetime.now(), txt_content,
+                )
+            if meeting_id:
+                wiki_url = f"https://wiki.yandex.ru/?orgId={wiki_config.get('org_id', '')}" if wiki_config.get("org_id") else ""
+                await db.save_summary(
+                    meeting_id=meeting_id,
+                    user_id=user_id,
+                    prompt_topic=prompt_topic,
+                    ai_model=ai_model,
+                    summary_text=result,
+                    wiki_published=True,
+                    wiki_url=wiki_url,
+                )
+        except Exception as e:
+            logger.error("❌ Ошибка сохранения саммари (wiki) в БД: %s", e)
+
     try:
         await status_msg.delete()
     except Exception:
@@ -1574,6 +1728,10 @@ async def publish_wiki_callback(callback: CallbackQuery, state: FSMContext):
     page_title = f"{prompt_topic} {datetime.now().strftime('%Y-%m-%d')}"
     success, msg = await publish_to_wiki(page_title, result, wiki_config)
     await callback.message.answer(msg, parse_mode=ParseMode.MARKDOWN)
+
+    # Помечаем письмо прочитанным — саммари опубликовано в Wiki
+    if imap_id:
+        _set_email_read(user_id, imap_id)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -2399,6 +2557,244 @@ async def _start_init(message: Message, state: FSMContext):
 
 
 
+# ═══════════════════════════════════════════════════════════════════
+# HELP REGISTRY — единый реестр групп, команд и эмодзи
+# ═══════════════════════════════════════════════════════════════════
+
+HELP_GROUPS = {
+    "setup": {"emoji": "🔧", "title": "Настройка", "description": "Настройка почты, AI-провайдера, Яндекс Вики и PostgreSQL"},
+    "notes": {"emoji": "📬", "title": "Конспекты встреч", "description": "Просмотр конспектов встреч из почты"},
+    "prompt": {"emoji": "🤖", "title": "Промпты", "description": "Управление шаблонами промптов для нейросети"},
+    "wiki": {"emoji": "📚", "title": "Яндекс Вики", "description": "Публикация саммари в Яндекс Вики"},
+    "other": {"emoji": "ℹ️", "title": "Прочее", "description": "Справка и приветствие"},
+}
+
+HELP_COMMANDS = {
+    "start": {
+        "emoji": "👋", "group": "setup", "title": "Приветствие",
+        "short": "Показать приветственное сообщение",
+        "syntax": "/start", "aliases": [], "admin": False, "public": True,
+        "details": "При первом запуске запускает онбординг (/init).\nЕсли уже настроен — показывает приветствие.",
+    },
+    "init": {
+        "emoji": "🔄", "group": "setup", "title": "Сброс настроек",
+        "short": "Сбросить настройки почты и настроить заново",
+        "syntax": "/init", "aliases": [], "admin": False, "public": True,
+        "details": "Полностью очищает текущие настройки почты.\n4 шага: Email → IMAP-сервер → Логин → Пароль.",
+    },
+    "setup": {
+        "emoji": "🔧", "group": "setup", "title": "Настройка",
+        "short": "Запустить мастер настройки почты (4 шага)",
+        "syntax": "/setup [подкоманда]", "aliases": [], "admin": False, "public": True,
+        "details": "Без аргументов — 4 шага: Email, IMAP-сервер, логин, пароль.\nПодкоманды описаны в /help setup.",
+    },
+    "setup_email": {
+        "emoji": "📧", "group": "setup", "title": "Изменить email",
+        "short": "Изменить только email почтового ящика",
+        "syntax": "/setup email", "aliases": [], "admin": False, "public": True,
+    },
+    "setup_imap": {
+        "emoji": "🔌", "group": "setup", "title": "Изменить IMAP-сервер",
+        "short": "Изменить только IMAP-сервер",
+        "syntax": "/setup imap", "aliases": [], "admin": False, "public": True,
+    },
+    "setup_login": {
+        "emoji": "👤", "group": "setup", "title": "Изменить логин",
+        "short": "Изменить только логин почты",
+        "syntax": "/setup login", "aliases": [], "admin": False, "public": True,
+    },
+    "setup_password": {
+        "emoji": "🔑", "group": "setup", "title": "Изменить пароль",
+        "short": "Изменить только пароль приложения",
+        "syntax": "/setup password", "aliases": [], "admin": False, "public": True,
+    },
+    "setup_show": {
+        "emoji": "📊", "group": "setup", "title": "Показать настройки",
+        "short": "Показать текущие настройки по разделам",
+        "syntax": "/setup show [all|account|ai|wiki]", "aliases": [], "admin": False, "public": True,
+    },
+    "setup_ai": {
+        "emoji": "🧠", "group": "setup", "title": "Настроить AI",
+        "short": "Настроить AI-провайдера для саммари",
+        "syntax": "/setup ai", "aliases": ["/setup_ai", "/setup_llm"],
+        "admin": False, "public": True,
+        "details": "Выбор провайдера → API-ключ → модель.\nПосле сохранения — автоматическая проверка.",
+    },
+    "setup_ai_test": {
+        "emoji": "🔌", "group": "setup", "title": "Проверить AI",
+        "short": "Проверить подключение к AI",
+        "syntax": "/setup ai test", "aliases": [], "admin": False, "public": True,
+    },
+    "setup_wiki": {
+        "emoji": "📚", "group": "wiki", "title": "Настроить Wiki",
+        "short": "Настроить подключение к Яндекс Вики",
+        "syntax": "/setup wiki", "aliases": ["/setup_wiki"],
+        "admin": False, "public": True,
+        "details": "Потребуется JSON авторизованного ключа сервисного аккаунта.",
+    },
+    "setup_wiki_org": {
+        "emoji": "🏢", "group": "wiki", "title": "ID организации",
+        "short": "Указать ID организации Яндекс 360",
+        "syntax": "/setup wiki org <ID>", "aliases": [], "admin": False, "public": True,
+    },
+    "setup_wiki_folder": {
+        "emoji": "📁", "group": "wiki", "title": "Папка Wiki",
+        "short": "Указать slug папки для публикации",
+        "syntax": "/setup wiki folder <slug>", "aliases": [], "admin": False, "public": True,
+    },
+    "setup_wiki_mode": {
+        "emoji": "⚙️", "group": "wiki", "title": "Режим публикации",
+        "short": "Режим публикации: auto/button/off",
+        "syntax": "/setup wiki mode auto|button|off", "aliases": [], "admin": False, "public": True,
+    },
+    "setup_wiki_test": {
+        "emoji": "🔍", "group": "wiki", "title": "Проверить Wiki",
+        "short": "Проверить подключение к Яндекс Вики",
+        "syntax": "/setup wiki test", "aliases": ["/setup_wiki_test"],
+        "admin": False, "public": True,
+    },
+    "wiki_test": {
+        "emoji": "🔍", "group": "wiki", "title": "Статус Wiki",
+        "short": "Проверить подключение к Wiki",
+        "syntax": "/wiki test", "aliases": ["/wiki_stat", "/wikistat"],
+        "admin": False, "public": True,
+    },
+    "setup_db": {
+        "emoji": "🗄️", "group": "setup", "title": "Настроить БД",
+        "short": "Настроить PostgreSQL (только для администратора)",
+        "syntax": "/setup db", "aliases": [], "admin": True, "public": False,
+    },
+    "setup_db_test": {
+        "emoji": "🔌", "group": "setup", "title": "Проверить БД",
+        "short": "Проверить подключение к PostgreSQL",
+        "syntax": "/setup db test", "aliases": [], "admin": True, "public": False,
+    },
+    "list": {
+        "emoji": "📬", "group": "notes", "title": "Непрочитанные",
+        "short": "Непрочитанные конспекты (UNSEEN не снимается)",
+        "syntax": "/list", "aliases": ["/get_notes", "/конспекты", "/конспект"],
+        "admin": False, "public": True,
+    },
+    "list_all": {
+        "emoji": "📋", "group": "notes", "title": "Все конспекты",
+        "short": "Все конспекты за последние 7 дней",
+        "syntax": "/list all", "aliases": ["/list_all", "/все_конспекты"],
+        "admin": False, "public": True,
+    },
+    "list_new": {
+        "emoji": "🆕", "group": "notes", "title": "Новые конспекты",
+        "short": "Новые конспекты (не показанные ранее)",
+        "syntax": "/list new", "aliases": ["/list_new", "/novye_konspekty"],
+        "admin": False, "public": True,
+        "details": "ID конспектов сохраняются — повторно не выводятся.",
+    },
+    "prompt": {
+        "emoji": "🤖", "group": "prompt", "title": "Управление промптами",
+        "short": "Список промптов с кнопками управления",
+        "syntax": "/prompt", "aliases": ["/промпт", "/промпты"],
+        "admin": False, "public": True,
+    },
+    "add_prompt": {
+        "emoji": "➕", "group": "prompt", "title": "Добавить промпт",
+        "short": "Добавить новый промпт",
+        "syntax": "/add_prompt", "aliases": ["/prompt_add"],
+        "admin": False, "public": True,
+    },
+    "edit_prompt": {
+        "emoji": "✏️", "group": "prompt", "title": "Редактировать промпт",
+        "short": "Редактировать существующий промпт",
+        "syntax": "/edit_prompt <номер>", "aliases": ["/prompt_edit"],
+        "admin": False, "public": True,
+    },
+    "text_prompt": {
+        "emoji": "📖", "group": "prompt", "title": "Текст промпта",
+        "short": "Показать полный текст промпта",
+        "syntax": "/text_prompt <номер>", "aliases": ["/prompt_text"],
+        "admin": False, "public": True,
+    },
+    "delete_prompt": {
+        "emoji": "🗑", "group": "prompt", "title": "Удалить промпт",
+        "short": "Удалить промпт",
+        "syntax": "/delete_prompt <номер>", "aliases": ["/prompt_delete"],
+        "admin": False, "public": True,
+    },
+    "help": {
+        "emoji": "❓", "group": "other", "title": "Справка",
+        "short": "Показать эту справку",
+        "syntax": "/help [раздел]", "aliases": ["/помощь", "/команды"],
+        "admin": False, "public": True,
+    },
+}
+
+
+def get_command_meta(name: str) -> dict | None:
+    clean = name.lstrip("/").lower().replace(" ", "_")
+    if clean in HELP_COMMANDS:
+        return HELP_COMMANDS[clean]
+    for cmd, meta in HELP_COMMANDS.items():
+        aliases_clean = [a.lstrip("/").lower() for a in meta.get("aliases", [])]
+        if clean in aliases_clean:
+            return meta
+    return None
+
+
+def get_command_emoji(name: str) -> str:
+    meta = get_command_meta(name)
+    return meta["emoji"] if meta else ""
+
+
+def get_group_emoji(group: str) -> str:
+    g = HELP_GROUPS.get(group)
+    return g["emoji"] if g else ""
+
+
+def render_help_overview() -> str:
+    lines = ["📚 **Справка по командам**\n"]
+    for gkey, ginfo in HELP_GROUPS.items():
+        lines.append(f"{ginfo['emoji']} **{ginfo['title']}**")
+        lines.append(ginfo["description"])
+        lines.append(f"Подробнее: `/help {gkey}`\n")
+    lines.append("Используйте `/help <раздел>` для подробной справки.")
+    return "\n".join(lines)
+
+
+def render_help_group(group: str) -> str | None:
+    ginfo = HELP_GROUPS.get(group)
+    if not ginfo:
+        return None
+    lines = [f"{ginfo['emoji']} **{ginfo['title']}**\n"]
+    for cmd_key, cmd_meta in HELP_COMMANDS.items():
+        if cmd_meta.get("group") == group and cmd_meta.get("public", True):
+            emoji = cmd_meta["emoji"]
+            syntax = cmd_meta["syntax"]
+            short = cmd_meta.get("short", "")
+            aliases = cmd_meta.get("aliases", [])
+            lines.append(f"{emoji} `{syntax}`")
+            lines.append(f"  {short}")
+            if aliases:
+                lines.append(f"  Алиасы: {', '.join(f'`{a}`' for a in aliases)}")
+            admin_tag = " 🔐 админ" if cmd_meta.get("admin") else ""
+            if admin_tag:
+                lines[-1] += admin_tag
+            lines.append("")
+    if group == "setup":
+        lines.append("**Подробнее о подкомандах /setup:**\n")
+        subs = [
+            ("email", "📧", "Изменить только email"),
+            ("imap", "🔌", "Изменить только IMAP-сервер"),
+            ("login", "👤", "Изменить только логин"),
+            ("password", "🔑", "Изменить только пароль"),
+            ("show", "📊", "Показать настройки"),
+            ("ai", "🧠", "Настроить AI-провайдера"),
+            ("ai test", "🔌", "Проверить подключение к AI"),
+            ("wiki", "📚", "Настроить Яндекс Вики"),
+            ("db", "🗄️", "Настроить PostgreSQL (админ)"),
+        ]
+        for sub, sub_e, desc in subs:
+            lines.append(f"  {sub_e} `{sub}` — {desc}")
+    return "\n".join(lines)
+
+
 # ---- Help sections -------------------------------------------------
 
 HELP_SETUP = (
@@ -2412,6 +2808,14 @@ HELP_SETUP = (
     "  Настройка IMAP-подключения к почте:\n"
     "  4 шага: Email, IMAP-сервер, логин, пароль.\n"
     "  Пустой Enter в шаге сохраняет текущее значение.\n\n"
+    "`/setup email`\n"
+    "  Изменить только email.\n"
+    "`/setup imap`\n"
+    "  Изменить только IMAP-сервер.\n"
+    "`/setup login` или `/setup user`\n"
+    "  Изменить только логин.\n"
+    "`/setup password` или `/setup pass`\n"
+    "  Изменить только пароль.\n\n"
     "`/setup show all`\n"
     "  Показать все настройки текущего пользователя.\n"
     "`/setup show account`\n"
@@ -2429,6 +2833,11 @@ HELP_SETUP = (
     "`/setup wiki`\n"
     "  Настройка подключения к Яндекс Вики.\n"
     "  Нужно для публикации саммари в вики.\n"
+    "`/setup db`\n"
+    "  Настройка PostgreSQL (только для администратора).\n"
+    "  5 шагов: хост, порт, БД, пользователь, пароль.\n"
+    "`/setup db test`\n"
+    "  Проверить подключение к PostgreSQL.\n"
 )
 
 HELP_LIST = (
@@ -2462,6 +2871,9 @@ HELP_WIKI = (
     "  Проверка подключения к Яндекс Вики.\n"
     "`/setup wiki org <ID>`\n"
     "  Указать ID организации Яндекс 360 для бизнеса.\n"
+    "`/setup wiki folder <slug>`\n"
+    "  Указать slug папки (раздела) Wiki для публикации.\n"
+    "  Например: `/setup wiki folder hr_meetings`\n"
     "`/setup wiki mode auto|button|off`\n"
     "  Режим публикации:\n"
     "  • `auto` — сразу после AI саммари → в Wiki\n"
@@ -2507,7 +2919,8 @@ def _help_text(section=None):
     if entry:
         return intro + entry[1]
     known = "`, `/help ".join(k for k in sorted(HELP_ALL_SECTIONS.keys()) if k != "notes")
-    return f"❗️ Неизвестный раздел `{section}`. Используйте: `/help {known}` или `/help all`."
+    available = " ".join(f"{g['emoji']} {gk}" for gk, g in HELP_GROUPS.items())
+    return f"❓ Раздел справки «{section}» не найден.\n\nДоступные разделы: {available}"
 @dp.message(Command("init"))
 async def cmd_init(message: Message, state: FSMContext):
     """Сбрасывает все настройки почты и запускает настройку заново."""
@@ -2541,10 +2954,19 @@ async def cmd_start(message: Message, state: FSMContext):
 @dp.message(Command("help", "помощь", "команды"))
 async def cmd_help(message: Message, command: CommandObject = None):
     """
-    /help -- full help. /help <section> -- specific section.
+    /help -- краткая справка по группам.
+    /help <раздел> -- подробная справка по разделу.
+    /help all -- полная справка (все разделы).
     """
     section = command.args.strip().lower() if command and command.args else None
-    await message.answer(_help_text(section), parse_mode=ParseMode.MARKDOWN)
+    if section:
+        group_help = render_help_group(section)
+        if group_help:
+            await message.answer(group_help, parse_mode=ParseMode.MARKDOWN)
+            return
+        await message.answer(_help_text(section), parse_mode=ParseMode.MARKDOWN)
+        return
+    await message.answer(render_help_overview(), parse_mode=ParseMode.MARKDOWN)
 
 
 # ── Команда /list (только непрочитанные) ─────────────────────
@@ -2610,7 +3032,8 @@ async def cmd_get_notes(message: Message):
     await message.answer(f"📋 **Новые конспекты встреч** — всего {total}", parse_mode=ParseMode.MARKDOWN)
 
     # Каждый конспект — отдельное сообщение с собственной кнопкой
-    for idx, (dt, display, _txt) in enumerate(items, 1):
+    for idx, item in enumerate(items, 1):
+        dt, display = item[0], item[1]
         date_str = dt.strftime("%d.%m.%Y %H:%M")
         text = f"**{idx}.** {display}\n📅 {date_str}"
         button = _get_item_button(idx, display)
@@ -2654,7 +3077,7 @@ async def cmd_list_new(message: Message):
 
     await sent.delete()
 
-    msg_ids = [f"{dt.timestamp()}:{display}" for dt, display, _txt in items]
+    msg_ids = [f"{item[0].timestamp()}:{item[1]}" for item in items]
     _mark_new_comms_shown(user.id, msg_ids)
 
     _save_notes_cache(user.id, items)
@@ -2662,7 +3085,8 @@ async def cmd_list_new(message: Message):
     total = len(items)
     await message.answer(f"New conspects: {total} total", parse_mode=ParseMode.MARKDOWN)
 
-    for idx, (dt, display, _txt) in enumerate(items, 1):
+    for idx, item in enumerate(items, 1):
+        dt, display = item[0], item[1]
         date_str = dt.strftime("%d.%m.%Y %H:%M")
         text = f"**{idx}.** {display}\n{date_str}"
         button = _get_item_button(idx, display)
@@ -2713,7 +3137,8 @@ async def cmd_list_all(message: Message):
     total = len(items)
     await message.answer(f"📋 **Конспекты встреч за неделю** — всего {total}", parse_mode=ParseMode.MARKDOWN)
 
-    for idx, (dt, display, _txt) in enumerate(items, 1):
+    for idx, item in enumerate(items, 1):
+        dt, display = item[0], item[1]
         date_str = dt.strftime("%d.%m.%Y %H:%M")
         text = f"**{idx}.** {display}\n📅 {date_str}"
         button = _get_item_button(idx, display)
@@ -2796,11 +3221,30 @@ async def _cmd_setup_show(message: Message, arg: str):
                 lines.append("  • ⚠️ Используется **устаревший OAuth-формат** — ")
                 lines.append("    перенастройте через `/setup wiki`")
             lines.append(f"  • ID организации: `{wiki.get('org_id', 'не указан') or 'не указан'}`")
+            folder = wiki.get("folder", "")
+            lines.append(f"  • Папка: `{folder}`" if folder else "  • Папка: не указана")
             mode = wiki.get("mode", "off")
             mode_labels = {"auto": "🚀 Авто", "button": "📤 По кнопке", "off": "⏸️ Выкл"}
             lines.append(f"  • Режим публикации: {mode_labels.get(mode, mode)}")
         else:
             lines.append("  ❌ **Не настроено.** Используйте `/setup wiki`")
+
+        # DB
+        lines.append("")
+        lines.append("**🗄️ PostgreSQL:**")
+        db_config = get_db_config(user_id)
+        if db_config:
+            lines.append(f"  • Хост: `{db_config.get('host', '?')}`")
+            lines.append(f"  • Порт: `{db_config.get('port', 5432)}`")
+            lines.append(f"  • БД: `{db_config.get('name', '?')}`")
+            lines.append(f"  • Пользователь: `{db_config.get('user', '?')}`")
+            lines.append(f"  • Пароль: {'✅ задан' if db_config.get('password') else '❌ не задан'}")
+            if db.DB_POOL:
+                lines.append("  • Статус: ✅ **Подключено**")
+            else:
+                lines.append("  • Статус: ⏸️ **Не подключено** (перезапустите бот)")
+        else:
+            lines.append("  ❌ **Не настроено.** Используйте `/setup db`")
 
         await message.answer("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
@@ -2854,10 +3298,12 @@ async def _cmd_setup_show(message: Message, arg: str):
         mode_labels = {"auto": "🚀 Авто (сразу в Wiki)", "button": "📤 По кнопке", "off": "⏸️ Выключено"}
         lines = [
             "📚 **Настройки Яндекс Вики**\n",
-            f"• JWT-ключ: {'✅ задан' if has_key else '❌ не задан'}",
+            "• JWT-ключ: {'✅ задан' if has_key else '❌ не задан'}",
         ]
         if has_old:
             lines.append("• ⚠️ Старый OAuth-формат — перенастройте через `/setup wiki`")
+        folder = wiki.get("folder", "")
+        lines.append(f"• Папка: `{folder}`" if folder else "• Папка: не указана")
         lines.extend([
             f"• ID организации: `{wiki.get('org_id', 'не указан') or 'не указан'}`",
             f"• Режим публикации: {mode_labels.get(mode, mode)}",
@@ -2866,10 +3312,32 @@ async def _cmd_setup_show(message: Message, arg: str):
         ])
         await message.answer("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
+    elif section == "db":
+        db_config = get_db_config(user_id)
+        if not db_config:
+            await message.answer(
+                "🗄️ **PostgreSQL не настроен.**\n\n"
+                "Используйте `/setup db` для настройки.",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return
+        status = "✅ **Подключено**" if db.DB_POOL else "⏸️ **Не подключено**"
+        await message.answer(
+            "🗄️ **Настройки PostgreSQL**\n\n"
+            f"• Хост: `{db_config.get('host', '?')}`\n"
+            f"• Порт: `{db_config.get('port', 5432)}`\n"
+            f"• БД: `{db_config.get('name', '?')}`\n"
+            f"• Пользователь: `{db_config.get('user', '?')}`\n"
+            f"• Пароль: {'✅ задан' if db_config.get('password') else '❌ не задан'}\n"
+            f"• Статус: {status}\n\n"
+            "Для проверки: `/setup db test`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+
     else:
         await message.answer(
             f"❌ Неизвестная секция: `{section}`.\n\n"
-            "Доступно: `all`, `account`, `ai`, `wiki`.",
+            "Доступно: `all`, `account`, `ai`, `wiki`, `db`.",
             parse_mode=ParseMode.MARKDOWN,
         )
 
@@ -2977,6 +3445,41 @@ async def cmd_setup_start(message: Message, state: FSMContext, command: CommandO
             )
             return
 
+        if arg.startswith("wiki folder"):
+            # Slug папки (раздела) в Яндекс Вики для публикации
+            folder = arg[len("wiki folder"):].strip()
+            if not folder:
+                await message.answer(
+                    "⚠️ Укажите slug папки.\n"
+                    "Пример: `/setup wiki folder hr_meetings`\n\n"
+                    "Slug — это идентификатор раздела в URL Яндекс Вики.\n"
+                    "Например, для страницы `https://wiki.yandex.ru/hr_meetings/`\n"
+                    "slug будет `hr_meetings`.",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+                return
+            user_id = message.from_user.id
+            wiki_config = get_wiki_config(user_id)
+            if not wiki_config or not wiki_config.get("authorized_key"):
+                await message.answer(
+                    "❌ **Сначала настройте Яндекс Вики через `/setup wiki`.**",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+                return
+            wiki_config["folder"] = folder
+            users = _load_users()
+            key = str(user_id)
+            if key in users:
+                users[key]["wiki"] = wiki_config
+                _save_users(users)
+            await message.answer(
+                f"✅ **Папка Wiki сохранена:** `{folder}`\n\n"
+                "Новые саммари будут публиковаться в этом разделе.\n"
+                "Проверьте: `/setup show wiki`",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return
+
         if arg.startswith("wiki mode"):
             # Смена режима публикации в Wiki
             mode = arg[len("wiki mode"):].strip()
@@ -3011,6 +3514,137 @@ async def cmd_setup_start(message: Message, state: FSMContext, command: CommandO
                 f"Текущий режим: `/setup show wiki`",
                 parse_mode=ParseMode.MARKDOWN,
             )
+            return
+
+        if arg == "db":
+            # Настройка PostgreSQL (только для администратора)
+            user_id = message.from_user.id
+            if user_id != db.ADMIN_USER_ID:
+                await message.answer("❌ Команда только для администратора.")
+                return
+            config = get_db_config(user_id)
+            current_host = (config or {}).get("host", "не задан")
+            await message.answer(
+                "🗄️ **Настройка PostgreSQL**\n\n"
+                f"Текущий хост: `{current_host}`\n\n"
+                "Введите **хост** сервера PostgreSQL:",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            await state.set_state(DbSetupState.host)
+            return
+
+        if arg == "db test":
+            # Тест подключения к PostgreSQL
+            user_id = message.from_user.id
+            if user_id != db.ADMIN_USER_ID:
+                await message.answer("❌ Команда только для администратора.")
+                return
+            if not db.DB_POOL:
+                await message.answer(
+                    "❌ **PostgreSQL не подключён.**\n"
+                    "Настройте через `/setup db`.",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+                return
+            try:
+                async with db.DB_POOL.acquire() as conn:
+                    ver = await conn.fetchval("SELECT version()")
+                    uptime = await conn.fetchval("SELECT pg_postmaster_start_time()")
+                await message.answer(
+                    "🗄️ **PostgreSQL: тест подключения**\n\n"
+                    f"✅ **Подключение работает**\n"
+                    f"📊 **Версия:** `{ver}`\n"
+                    f"🕒 **Запущен с:** `{uptime}`\n"
+                    f"🔗 `hr.hunttech.ru:5432/hunttech_protocols`",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+            except Exception as e:
+                await message.answer(f"❌ **Ошибка:** {e}", parse_mode=ParseMode.MARKDOWN)
+            return
+
+        if arg == "db stat":
+            # Статистика данных в БД (только для администратора)
+            user_id = message.from_user.id
+            if user_id != db.ADMIN_USER_ID:
+                await message.answer("❌ Команда только для администратора.")
+                return
+            if not db.DB_POOL:
+                await message.answer(
+                    "❌ **PostgreSQL не подключён.**\n"
+                    "Настройте через `/setup db`.",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+                return
+            try:
+                async with db.DB_POOL.acquire() as conn:
+                    cnt_m = await conn.fetchval("SELECT COUNT(*) FROM meetings")
+                    cnt_s = await conn.fetchval("SELECT COUNT(*) FROM summary_log")
+                    cnt_m_today = await conn.fetchval(
+                        "SELECT COUNT(*) FROM meetings WHERE DATE(received_at) = CURRENT_DATE"
+                    )
+                    cnt_s_today = await conn.fetchval(
+                        "SELECT COUNT(*) FROM summary_log WHERE DATE(created_at) = CURRENT_DATE"
+                    )
+                    last_m = await conn.fetch(
+                        "SELECT id, subject, received_at, summary_created_at "
+                        "FROM meetings ORDER BY received_at DESC LIMIT 5"
+                    )
+                    by_day = await conn.fetch(
+                        "SELECT DATE(received_at) AS day, COUNT(*) AS cnt "
+                        "FROM meetings GROUP BY DATE(received_at) ORDER BY day DESC LIMIT 7"
+                    )
+                    users_who_generated = await conn.fetch(
+                        "SELECT DISTINCT user_id FROM summary_log ORDER BY user_id"
+                    )
+                lines = [
+                    "🗄️ **PostgreSQL: статистика данных**\n",
+                    f"📝 **Всего встреч:** {cnt_m}",
+                    f"🧠 **Всего саммари:** {cnt_s}",
+                    f"📅 **За сегодня:** {cnt_m_today} встреч, {cnt_s_today} саммари",
+                ]
+                if by_day:
+                    lines.append("")
+                    lines.append("**📆 По дням (последние 7):**")
+                    for r in by_day:
+                        lines.append(f"  • {r['day']}: {r['cnt']} встреч")
+                if last_m:
+                    lines.append("")
+                    lines.append("**🆕 Последние встречи:**")
+                    for r in last_m:
+                        sid = r['summary_created_at']
+                        status = "✅ саммари" if sid else "⏳ без саммари"
+                        lines.append(f"  • #{r['id']} `{r['subject'][:40]}` — {status}")
+                if users_who_generated:
+                    lines.append("")
+                    lines.append(f"👤 **Генерировали саммари:** {len(users_who_generated)} пользователей")
+                await message.answer("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+            except Exception as e:
+                await message.answer(f"❌ **Ошибка:** {e}", parse_mode=ParseMode.MARKDOWN)
+            return
+
+        if arg in ("email", "imap", "login", "user", "password", "pass"):
+            # Одношаговая настройка отдельного поля почты
+            # Без FSM-диалога — только запрос значения и сохранение
+            field = "email" if arg == "email" else \
+                    "imap" if arg == "imap" else \
+                    "login" if arg in ("login", "user") else \
+                    "password"
+            await state.update_data(field=field)
+            labels = {
+                "email": "📧 **Email** — введите новый адрес электронной почты:",
+                "imap": "🔌 **IMAP-сервер** — введите адрес IMAP-сервера (например, `imap.yandex.ru`):",
+                "login": "👤 **Логин** — введите логин для IMAP (обычно совпадает с email):",
+                "password": "🔑 **Пароль** — введите пароль приложения для IMAP:",
+            }
+            config = get_user_config(message.from_user.id)
+            current = ""
+            if config and config.get(field):
+                current = f"\n\nТекущее значение: `{config[field][:20]}...`" if field == "password" else f"\n\nТекущее значение: `{config[field]}`"
+            await message.answer(
+                f"{labels.get(field, '')}{current}",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            await state.set_state(SetupSingleField.value)
             return
 
     config = get_user_config(message.from_user.id)
@@ -3197,7 +3831,7 @@ async def setup_password(message: Message, state: FSMContext):
     # Спрашиваем, хочет ли пользователь настроить AI для Саммари
     await message.answer(
         "🤖 Хотите настроить подключение к нейросети?\n"
-        "Это нужно для функции «Саммари».",
+        "Это нужно, чтобы кнопка «Саммари» работала.",
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [
@@ -3205,6 +3839,50 @@ async def setup_password(message: Message, state: FSMContext):
                 InlineKeyboardButton(text="🚫 Нет", callback_data="ai_after_setup:no"),
             ]
         ]),
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════
+# FSM-ХЕНДЛЕР: ОДНОШАГОВАЯ НАСТРОЙКА ПОЛЯ ПОЧТЫ
+# ═══════════════════════════════════════════════════════════════════
+# Позволяет изменить одно поле (email/imap/login/password) без
+# повторного ввода всех остальных.
+
+
+@dp.message(SetupSingleField.value)
+async def setup_single_field(message: Message, state: FSMContext):
+    """Сохраняет одно поле настройки почты (email, imap, login, password)."""
+    value = message.text.strip()
+    if not value:
+        await message.answer("⚠️ Значение не может быть пустым. Введите снова:")
+        return
+
+    data = await state.get_data()
+    field = data.get("field", "email")
+    user_id = message.from_user.id
+
+    users = _load_users()
+    key = str(user_id)
+    if key not in users:
+        users[key] = {}
+
+    old_val = users[key].get(field, "")
+    users[key][field] = value
+    _save_users(users)
+
+    await state.clear()
+
+    label_map = {
+        "email": "📧 Email",
+        "imap": "🔌 IMAP-сервер",
+        "login": "👤 Логин",
+        "password": "🔑 Пароль",
+    }
+    masked = f"`{value[:20]}...`" if field == "password" else f"`{value}`"
+    await message.answer(
+        f"✅ **{label_map.get(field, field)}** сохранён: {masked}\n\n"
+        "Проверьте настройки: `/setup show all`",
+        parse_mode=ParseMode.MARKDOWN,
     )
 
 
@@ -3229,12 +3907,17 @@ def _save_notes_cache(user_id: int, items: list):
             cache = {}
     # Сериализуем datetime -> str, т.к. JSON не умеет в datetime
     serialized = []
-    for dt, display, txt in items:
-        serialized.append({
+    for item in items:
+        dt, display, txt = item[0], item[1], item[2]
+        entry = {
             "dt": dt.isoformat() if dt else "",
             "display": display,
             "txt": txt,
-        })
+        }
+        # Если есть imap_msg_id (6-й элемент) — сохраняем
+        if len(item) >= 6:
+            entry["imap_id"] = item[5]
+        serialized.append(entry)
     cache[str(user_id)] = serialized
     NOTES_CACHE_FILE.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -3249,9 +3932,10 @@ def _load_notes_cache(user_id: int) -> list:
         return []
     serialized = cache.get(str(user_id), [])
     items = []
-    for item in serialized:
-        dt = datetime.fromisoformat(item["dt"]) if item.get("dt") else datetime.now()
-        items.append((dt, item["display"], item["txt"]))
+    for entry in serialized:
+        dt = datetime.fromisoformat(entry["dt"]) if entry.get("dt") else datetime.now()
+        imap_id = entry.get("imap_id", "")
+        items.append((dt, entry["display"], entry["txt"], "", "", imap_id))
     return items
 
 
@@ -3723,6 +4407,124 @@ async def cmd_setup_wiki_test(message: Message):
 
 
 # ═══════════════════════════════════════════════════════════════════
+# FSM-ДИАЛОГ: /setup db — НАСТРОЙКА POSTGRESQL
+# ═══════════════════════════════════════════════════════════════════
+# Бизнес-правило: только администратор (AlekseyAnanyev, ID 272980897)
+# может настраивать подключение к PostgreSQL.
+# Пароль в БД никогда не показывается в чате.
+
+
+@dp.message(DbSetupState.host)
+async def setup_db_host(message: Message, state: FSMContext):
+    """Шаг 1: хост PostgreSQL."""
+    host = message.text.strip()
+    if not host:
+        await message.answer("⚠️ Хост не может быть пустым. Введите хост:")
+        return
+    await state.update_data(host=host)
+    await message.answer(
+        f"✅ Хост: `{host}`\n\n"
+        "Введите **порт** (по умолчанию 5432):",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    await state.set_state(DbSetupState.port)
+
+
+@dp.message(DbSetupState.port)
+async def setup_db_port(message: Message, state: FSMContext):
+    """Шаг 2: порт PostgreSQL."""
+    raw = message.text.strip()
+    try:
+        port = int(raw) if raw else 5432
+    except ValueError:
+        await message.answer("⚠️ Порт должен быть числом. Введите число (например, 5432):")
+        return
+    if port < 1 or port > 65535:
+        await message.answer("⚠️ Порт должен быть от 1 до 65535. Введите снова:")
+        return
+    await state.update_data(port=port)
+    await message.answer(
+        f"✅ Порт: `{port}`\n\n"
+        "Введите **имя базы данных**:",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    await state.set_state(DbSetupState.name)
+
+
+@dp.message(DbSetupState.name)
+async def setup_db_name(message: Message, state: FSMContext):
+    """Шаг 3: имя базы данных."""
+    name = message.text.strip()
+    if not name:
+        await message.answer("⚠️ Имя БД не может быть пустым. Введите имя БД:")
+        return
+    await state.update_data(name=name)
+    await message.answer(
+        f"✅ База данных: `{name}`\n\n"
+        "Введите **имя пользователя**:",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    await state.set_state(DbSetupState.user)
+
+
+@dp.message(DbSetupState.user)
+async def setup_db_user(message: Message, state: FSMContext):
+    """Шаг 4: пользователь PostgreSQL."""
+    user = message.text.strip()
+    if not user:
+        await message.answer("⚠️ Имя пользователя не может быть пустым. Введите имя:")
+        return
+    await state.update_data(user=user)
+    await message.answer(
+        f"✅ Пользователь: `{user}`\n\n"
+        "Введите **пароль**:",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    await state.set_state(DbSetupState.password)
+
+
+@dp.message(DbSetupState.password)
+async def setup_db_password(message: Message, state: FSMContext):
+    """Шаг 5: пароль PostgreSQL.
+       После ввода всех параметров — тестируем подключение.
+       Пароль не показывается в логах."""
+    password = message.text.strip()
+    if not password:
+        await message.answer("⚠️ Пароль не может быть пустым. Введите пароль:")
+        return
+
+    data = await state.get_data()
+    host = data["host"]
+    port = data["port"]
+    name = data["name"]
+    user = data["user"]
+
+    user_id = message.from_user.id
+
+    # Сообщаем о тесте
+    status_msg = await message.answer(
+        f"🔄 Тестирую подключение к `{host}:{port}/{name}`...",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+    # Пробуем подключиться
+    success, msg = await db.apply_config(host, port, name, user, password)
+
+    if success:
+        # Сохраняем конфиг
+        save_db_config(user_id, host, port, name, user, password)
+        await status_msg.edit_text(msg, parse_mode=ParseMode.MARKDOWN)
+    else:
+        await status_msg.edit_text(
+            f"{msg}\n\n"
+            "Проверьте параметры и введите `/setup db` заново.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+
+    await state.clear()
+
+
+# ═══════════════════════════════════════════════════════════════════
 # КОМАНДА /wiki_test — ПРОВЕРКА ПОДКЛЮЧЕНИЯ К YANDEX WIKI
 # ═══════════════════════════════════════════════════════════════════
 # Бизнес-логика: пользователь хочет убедиться, что wiki настроена
@@ -3829,6 +4631,23 @@ async def unknown_command(message: Message):
 async def main():
     logger.info("🤖 Бот конспектов встреч запускается...")
 
+    # ── Инициализация PostgreSQL ─────────────────────────────
+    # Сначала пробуем загрузить сохранённый конфиг администратора
+    admin_db = get_db_config(db.ADMIN_USER_ID)
+    if admin_db:
+        logger.info("📦 Найден сохранённый конфиг PostgreSQL, подключаюсь...")
+        success, msg = await db.apply_config(
+            admin_db["host"], admin_db["port"],
+            admin_db["name"], admin_db["user"], admin_db["password"],
+        )
+        if success:
+            logger.info("✅ PostgreSQL подключён: %s:%s/%s",
+                        admin_db["host"], admin_db["port"], admin_db["name"])
+        else:
+            logger.warning("❌ Не удалось подключиться к PostgreSQL: %s", msg)
+    else:
+        logger.info("📦 Сохранённый конфиг PostgreSQL не найден")
+
     # ── Фоновая проверка почты каждые 5 минут ───────────────
     async def check_new_conspects():
         """Проверяет новые конспекты для всех пользователей, у кого
@@ -3852,15 +4671,17 @@ async def main():
                             # Фильтруем те, о которых уже уведомляли
                             notified = _get_notified_comms_for_user(user_id)
                             new_notifications = []
-                            for dt, display, txt in items:
+                            for item in items:
+                                dt, display, txt = item[0], item[1], item[2]
                                 uid = f"{dt.timestamp()}:{display}"
                                 if uid not in notified:
-                                    new_notifications.append((dt, display, txt))
+                                    new_notifications.append(item)
 
                             if not new_notifications:
                                 continue
 
-                            for idx, (dt, display, txt) in enumerate(new_notifications, 1):
+                            for idx, item in enumerate(new_notifications, 1):
+                                dt, display = item[0], item[1]
                                 date_str = dt.strftime("%d.%m.%Y %H:%M")
                                 text = (
                                     f"🔔 **Новый конспект встречи!**\n\n"
@@ -3879,7 +4700,7 @@ async def main():
                                         uid_str, e,
                                     )
                             # Сохраняем в кеш для кнопки Саммари
-                            notified_ids = [f"{dt.timestamp()}:{display}" for dt, display, _txt in new_notifications]
+                            notified_ids = [f"{item[0].timestamp()}:{item[1]}" for item in new_notifications]
                             _mark_notified(user_id, notified_ids)
                             _save_notes_cache(user_id, items)
 
