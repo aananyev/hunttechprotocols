@@ -23,9 +23,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 import io
-import tempfile
 import zipfile
 import xml.etree.ElementTree as ET
+from hunttech_bot_common.files import temp_directory
 
 import db  # Модуль PostgreSQL (включается при наличии DB_HOST в .env)
 
@@ -1746,9 +1746,9 @@ async def _extract_text_from_file(message: Message) -> str | None:
 
     try:
         tg_file = await bot.get_file(message.document.file_id)
-        temp_dir = tempfile.mkdtemp()
-        local_path = Path(temp_dir) / file_name
-        await bot.download_file(tg_file.file_path, destination=str(local_path))
+        with temp_directory("bot-") as temp_dir:
+            local_path = Path(temp_dir) / file_name
+            await bot.download_file(tg_file.file_path, destination=str(local_path))
     except Exception as e:
         logger.error(f"Error downloading file: {e}")
         return None
@@ -1816,9 +1816,6 @@ async def _extract_text_from_file(message: Message) -> str | None:
     except Exception as e:
         logger.error(f"Error extracting from {file_name}: {e}")
         return None
-    finally:
-        import shutil
-        shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 def _detect_title_from_text(text: str) -> str | None:
