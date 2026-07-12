@@ -2926,6 +2926,11 @@ async def cmd_start(message: Message, state: FSMContext):
     """
     user_id = message.from_user.id
     config = get_user_config(user_id)
+
+    # Sync user menu on /start
+    from integrations.menu_adapter import _sync_menu
+    await _sync_menu(bot, user_id)
+
     if not config:
         await message.answer(
             "👋 Привет! Я бот для конспектов встреч.\n\n"
@@ -3810,6 +3815,10 @@ async def setup_password(message: Message, state: FSMContext):
     save_user_config(user_id, email, server, login, password)
     await state.clear()
 
+    # Sync menu — IMAP configured, more commands now available
+    from integrations.menu_adapter import _sync_menu
+    await _sync_menu(bot, user_id)
+
     await status.edit_text(
         f"✅ **Настройка завершена!**\n\n"
         f"📧 Email: `{email}`\n"
@@ -4126,6 +4135,10 @@ async def ai_setup_model(message: Message, state: FSMContext):
     user_id = message.from_user.id
     save_ai_config(user_id, endpoint, api_key, model)
     await state.clear()
+
+    # Sync menu — AI configured, more commands now available
+    from integrations.menu_adapter import _sync_menu
+    await _sync_menu(bot, user_id)
 
     provider_label = data.get("ai_provider_label", "Пользовательский")
     await message.answer(
@@ -4532,6 +4545,14 @@ async def unknown_command(message: Message):
 
 async def main():
     logger.info("🤖 Бот конспектов встреч запускается...")
+
+    # ── Инициализация бокового меню ───────────────────────────
+    # Устанавливаем меню по умолчанию для всех пользователей
+    from integrations.menu_adapter import _sync_default_menu
+    await _sync_default_menu(bot)
+    # Также синхронизируем админское меню, если админ есть
+    from integrations.menu_adapter import _sync_admin_menu
+    await _sync_admin_menu(bot)
 
     # ── Инициализация PostgreSQL ─────────────────────────────
     # Сначала пробуем загрузить сохранённый конфиг администратора
