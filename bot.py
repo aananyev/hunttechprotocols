@@ -3541,7 +3541,9 @@ async def cmd_setup_start(message: Message, state: FSMContext, command: CommandO
                 )
                 return
             try:
-                async with db.DB_POOL.acquire() as conn:
+                from integrations.db_adapter import _get_db_manager
+                mgr = await _get_db_manager()
+                async with mgr.session() as conn:
                     ver = await conn.fetchval("SELECT version()")
                     uptime = await conn.fetchval("SELECT pg_postmaster_start_time()")
                 await message.answer(
@@ -3570,7 +3572,9 @@ async def cmd_setup_start(message: Message, state: FSMContext, command: CommandO
                 )
                 return
             try:
-                async with db.DB_POOL.acquire() as conn:
+                from integrations.db_adapter import _get_db_manager
+                mgr = await _get_db_manager()
+                async with mgr.session() as conn:
                     cnt_m = await conn.fetchval("SELECT COUNT(*) FROM meetings")
                     cnt_s = await conn.fetchval("SELECT COUNT(*) FROM summary_log")
                     cnt_m_today = await conn.fetchval(
