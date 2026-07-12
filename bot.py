@@ -3939,111 +3939,18 @@ def _load_notes_cache(user_id: int) -> list:
 # Универсальный вызов любого OpenAI-совместимого API.
 # Поддерживает OpenRouter, OpenAI, DeepSeek, vLLM и т.д.
 
+from integrations.ai_adapter import call_ai_with_config, test_ai_connection
+
+
 async def call_ai(user_id: int, system_prompt: str, user_text: str) -> str:
-    """
-    Вызывает нейросеть через OpenAI-совместимый API.
-    Настройки (endpoint, api_key, model) берутся из users.json для user_id.
-    
-    Бизнес-правила:
-    - Всегда возвращает строку (ответ или ошибку) — никогда не падает
-    - Таймаут 120 секунд — длинные конспекты требуют времени
-    - Для OpenRouter отправляет HTTP-Referer (требование их ToS)
-    
-    Returns:
-        str — ответ нейросети или сообщение об ошибке, начинающееся с ❌
-    """
+    """Wrapper: gets ai_config and delegates to adapter."""
     ai_config = get_ai_config(user_id)
-    if not ai_config:
-        return "❌ AI не настроен. Используйте `/setup_ai`"
+    return await call_ai_with_config(ai_config, system_prompt, user_text)
 
-    endpoint = ai_config.get("endpoint", "").rstrip("/")
-    api_key = ai_config.get("api_key", "")
-    model = ai_config.get("model", "gpt-4o")
-
-    if not endpoint or not api_key:
-        return "❌ AI настроен не полностью. Проверьте endpoint и API key через `/setup_ai`"
-
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
-
-    # Для OpenRouter добавляем заголовок с именем приложения
-    if "openrouter" in endpoint.lower():
-        headers["HTTP-Referer"] = "https://t.me/hunttech_protocols_bot"
-        headers["X-Title"] = "HunttechProtocolsBot"
-
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_text},
-        ],
-    }
-
-    try:
-        async with httpx.AsyncClient(timeout=120) as client:
-            response = await client.post(
-                f"{endpoint}/chat/completions",
-                headers=headers,
-                json=payload,
-            )
-            if response.status_code != 200:
-                return f"❌ Ошибка API ({response.status_code}): {response.text[:500]}"
-            result = response.json()
-            return result["choices"][0]["message"]["content"]
-    except httpx.TimeoutException:
-        return "❌ Таймаут: нейросеть не ответила за 120 секунд"
-    except Exception as e:
-        return f"❌ Ошибка: {e}"
-
-
-# ── Тестирование AI-подключения ──────────────────────────
 
 async def _test_ai_connection(endpoint: str, api_key: str, model: str) -> str:
-    """Проверяет подключение к AI-провайдеру.
-       Отправляет короткий запрос и возвращает отчёт.
-    """
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
-    if "openrouter" in endpoint.lower():
-        headers["HTTP-Referer"] = "https://t.me/hunttech_protocols_bot"
-        headers["X-Title"] = "HunttechProtocolsBot"
-
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "user", "content": "Ответь одним словом: привет"},
-        ],
-        "max_tokens": 10,
-    }
-
-    try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            response = await client.post(
-                f"{endpoint}/chat/completions",
-                headers=headers,
-                json=payload,
-            )
-            if response.status_code == 200:
-                result = response.json()
-                reply = result["choices"][0]["message"]["content"]
-                return f"✅ Подключение успешно!\\nОтвет модели: «{reply.strip()}»"
-            elif response.status_code == 401:
-                return "❌ Ошибка авторизации (401). Проверьте API-ключ."
-            elif response.status_code == 404:
-                return "❌ Модель не найдена (404). Проверьте название модели."
-            else:
-                return f"❌ Ошибка API ({response.status_code}): {response.text[:300]}"
-    except httpx.TimeoutException:
-        return "❌ Таймаут: сервер не ответил за 15 секунд. Проверьте endpoint."
-    except httpx.ConnectError:
-        return "❌ Не удалось подключиться к серверу. Проверьте endpoint."
-    except Exception as e:
-        return f"❌ Ошибка: {e}"
-
+    """Wrapper: delegates to adapter."""
+    return await test_ai_connection(endpoint, api_key, model)
 
 # ═══════════════════════════════════════════════════════════════════
 # КОМАНДА /setup_ai — НАСТРОЙКА НЕЙРОСЕТИ
