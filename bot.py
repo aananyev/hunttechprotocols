@@ -30,14 +30,7 @@ import xml.etree.ElementTree as ET
 import db  # Модуль PostgreSQL (включается при наличии DB_HOST в .env)
 
 # ── Логирование ──────────────────────────────────────────────────
-# Логи нужны, чтобы отслеживать работу бота в фоне — кто и когда
-# запрашивал конспекты, были ли ошибки IMAP/AI.
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
-    datefmt="%H:%M:%S",
-)
-logger = logging.getLogger("bot")
+from integrations.logging_adapter import logger
 
 from aiogram import Bot, Dispatcher
 from aiogram.filters import Command, CommandObject
@@ -46,6 +39,7 @@ from aiogram.enums import ParseMode
 
 import os
 from dotenv import load_dotenv
+from integrations.config_adapter import settings
 
 # ── Конфигурация ──────────────────────────────────────────────
 
