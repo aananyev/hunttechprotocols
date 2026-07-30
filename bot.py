@@ -27,6 +27,10 @@ import tempfile
 import zipfile
 import xml.etree.ElementTree as ET
 
+# ── Access control (из hunttech-bot-common) ───────────────
+from hunttech_bot_common.users import AccessManager
+from hunttech_bot_common.users.ptb import get_bot_access_path
+
 import db  # Модуль PostgreSQL (включается при наличии DB_HOST в .env)
 
 # ── Логирование ──────────────────────────────────────────────────
@@ -53,6 +57,11 @@ load_dotenv()
 # TG_TOKEN — ключ от @BotFather, даёт боту доступ к Telegram API.
 # Хранится в .env (не в git!), чтобы не светить секрет в репозитории.
 TG_TOKEN = os.getenv("TG_TOKEN", "") or exit("❌ TG_TOKEN не задан! Положи токен в .env")
+
+# MASTER_ADMIN_ID — Telegram user ID владельца бота (главный администратор).
+# Администратор имеет полный доступ и может управлять пользователями.
+# Если не задан — используется db.ADMIN_USER_ID (если db доступен).
+MASTER_ADMIN_ID = int(os.getenv("MASTER_ADMIN_ID", "0")) or 0
 
 # SUBJECT_FILTER — бизнес-правило: мы ищем только письма с темой
 # "Конспект встречи", которые секретарь Совета директоров отправляет
@@ -1030,6 +1039,22 @@ from aiogram.types import ReplyKeyboardRemove
 
 bot = Bot(token=TG_TOKEN)
 dp = Dispatcher()
+
+# ── Access Manager ─────────────────────────────────────────
+# AccessManager управляет тем, какие пользователи Telegram имеют
+# доступ к этому боту. Каждый бот имеет свой файл доступа.
+_master_admin_id = MASTER_ADMIN_ID or getattr(db, "ADMIN_USER_ID", 0)
+if not _master_admin_id:
+    logger.warning(
+        "⚠️ MASTER_ADMIN_ID не задан! "
+        "Бот будет работать без контроля доступа. "
+        "Укажите MASTER_ADMIN_ID в .env или db.ADMIN_USER_ID."
+    )
+access_manager = AccessManager(
+    data_path=get_bot_access_path("hunttechprotocols"),
+    master_admin_id=_master_admin_id,
+    bot_name="HuntTech Protocols",
+)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -2930,10 +2955,66 @@ async def cmd_init(message: Message, state: FSMContext):
 @dp.message(Command("start"))
 async def cmd_start(message: Message, state: FSMContext):
     """
-    Команда /start: если пользователь новый — сразу запускаем онбординг.
-    Если уже настроен — показываем приветствие и советуем /help.
+    Команда /start: проверяет доступ, если пользователь новый — запускает онбординг.
+    Если уже настроен — показывает приветствие.
     """
     user_id = message.from_user.id
+    user = message.from_user
+
+    # ── Access gate ──────────────────────────────────────────
+    # Если master_admin_id не задан — пропускаем всех (fallback)
+    if _master_admin_id:
+        if access_manager.is_admin(user_id):
+            # Master admin — полный доступ
+            pass
+        elif access_manager.is_allowed(user_id):
+            # Разрешённый пользователь — полный доступ
+            pass
+        else:
+            # Неизвестный пользователь — запрос доступа
+            result = access_manager.request_access(
+                user_id=user_id,
+                username=user.username or "",
+                first_name=user.first_name or "",
+                last_name=user.last_name or "",
+            )
+
+            if result.get("is_already_allowed"):
+                # Уже есть доступ (возник гонка)
+                pass
+            elif not result.get("is_new"):
+                await message.answer(
+                    "⏳ Ваш запрос на рассмотрении. Ожидайте, пожалуйста."
+                )
+                return
+            else:
+                # Новый запрос — уведомляем администратора
+                display_name = (
+                    f"{user.first_name or ''} {user.last_name or ''}"
+                ).strip() or user.username or f"User#{user_id}"
+                try:
+                    await bot.send_message(
+                        chat_id=_master_admin_id,
+                        text=(
+                            f"🔔 Новый запрос доступа к боту *HuntTech Protocols*\n\n"
+                            f"Пользователь: {display_name}\n"
+                            f"ID: `{user_id}`\n"
+                            f"Username: @{user.username or '-'}\n\n"
+                            f"Разрешить: /user add {user_id}"
+                        ),
+                        parse_mode=ParseMode.MARKDOWN,
+                    )
+                except Exception as exc:
+                    logger.warning("Не удалось уведомить администратора: %s", exc)
+
+                await message.answer(
+                    "🚫 Доступ запрещён.\n"
+                    "Ваш запрос отправлен администратору. Ожидайте.\n\n"
+                    "Если вы уже подавали запрос — /request_access"
+                )
+                return
+
+    # ── Существующая логика /start ─────────────────────────
     config = get_user_config(user_id)
     if not config:
         await message.answer(
@@ -2949,6 +3030,169 @@ async def cmd_start(message: Message, state: FSMContext):
         "Напиши `/help` — покажу все команды.",
         parse_mode=ParseMode.MARKDOWN,
     )
+
+
+# ── Команда /request_access — запрос доступа к боту ───────
+
+@dp.message(Command("request_access"))
+async def cmd_request_access(message: Message):
+    """Если пользователь не имеет доступа — отправляет запрос администратору."""
+    user_id = message.from_user.id
+    user = message.from_user
+
+    if not _master_admin_id:
+        await message.answer("✅ Доступ открыт (контроль доступа не настроен).")
+        return
+
+    if access_manager.is_allowed(user_id) or access_manager.is_admin(user_id):
+        await message.answer("✅ У вас уже есть доступ к боту.")
+        return
+
+    result = access_manager.request_access(
+        user_id=user_id,
+        username=user.username or "",
+        first_name=user.first_name or "",
+        last_name=user.last_name or "",
+    )
+
+    if result.get("is_already_allowed"):
+        await message.answer("✅ У вас уже есть доступ к боту.")
+        return
+
+    if result.get("is_new"):
+        display_name = (
+            f"{user.first_name or ''} {user.last_name or ''}"
+        ).strip() or user.username or f"User#{user_id}"
+        try:
+            await bot.send_message(
+                chat_id=_master_admin_id,
+                text=(
+                    f"🔔 Новый запрос доступа к боту *HuntTech Protocols*\n\n"
+                    f"Пользователь: {display_name}\n"
+                    f"ID: `{user_id}`\n"
+                    f"Username: @{user.username or '-'}\n\n"
+                    f"Разрешить: /user add {user_id}"
+                ),
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        except Exception as exc:
+            logger.warning("Не удалось уведомить администратора: %s", exc)
+        await message.answer(
+            "✅ Запрос отправлен администратору. Ожидайте."
+        )
+    else:
+        await message.answer(
+            "⏳ Ваш запрос уже на рассмотрении. Ожидайте."
+        )
+
+
+# ── Команда /user — управление пользователями (только админ) ──
+
+@dp.message(Command("user"))
+async def cmd_user(message: Message):
+    """/user [list|add|remove|ban|unban] — управление пользователями (только админ)."""
+    user_id = message.from_user.id
+    args = message.text.strip().split()
+    subcmd = args[1] if len(args) > 1 else "help"
+
+    if not _master_admin_id:
+        await message.answer("❌ Контроль доступа не настроен.")
+        return
+
+    if not access_manager.is_admin(user_id):
+        await message.answer("❌ Только администратор может управлять пользователями.")
+        return
+
+    if subcmd in ("list", "список"):
+        users = access_manager.get_allowed_users()
+        pending = access_manager.get_pending_requests()
+        lines = []
+        if pending:
+            lines.append("⏳ Ожидают подтверждения:")
+            for req in pending:
+                if req.get("status") == "pending":
+                    name = req.get("full_name") or req.get("username") or f"User#{req['user_id']}"
+                    lines.append(f"  • {name} (id={req['user_id']})")
+            lines.append("")
+        if users:
+            lines.append("✅ Разрешённые пользователи:")
+            for u in users:
+                name = u.get("full_name") or u.get("username") or f"User#{u['user_id']}"
+                banned = " 🚫(забанен)" if u.get("is_banned") else ""
+                lines.append(f"  • {name} (id={u['user_id']}){banned}")
+        else:
+            lines.append("Нет разрешённых пользователей.")
+        lines.append("")
+        lines.append(f"👑 Администратор: id={access_manager.master_admin_id}")
+        await message.answer("\n".join(lines))
+        return
+
+    if len(args) < 3:
+        await message.answer("Укажите Telegram ID: /user <cmd> <id>")
+        return
+
+    try:
+        target_id = int(args[2])
+    except ValueError:
+        await message.answer("Укажите числовой Telegram ID.")
+        return
+
+    if subcmd in ("add", "добавить"):
+        access_manager.add_user(user_id=target_id, added_by=user_id)
+        await message.answer(f"✅ Пользователь {target_id} добавлен.")
+        # Уведомляем пользователя, что доступ открыт
+        try:
+            await bot.send_message(
+                chat_id=target_id,
+                text=(
+                    "🎉 Вам открыт доступ к боту *HuntTech Protocols*!\n\n"
+                    "Напишите /start чтобы начать."
+                ),
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        except Exception as exc:
+            logger.warning("Не удалось уведомить пользователя %s: %s", target_id, exc)
+        return
+
+    if subcmd in ("remove", "delete", "удалить"):
+        if target_id == access_manager.master_admin_id:
+            await message.answer("Нельзя удалить главного администратора.")
+            return
+        if access_manager.remove_user(target_id):
+            await message.answer(f"✅ Пользователь {target_id} удалён.")
+        else:
+            await message.answer(f"Пользователь {target_id} не найден.")
+        return
+
+    if subcmd in ("ban", "заблокировать"):
+        if target_id == access_manager.master_admin_id:
+            await message.answer("Нельзя заблокировать главного администратора.")
+            return
+        if access_manager.ban_user(target_id):
+            await message.answer(f"🚫 Пользователь {target_id} заблокирован.")
+        else:
+            await message.answer(f"Пользователь {target_id} не найден.")
+        return
+
+    if subcmd in ("unban", "разблокировать"):
+        if access_manager.unban_user(target_id):
+            await message.answer(f"✅ Пользователь {target_id} разблокирован.")
+        else:
+            await message.answer(f"Пользователь {target_id} не найден.")
+        return
+
+    # Справка
+    lines = [
+        "Управление пользователями:",
+        "",
+        "/user list — список пользователей",
+        "/user add <id> — добавить пользователя",
+        "/user remove <id> — удалить пользователя",
+        "/user ban <id> — заблокировать",
+        "/user unban <id> — разблокировать",
+        "/request_access — запросить доступ",
+    ]
+    await message.answer("\n".join(lines))
 
 
 @dp.message(Command("help", "помощь", "команды"))
