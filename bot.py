@@ -1477,6 +1477,8 @@ def _detect_mail_servers(email: str) -> dict | None:
     """Пытается определить (imap, pop3, smtp) хосты по домену email.
     Возвращает {'imap': ..., 'pop3': ..., 'smtp': ...} или None, если
     ни один сервер определить не удалось.
+    Порядок: 1) таблица провайдеров, 2) MX-запись домена (dig),
+    3) стандартные префиксы imap./pop./smtp. + DNS.
     """
     if not email or "@" not in email:
         return None
@@ -1489,7 +1491,12 @@ def _detect_mail_servers(email: str) -> dict | None:
     if hit:
         return {"imap": hit[0], "pop3": hit[1], "smtp": hit[2]}
 
-    # 2) Стандартные префиксы imap./pop./smtp. — проверяем DNS
+    # 2) MX-запись домена → провайдер (dig, с таймаутом; нет dig — пропускаем)
+    mx = _mx_provider_servers(domain)
+    if mx:
+        return {"imap": mx[0], "pop3": mx[1], "smtp": mx[2]}
+
+    # 3) Стандартные префиксы imap./pop./smtp. — проверяем DNS
     import socket
     found = {}
     for proto, prefix in (("imap", "imap"), ("pop3", "pop"), ("smtp", "smtp")):
@@ -1500,6 +1507,50 @@ def _detect_mail_servers(email: str) -> dict | None:
         except OSError:
             pass
     return found or None
+
+
+def _mx_provider_servers(domain: str) -> tuple | None:
+    """Определяет провайдера почты по MX-записи домена (subprocess dig).
+    Возвращает (imap, pop3, smtp) серверы провайдера или None.
+    Работает для корпоративных доменов на чужих почтовых системах
+    (например, mail@corp.ru на Яндексе → MX mx.yandex.net → yandex)."""
+    import shutil
+    import subprocess
+    if not shutil.which("dig"):
+        return None
+    try:
+        out = subprocess.run(
+            ["dig", "+short", "MX", domain],
+            capture_output=True, text=True, timeout=5,
+        ).stdout
+    except Exception:
+        return None
+    mx_host = ""
+    for line in out.splitlines():
+        line = line.strip().rstrip(".")
+        if not line or line.startswith(";"):
+            continue
+        parts = line.split()
+        if parts:
+            mx_host = parts[-1].lower()
+            break
+    if not mx_host:
+        return None
+    if "yandex" in mx_host:
+        return KNOWN_MAIL_PROVIDERS["yandex.ru"]
+    if "mail.ru" in mx_host:
+        return KNOWN_MAIL_PROVIDERS["mail.ru"]
+    if "google" in mx_host or "googlemail" in mx_host:
+        return KNOWN_MAIL_PROVIDERS["gmail.com"]
+    if "outlook" in mx_host or "office365" in mx_host or "microsoft" in mx_host:
+        return KNOWN_MAIL_PROVIDERS["outlook.com"]
+    if "icloud" in mx_host or "apple" in mx_host:
+        return KNOWN_MAIL_PROVIDERS["icloud.com"]
+    if "rambler" in mx_host:
+        return KNOWN_MAIL_PROVIDERS["rambler.ru"]
+    if "qq.com" in mx_host:
+        return KNOWN_MAIL_PROVIDERS["qq.com"]
+    return None
 
 
 def _auto_fill_mail_servers(user_id: int, email: str) -> dict | None:
@@ -1522,6 +1573,11 @@ def _auto_fill_mail_servers(user_id: int, email: str) -> dict | None:
         changed = True
     if not users[key].get("pop3_host") and detected.get("pop3"):
         users[key]["pop3_host"] = detected["pop3"]
+        changed = True
+    # Логин для IMAP обычно совпадает с email — подставляем автоматически,
+    # если ещё не введён вручную
+    if not users[key].get("login") and email:
+        users[key]["login"] = email
         changed = True
     if changed:
         _save_users(users)
