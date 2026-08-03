@@ -4382,6 +4382,100 @@ def _setup_skip_done_keyboard() -> "ReplyKeyboardMarkup":
     )
 
 
+def _setup_field_nav_keyboard() -> "ReplyKeyboardMarkup":
+    """Нижнее меню мастера настройки поля /setup email:
+    «Редактировать» — ввести новое значение;
+    «Оставить» — сохранить текущее значение (как /skip) и перейти дальше;
+    «Следующий» — перейти к следующему полю, не меняя текущее."""
+    from aiogram.types import KeyboardButton, ReplyKeyboardMarkup
+
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [
+                KeyboardButton(text="Редактировать"),
+                KeyboardButton(text="Оставить"),
+                KeyboardButton(text="Следующий"),
+            ],
+        ],
+        resize_keyboard=True,
+    )
+
+
+async def _show_field_step(
+    message: Message,
+    state: FSMContext,
+    section: str,
+    field: str,
+) -> None:
+    """Показывает шаг мастера настройки поля: текущее значение + нижнее меню
+    «Редактировать / Оставить / Следующий». state: {section, field, fields, idx}."""
+    spec = SETUP_SECTIONS[section]
+    fields = [f for f, _ in spec["fields"]]
+    idx = fields.index(field) if field in fields else 0
+    await state.update_data(section=section, field=field, fields=fields, idx=idx)
+
+    label = SETUP_FIELD_LABELS.get(field, escape_md_simple(field))
+    cfg, _, _ = _section_config(message.from_user.id, section)
+    current = cfg.get(field, "")
+    if current:
+        masked = f"`{current[:20]}...`" if field in ("password", "api_key") else f"`{current}`"
+        cur_line = f"Текущее значение: {masked}"
+    else:
+        cur_line = "Текущее значение не задано"
+
+    await message.answer(
+        f"{label}\n\n{cur_line}\n\n"
+        "Выберите действие:",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=_setup_field_nav_keyboard(),
+    )
+    await state.set_state(SetupSingleField.value)
+
+
+async def _next_field_step(
+    message: Message,
+    state: FSMContext,
+    *,
+    apply_current: bool = False,
+) -> bool:
+    """Переход к следующему полю секции в мастере /setup email.
+    apply_current=True — сохранить текущее значение (кнопка «Оставить»).
+    Возвращает False, если поля закончились (мастер завершён)."""
+    from aiogram.types import ReplyKeyboardRemove
+
+    data = await state.get_data()
+    section = data.get("section", "email")
+    fields = data.get("fields") or [f for f, _ in SETUP_SECTIONS[section]["fields"]]
+    idx = data.get("idx", 0)
+    field = data.get("field", fields[0] if fields else "email")
+    user_id = message.from_user.id
+
+    if apply_current:
+        cfg, _, _ = _section_config(user_id, section)
+        value = cfg.get(field, "")
+        if value:
+            _apply_single_field(user_id, section, field, value, skipped=True)
+
+    nxt = idx + 1
+    if nxt >= len(fields):
+        # Мастер завершён — убираем нижнее меню, возвращаем меню секции
+        await state.clear()
+        await message.answer(
+            "✅ Настройка завершена.",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        await message.answer(
+            _setup_section_text(user_id, section),
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=_setup_section_keyboard(user_id, section),
+        )
+        return False
+
+    await _show_field_step(message, state, section, fields[nxt])
+    return True
+
+
 async def _finish_email_setup_early(message: Message, state: FSMContext) -> None:
     """Досрочное завершение /setup email (кнопка «Готово»): сохраняет
     введённые в state значения, недостающие поля берёт из текущего конфига.
@@ -4668,13 +4762,56 @@ async def setup_password(message: Message, state: FSMContext):
 async def setup_single_field(message: Message, state: FSMContext):
     """Сохраняет одно поле настройки (email/imap/login/password | db:host.. | ai:endpoint..).
        /skip — оставить текущее значение.
-       После ввода значения — кнопки «✅ Подтвердить / ✏️ Редактировать / 🚫 Отмена»."""
+       После ввода значения — кнопки «✅ Подтвердить / ✏️ Редактировать / 🚫 Отмена».
+       Кнопки мастера «Редактировать / Оставить / Следующий» — пошаговый обход полей."""
     text = message.text.strip()
 
     data = await state.get_data()
     section = data.get("section", "email")
     field = data.get("field", "email")
     user_id = message.from_user.id
+
+    # ── Кнопки мастера /setup email: «Редактировать / Оставить / Следующий» ──
+    if text == "Редактировать":
+        cfg, _, _ = _section_config(user_id, section)
+        current = ""
+        if cfg.get(field):
+            secret = field in ("password", "api_key")
+            current = f"\n\nТекущее значение: `{cfg[field][:20]}...`" if secret else f"\n\nТекущее значение: `{cfg[field]}`"
+        await message.answer(
+            f"{_single_field_prompt(field)}{current}\n\n"
+            "или `/skip` — оставить текущее значение:",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=_setup_field_nav_keyboard(),
+        )
+        return
+
+    if text == "Оставить":
+        cfg, _, _ = _section_config(user_id, section)
+        value = cfg.get(field, "")
+        if not value:
+            await message.answer(
+                f"⚠️ Текущее значение `{field}` не задано — "
+                "нажмите «Редактировать», чтобы ввести его, "
+                "или «Следующий» для перехода дальше.",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=_setup_field_nav_keyboard(),
+            )
+            return
+        _apply_single_field(user_id, section, field, value, skipped=True)
+        label = SETUP_FIELD_LABELS.get(field, escape_md_simple(field))
+        masked = f"`{value[:20]}...`" if field in ("password", "api_key") else f"`{value}`"
+        await message.answer(
+            f"✅ **{label}** оставлен: {masked}",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=_setup_field_nav_keyboard(),
+        )
+        await _next_field_step(message, state, apply_current=False)
+        return
+
+    if text == "Следующий":
+        await _next_field_step(message, state, apply_current=False)
+        return
 
     # /skip — оставить текущее значение (сохраняем сразу, подтверждение не нужно)
     if text.lower() in ("/skip", "-"):
@@ -4812,10 +4949,13 @@ async def setup_single_field_callback(callback: CallbackQuery, state: FSMContext
             )
         await callback.message.answer(
             f"✅ **{label}** сохранён: {masked}"
-            f"{auto_note}\n\n"
-            "Проверьте настройки: `/setup show all`",
+            f"{auto_note}",
             parse_mode=ParseMode.MARKDOWN,
         )
+        # Мастер /setup email: после сохранения — следующий шаг (или завершение)
+        if data.get("fields"):
+            await _next_field_step(callback.message, state, apply_current=False)
+            return
         await state.clear()
         if section in SETUP_SECTIONS:
             await callback.message.answer(
@@ -4836,6 +4976,7 @@ async def setup_single_field_callback(callback: CallbackQuery, state: FSMContext
             f"{_single_field_prompt(field)}{current}\n\n"
             "или `/skip` — оставить текущее значение:",
             parse_mode=ParseMode.MARKDOWN,
+            reply_markup=_setup_field_nav_keyboard(),
         )
         await state.set_state(SetupSingleField.value)
         return
@@ -4877,7 +5018,8 @@ async def setup_menu_callback(callback: CallbackQuery):
 
 @dp.callback_query(lambda c: c.data and c.data.startswith("setup_param:"))
 async def setup_param_callback(callback: CallbackQuery, state: FSMContext):
-    """Кнопка-параметр: начинает одношаговую настройку конкретного поля."""
+    """Кнопка-параметр: начинает мастер настройки конкретного поля
+    с нижним меню «Редактировать / Оставить / Следующий»."""
     _, section, field = callback.data.split(":", 2)
     user_id = callback.from_user.id
     await callback.answer()
@@ -4886,20 +5028,7 @@ async def setup_param_callback(callback: CallbackQuery, state: FSMContext):
         await callback.message.answer("❌ Команда только для администратора.")
         return
 
-    await state.update_data(section=section, field=field)
-
-    cfg, _, _ = _section_config(user_id, section)
-    current = ""
-    if cfg.get(field):
-        secret = field in ("password", "api_key")
-        current = f"\n\nТекущее значение: `{cfg[field][:20]}...`" if secret else f"\n\nТекущее значение: `{cfg[field]}`"
-
-    await callback.message.answer(
-        f"{_single_field_prompt(field)}{current}\n\n"
-        "или `/skip` — оставить текущее значение:",
-        parse_mode=ParseMode.MARKDOWN,
-    )
-    await state.set_state(SetupSingleField.value)
+    await _show_field_step(callback.message, state, section, field)
 
 
 @dp.callback_query(lambda c: c.data and c.data.startswith("setup_full:"))
