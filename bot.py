@@ -1551,10 +1551,15 @@ def _section_config(user_id: int, section: str) -> tuple:
 
 
 def _field_status(user_id: int, section: str, field: str) -> str:
-    """Флаг параметра: 🔴 не введено · 🟡 введено, не проверено · 🟢 введено и проверено."""
+    """Флаг параметра: 🔴 не введено · 🟡 введено, не проверено · 🟢 введено и проверено.
+    Для поля email зелёный флаг ставится сразу при вводе (валидность адреса
+    уже подтверждена validate_email), проверка SMTP/IMAP — отдельный шаг
+    (email_checked влияет на общий флаг секции)."""
     cfg, users, key = _section_config(user_id, section)
     if not cfg.get(field):
         return "🔴"
+    if section == "email" and field == "email":
+        return "🟢"
     check_key = SETUP_SECTIONS[section]["check_key"]
     checked = cfg.get(check_key) if section == "email" else cfg.get(check_key)
     return "🟢" if checked else "🟡"
