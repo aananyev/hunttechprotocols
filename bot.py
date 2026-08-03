@@ -1449,6 +1449,97 @@ SETUP_FIELD_LABELS = {
 }
 
 
+# ── Автоопределение серверов почты по домену email ─────────────
+# Таблица известных провайдеров: (imap, pop3, smtp)
+KNOWN_MAIL_PROVIDERS = {
+    "yandex.ru": ("imap.yandex.ru", "pop.yandex.ru", "smtp.yandex.ru"),
+    "ya.ru": ("imap.yandex.ru", "pop.yandex.ru", "smtp.yandex.ru"),
+    "mail.ru": ("imap.mail.ru", "pop.mail.ru", "smtp.mail.ru"),
+    "bk.ru": ("imap.mail.ru", "pop.mail.ru", "smtp.mail.ru"),
+    "list.ru": ("imap.mail.ru", "pop.mail.ru", "smtp.mail.ru"),
+    "inbox.ru": ("imap.mail.ru", "pop.mail.ru", "smtp.mail.ru"),
+    "gmail.com": ("imap.gmail.com", "pop.gmail.com", "smtp.gmail.com"),
+    "googlemail.com": ("imap.gmail.com", "pop.gmail.com", "smtp.gmail.com"),
+    "outlook.com": ("outlook.office365.com", "outlook.office365.com", "smtp.office365.com"),
+    "hotmail.com": ("outlook.office365.com", "outlook.office365.com", "smtp.office365.com"),
+    "live.com": ("outlook.office365.com", "outlook.office365.com", "smtp.office365.com"),
+    "icloud.com": ("imap.mail.me.com", "pop.mail.me.com", "smtp.mail.me.com"),
+    "me.com": ("imap.mail.me.com", "pop.mail.me.com", "smtp.mail.me.com"),
+    "rambler.ru": ("imap.rambler.ru", "pop.rambler.ru", "smtp.rambler.ru"),
+    "lenta.ru": ("imap.rambler.ru", "pop.rambler.ru", "smtp.rambler.ru"),
+    "myrambler.ru": ("imap.rambler.ru", "pop.rambler.ru", "smtp.rambler.ru"),
+    "qq.com": ("imap.qq.com", "pop.qq.com", "smtp.qq.com"),
+    "163.com": ("imap.163.com", "pop.163.com", "smtp.163.com"),
+}
+
+
+def _detect_mail_servers(email: str) -> dict | None:
+    """Пытается определить (imap, pop3, smtp) хосты по домену email.
+    Возвращает {'imap': ..., 'pop3': ..., 'smtp': ...} или None, если
+    ни один сервер определить не удалось.
+    """
+    if not email or "@" not in email:
+        return None
+    domain = email.rsplit("@", 1)[1].strip().lower()
+    if not domain:
+        return None
+
+    # 1) Известный провайдер
+    hit = KNOWN_MAIL_PROVIDERS.get(domain)
+    if hit:
+        return {"imap": hit[0], "pop3": hit[1], "smtp": hit[2]}
+
+    # 2) Стандартные префиксы imap./pop./smtp. — проверяем DNS
+    import socket
+    found = {}
+    for proto, prefix in (("imap", "imap"), ("pop3", "pop"), ("smtp", "smtp")):
+        host = f"{prefix}.{domain}"
+        try:
+            socket.getaddrinfo(host, None, socket.AF_INET, socket.SOCK_STREAM)
+            found[proto] = host
+        except OSError:
+            pass
+    return found or None
+
+
+def _auto_fill_mail_servers(user_id: int, email: str) -> dict | None:
+    """Определяет серверы по email и сохраняет их в users.json.
+    Заполняет только пустые поля (не перетирает введённые вручную).
+    Возвращает определённый dict или None."""
+    detected = _detect_mail_servers(email)
+    if not detected:
+        return None
+    users = _load_users()
+    key = str(user_id)
+    if key not in users:
+        users[key] = {}
+    changed = False
+    if not users[key].get("server") and detected.get("imap"):
+        users[key]["server"] = detected["imap"]
+        changed = True
+    if not users[key].get("smtp_host") and detected.get("smtp"):
+        users[key]["smtp_host"] = detected["smtp"]
+        changed = True
+    if not users[key].get("pop3_host") and detected.get("pop3"):
+        users[key]["pop3_host"] = detected["pop3"]
+        changed = True
+    if changed:
+        _save_users(users)
+    return detected
+
+
+def _smtp_host_for(config: dict, server: str = "") -> str:
+    """SMTP-хост для проверки подключения: приоритет — сохранённый
+    smtp_host (автоопределённый или введённый), затем вывод из imap-хоста,
+    затем дефолт smtp.yandex.ru."""
+    if config and config.get("smtp_host"):
+        return config["smtp_host"]
+    srv = server or (config or {}).get("server", "")
+    if "imap" in srv:
+        return srv.replace("imap", "smtp")
+    return "smtp.yandex.ru"
+
+
 def _section_config(user_id: int, section: str) -> tuple:
     """Возвращает (config, users, key) для секции: email — корень users[key], db/ai — вложенный dict."""
     users = _load_users()
@@ -4069,7 +4160,7 @@ async def cmd_setup_start(message: Message, state: FSMContext, command: CommandO
             cfg = {
                 "sender": config.get("login") or config.get("email"),
                 "password": config.get("password"),
-                "smtp_host": config.get("server", "").replace("imap", "smtp") if "imap" in config.get("server", "") else "smtp.yandex.ru",
+                "smtp_host": _smtp_host_for(config),
                 "smtp_port": 465,
                 "imap_host": config.get("server", "imap.yandex.ru"),
                 "imap_port": 993,
@@ -4090,7 +4181,7 @@ async def cmd_setup_start(message: Message, state: FSMContext, command: CommandO
             cfg = {
                 "sender": config.get("login") or config.get("email", ""),
                 "password": config.get("password", ""),
-                "smtp_host": config.get("server", "").replace("imap", "smtp") if "imap" in config.get("server", "") else "smtp.yandex.ru",
+                "smtp_host": _smtp_host_for(config),
                 "smtp_port": 465,
                 "imap_host": config.get("server", "imap.yandex.ru"),
                 "imap_port": 993,
@@ -4234,9 +4325,25 @@ async def setup_email(message: Message, state: FSMContext):
         email_val = text
     await state.update_data(email=email_val)
 
+    # Автоопределение серверов по домену email (imap/pop3/smtp).
+    # Заполняет пустые поля → кнопки настроек получают 🟡 (заполнено, не проверено).
+    detected = _auto_fill_mail_servers(message.from_user.id, email_val)
+    if detected:
+        config = get_user_config(message.from_user.id) or {}
+        detected_note = (
+            "✨ Определил серверы по домену:\n"
+            f"• IMAP: `{detected['imap']}`\n"
+            f"• POP3: `{detected['pop3']}`\n"
+            f"• SMTP: `{detected['smtp']}`\n\n"
+            "Можно нажать `/skip` — сервер уже подставлен.\n\n"
+        )
+    else:
+        detected_note = ""
+
     current = config.get("server") or "не задан"
     await message.answer(
         f"✅ Email: `{email_val}`\n\n"
+        f"{detected_note}"
         f"**IMAP-сервер** ({escape_md_simple(current)}):\n"
         "Введите адрес IMAP-сервера\n"
         "(например: `imap.yandex.ru`, `imap.mail.ru`)\n"
@@ -4370,7 +4477,7 @@ async def setup_password(message: Message, state: FSMContext):
     cfg = {
         "sender": login or email,
         "password": password,
-        "smtp_host": server.replace("imap", "smtp") if "imap" in server else "smtp.yandex.ru",
+        "smtp_host": _smtp_host_for(config, server),
         "smtp_port": 465,
         "imap_host": server,
         "imap_port": 993,
@@ -4482,6 +4589,19 @@ async def setup_single_field(message: Message, state: FSMContext):
             cfg["checked"] = False
     _save_users(users)
 
+    # Если ввели email — пробуем определить серверы (imap/pop3/smtp)
+    # и подставить их → кнопки настроек получают 🟡
+    auto_note = ""
+    if section == "email" and field == "email" and not skipped:
+        detected = _auto_fill_mail_servers(user_id, value)
+        if detected:
+            auto_note = (
+                "\n\n✨ Определил серверы по домену:\n"
+                f"• IMAP: `{detected['imap']}`\n"
+                f"• POP3: `{detected['pop3']}`\n"
+                f"• SMTP: `{detected['smtp']}`"
+            )
+
     await state.clear()
 
     label_map = {
@@ -4500,7 +4620,8 @@ async def setup_single_field(message: Message, state: FSMContext):
     masked = f"`{value[:20]}...`" if field in ("password", "api_key") else f"`{value}`"
     skip_note = " (оставлено прежнее значение)" if skipped else ""
     await message.answer(
-        f"✅ **{label_map.get(field, escape_md_simple(field))}** сохранён{skip_note}: {masked}\n\n"
+        f"✅ **{label_map.get(field, escape_md_simple(field))}** сохранён{skip_note}: {masked}"
+        f"{auto_note}\n\n"
         "Проверьте настройки: `/setup show all`",
         parse_mode=ParseMode.MARKDOWN,
     )
@@ -4634,7 +4755,7 @@ async def setup_test_callback(callback: CallbackQuery):
         cfg = {
             "sender": config.get("login") or config.get("email"),
             "password": config.get("password"),
-            "smtp_host": config.get("server", "").replace("imap", "smtp") if "imap" in config.get("server", "") else "smtp.yandex.ru",
+            "smtp_host": _smtp_host_for(config),
             "smtp_port": 465,
             "imap_host": config.get("server", "imap.yandex.ru"),
             "imap_port": 993,
