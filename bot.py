@@ -4505,6 +4505,15 @@ async def setup_single_field(message: Message, state: FSMContext):
         parse_mode=ParseMode.MARKDOWN,
     )
 
+    # Возвращаем меню секции — чтобы пользователь видел обновлённые флаги
+    # и мог продолжить настройку (email → меню email, db → меню db, ai → меню ai)
+    if section in SETUP_SECTIONS:
+        await message.answer(
+            _setup_section_text(user_id, section),
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=_setup_section_keyboard(user_id, section),
+        )
+
 
 # ═══════════════════════════════════════════════════════════════════
 # CALLBACK-ХЕНДЛЕРЫ МЕНЮ /setup (кнопки-параметры с флагами)
