@@ -913,13 +913,13 @@ async def _test_wiki_connection(iam_token: str, org_id: str = "") -> str:
                 report_parts.append("❌ **Ошибка авторизации (401):** IAM-токен недействителен или истёк.")
                 all_ok = False
             else:
-                report_parts.append(f"❌ **Ошибка API ({resp.status_code}):** {resp.text[:200]}")
+                report_parts.append(f"❌ **Ошибка API ({resp.status_code}):** {escape_md_simple(resp.text[:200])}")
                 all_ok = False
     except httpx.TimeoutException:
         report_parts.append("❌ **Таймаут:** Яндекс Вики не ответил за 15 секунд.")
         all_ok = False
     except Exception as e:
-        report_parts.append(f"❌ **Ошибка подключения:** {e}")
+        report_parts.append(f"❌ **Ошибка подключения:** {escape_md_simple(e)}")
         all_ok = False
 
     # ── Тест 2: список страниц (проверяем доступ на чтение) ────────
@@ -952,7 +952,7 @@ async def _test_wiki_connection(iam_token: str, org_id: str = "") -> str:
                 else:
                     report_parts.append(f"⚠️ **Не удалось получить страницы:** HTTP {resp.status_code}")
         except Exception as e:
-            report_parts.append(f"⚠️ **Ошибка при получении страниц:** {e}")
+            report_parts.append(f"⚠️ **Ошибка при получении страниц:** {escape_md_simple(e)}")
 
     # ── Тест 3: информация о кластере (организации) ────────────────
     # Узнаём, к какому кластеру/организации привязан токен.
@@ -1766,7 +1766,7 @@ async def summary_callback(callback: CallbackQuery, state: FSMContext):
     prompts = _load_prompts()
     prompt_text = prompts.get(prompt_topic, "")
     if not prompt_text:
-        await callback.message.answer(f"❌ Промпт «{prompt_topic}» не найден.")
+        await callback.message.answer(f"❌ Промпт «{escape_md_simple(prompt_topic)}» не найден.")
         return
 
     if not txt_content:
@@ -1775,7 +1775,7 @@ async def summary_callback(callback: CallbackQuery, state: FSMContext):
 
     # Показываем статус — нейросеть может думать до минуты
     status_msg = await callback.message.answer(
-        f"⏳ Обрабатываю «{display}» через нейросеть...",
+        f"⏳ Обрабатываю «{escape_md_simple(display)}» через нейросеть...",
         parse_mode=ParseMode.MARKDOWN,
     )
 
@@ -1819,7 +1819,7 @@ async def summary_callback(callback: CallbackQuery, state: FSMContext):
         pass
 
     # Выводим результат с заголовком
-    header = f"🧠 **Саммари: {display}**\n\n---\n\n"
+    header = f"🧠 **Саммари: {escape_md_simple(display)}**\n\n---\n\n"
     full_text = header + result
 
     # Telegram не принимает >4000 символов — режем
@@ -1939,7 +1939,7 @@ async def publish_wiki_callback(callback: CallbackQuery, state: FSMContext):
 
     # Повторно генерируем саммари (или можно было кешировать, но проще перегенерировать)
     status_msg = await callback.message.answer(
-        f"⏳ Генерирую саммари для «{display}»...",
+        f"⏳ Генерирую саммари для «{escape_md_simple(display)}»...",
         parse_mode=ParseMode.MARKDOWN,
     )
 
@@ -3197,7 +3197,7 @@ def _help_text(section=None):
         return intro + entry[1]
     known = "`, `/help ".join(k for k in sorted(HELP_ALL_SECTIONS.keys()) if k != "notes")
     available = " ".join(f"{g['emoji']} {gk}" for gk, g in HELP_GROUPS.items())
-    return f"❓ Раздел справки «{section}» не найден.\n\nДоступные разделы: {available}"
+    return f"❓ Раздел справки «{escape_md_simple(section)}» не найден.\n\nДоступные разделы: {available}"
 @dp.message(Command("init"))
 async def cmd_init(message: Message, state: FSMContext):
     """Сбрасывает все настройки почты и запускает настройку заново."""
@@ -3531,7 +3531,7 @@ async def cmd_get_notes(message: Message):
     for idx, item in enumerate(items, 1):
         dt, display = item[0], item[1]
         date_str = dt.strftime("%d.%m.%Y %H:%M")
-        text = f"**{idx}.** {display}\n📅 {date_str}"
+        text = f"**{idx}.** {escape_md_simple(display)}\n📅 {date_str}"
         button = _get_item_button(idx, display)
         await message.answer(text, parse_mode=ParseMode.MARKDOWN, reply_markup=button)
 
@@ -3583,7 +3583,7 @@ async def cmd_list_new(message: Message):
     for idx, item in enumerate(items, 1):
         dt, display = item[0], item[1]
         date_str = dt.strftime("%d.%m.%Y %H:%M")
-        text = f"**{idx}.** {display}\n{date_str}"
+        text = f"**{idx}.** {escape_md_simple(display)}\n{date_str}"
         button = _get_item_button(idx, display)
         await message.answer(text, parse_mode=ParseMode.MARKDOWN, reply_markup=button)
 
@@ -3635,7 +3635,7 @@ async def cmd_list_all(message: Message):
     for idx, item in enumerate(items, 1):
         dt, display = item[0], item[1]
         date_str = dt.strftime("%d.%m.%Y %H:%M")
-        text = f"**{idx}.** {display}\n📅 {date_str}"
+        text = f"**{idx}.** {escape_md_simple(display)}\n📅 {date_str}"
         button = _get_item_button(idx, display)
         await message.answer(text, parse_mode=ParseMode.MARKDOWN, reply_markup=button)
 
@@ -3858,7 +3858,7 @@ async def _cmd_setup_ai_test(message: Message):
     model = ai_config.get("model", "")
 
     await message.answer(
-        f"⏳ Тестирую подключение к **{model}**...\n"
+        f"⏳ Тестирую подключение к **{escape_md_simple(model)}**...\n"
         f"🔗 `{endpoint}`",
         parse_mode=ParseMode.MARKDOWN,
     )
@@ -4354,7 +4354,7 @@ async def setup_password(message: Message, state: FSMContext):
         err = validate_password(text)
         if err:
             await message.answer(
-                f"⚠️ **{err}**\n\nВведите пароль приложения (минимум 4 символа):",
+                f"⚠️ **{escape_md_simple(err)}**\n\nВведите пароль приложения (минимум 4 символа):",
                 parse_mode=ParseMode.MARKDOWN,
             )
             return
@@ -4858,7 +4858,7 @@ async def _test_ai_connection(endpoint: str, api_key: str, model: str) -> str:
             if response.status_code == 200:
                 result = response.json()
                 reply = result["choices"][0]["message"]["content"]
-                return f"✅ Подключение успешно!\\nОтвет модели: «{reply.strip()}»"
+                return f"✅ Подключение успешно!\nОтвет модели: «{escape_md_simple(reply.strip())}»"
             elif response.status_code == 401:
                 return "❌ Ошибка авторизации (401). Проверьте API-ключ."
             elif response.status_code == 404:
@@ -5093,7 +5093,7 @@ async def ai_setup_model(message: Message, state: FSMContext):
 
     provider_label = data.get("ai_provider_label", "Пользовательский")
     await message.answer(
-        f"⏳ Проверяю подключение к **{provider_label}**...",
+        f"⏳ Проверяю подключение к **{escape_md_simple(provider_label)}**...",
         parse_mode=ParseMode.MARKDOWN,
     )
 
@@ -5648,7 +5648,7 @@ async def main():
                                 date_str = dt.strftime("%d.%m.%Y %H:%M")
                                 text = (
                                     f"🔔 **Новый конспект встречи!**\n\n"
-                                    f"**{idx}.** {display}\n"
+                                    f"**{idx}.** {escape_md_simple(display)}\n"
                                     f"📅 {date_str}"
                                 )
                                 try:
