@@ -1067,6 +1067,35 @@ dp = Dispatcher()
 # AccessManager управляет тем, какие пользователи Telegram имеют
 # доступ к этому боту. Каждый бот имеет свой файл доступа.
 _master_admin_id = MASTER_ADMIN_ID or getattr(db, "ADMIN_USER_ID", 0)
+
+# ── Нижнее меню (стандарт HuntTech) ─────────────────────────
+# Кнопки ReplyKeyboard ЭКВИВАЛЕНТНЫ командам: нажатие кнопки
+# маршрутизируется в тот же хендлер, что и текстовая команда.
+SIDE_MENU_BUTTONS = {
+    "notes": "📬 Конспекты",
+    "prompt": "🤖 Промпты",
+    "setup": "🔧 Настройки",
+    "help": "❓ Справка",
+}
+SIDE_MENU_ALIASES: dict[str, str] = {}
+for _cmd, _text in SIDE_MENU_BUTTONS.items():
+    SIDE_MENU_ALIASES[_text.lower()] = _cmd
+    SIDE_MENU_ALIASES[_cmd] = _cmd
+
+
+def _main_menu_keyboard() -> "ReplyKeyboardMarkup":
+    """Нижняя ReplyKeyboard-клавиатура с основными кнопками бота."""
+    from aiogram.types import KeyboardButton, ReplyKeyboardMarkup
+    btns = [KeyboardButton(text=t) for t in SIDE_MENU_BUTTONS.values()]
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            btns[0:2],   # notes, prompt
+            btns[2:4],   # setup, help
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=False,
+        input_field_placeholder="Выберите действие или введите команду...",
+    )
 if not _master_admin_id:
     logger.warning(
         "⚠️ MASTER_ADMIN_ID не задан! "
@@ -4931,6 +4960,27 @@ async def unknown_command(message: Message):
     Ловит любые сообщения, начинающиеся с /, которые не обработали
     другие хендлеры. Показывает подсказку /help.
     """
+
+    # ── Нижнее меню (стандарт HuntTech): кнопки ЭКВИВАЛЕНТНЫ командам ──
+    # Нажатия ReplyKeyboard приходят как обычные текстовые сообщения,
+    # поэтому маршрутизация кнопок живёт здесь.
+    normalized = (message.text or "").strip().lower()
+    cmd = SIDE_MENU_ALIASES.get(normalized)
+    if cmd:
+        if cmd == "notes":
+            await cmd_get_notes(message)
+        elif cmd == "prompt":
+            ctx = dp.fsm.get_context(bot=bot, chat_id=message.chat.id,
+                                     user_id=message.from_user.id)
+            await cmd_list_prompts(message, ctx, CommandObject(command="prompt", args=None))
+        elif cmd == "setup":
+            ctx = dp.fsm.get_context(bot=bot, chat_id=message.chat.id,
+                                     user_id=message.from_user.id)
+            await cmd_setup_start(message, ctx, CommandObject(command="setup", args=None))
+        elif cmd == "help":
+            await cmd_help(message, None)
+        return
+
     if message.text and message.text.startswith("/") and len(message.text) > 1:
         logger.info("Неизвестная команда: %s", message.text.split()[0])
         await message.answer(
@@ -5043,6 +5093,32 @@ async def main():
         logger.info("✅ Нижнее меню команд установлено (%d команд)", len(cmds))
     except Exception as e:
         logger.warning("⚠️ Не удалось установить меню команд: %s", e)
+
+    # ── Приветствие администратору при каждом старте ─────────
+    # (стандарт HuntTech, эталон — offer: plain text, parse_mode=None,
+    # reply_markup — актуальная нижняя клавиатура: Telegram кэширует
+    # ReplyKeyboard по чату, иначе после изменения состава кнопок
+    # пользователь продолжает видеть старые (мёртвые) кнопки)
+    if _master_admin_id:
+        try:
+            ai_cfg = get_ai_config(_master_admin_id)
+            ai_model = (ai_cfg or {}).get("model") or "не настроен"
+            startup_text = (
+                "🚀 HuntTech Protocols Bot\n"
+                "━━━━━━━━━━━━━━━━━━━━━━\n"
+                "✅ Бот запущен и готов к работе!\n"
+                f"🤖 AI: {ai_model}\n"
+                "━━━━━━━━━━━━━━━━━━━━━━"
+            )
+            await bot.send_message(
+                chat_id=_master_admin_id,
+                text=startup_text,
+                parse_mode=None,
+                reply_markup=_main_menu_keyboard(),
+            )
+            logger.info("Startup message sent to admin %s", _master_admin_id)
+        except Exception as e:
+            logger.warning("Startup message failed for admin %s: %s", _master_admin_id, e)
 
     await dp.start_polling(bot)
 
