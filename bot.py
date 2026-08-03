@@ -3995,7 +3995,8 @@ async def cmd_setup_start(message: Message, state: FSMContext, command: CommandO
             if config and config.get(field):
                 current = f"\n\nТекущее значение: `{config[field][:20]}...`" if field == "password" else f"\n\nТекущее значение: `{config[field]}`"
             await message.answer(
-                f"{labels.get(field, '')}{current}",
+                f"{labels.get(field, '')}{current}\n\n"
+                "или `/skip` — оставить текущее значение:",
                 parse_mode=ParseMode.MARKDOWN,
             )
             await state.set_state(SetupSingleField.value)
@@ -4017,31 +4018,43 @@ async def setup_email(message: Message, state: FSMContext):
     """
     Шаг 1: Email.
     Проверка через библиотечную validate_email().
+    /skip — оставить текущее значение.
     """
-    email_val = message.text.strip()
-    if not email_val:
-        await message.answer("⚠️ Email не может быть пустым. Введите адрес электронной почты:")
-        return
+    text = message.text.strip()
+    config = get_user_config(message.from_user.id) or {}
 
-    err = validate_email(email_val)
-    if err:
-        await message.answer(
-            f"⚠️ **{err}**\n\n"
-            "Пример правильного адреса: `ivan@example.ru`\n"
-            "Email должен содержать `@` и домен (например, `.ru`, `.com`).\n\n"
-            "Введите email ещё раз:",
-            parse_mode=ParseMode.MARKDOWN,
-        )
-        return
+    if text.lower() in ("/skip", "-"):
+        email_val = config.get("email", "")
+        if not email_val:
+            await message.answer(
+                "⚠️ Текущий email не задан — введите адрес или начните заново: `/setup`.",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return
+    else:
+        if not text:
+            await message.answer("⚠️ Email не может быть пустым. Введите адрес электронной почты:")
+            return
+        err = validate_email(text)
+        if err:
+            await message.answer(
+                f"⚠️ **{err}**\n\n"
+                "Пример правильного адреса: `ivan@example.ru`\n"
+                "Email должен содержать `@` и домен (например, `.ru`, `.com`).\n\n"
+                "Введите email ещё раз (или `/skip` — оставить текущий):",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return
+        email_val = text
     await state.update_data(email=email_val)
 
-    config = get_user_config(message.from_user.id)
-    current = config["server"] if config else "не задан"
+    current = config.get("server") or "не задан"
     await message.answer(
         f"✅ Email: `{email_val}`\n\n"
         f"**IMAP-сервер** ({current}):\n"
         "Введите адрес IMAP-сервера\n"
-        "(например: `imap.yandex.ru`, `imap.mail.ru`):",
+        "(например: `imap.yandex.ru`, `imap.mail.ru`)\n"
+        "или `/skip` — оставить текущий:",
         parse_mode=ParseMode.MARKDOWN,
     )
     await state.set_state(SetupState.server)
@@ -4052,31 +4065,43 @@ async def setup_server(message: Message, state: FSMContext):
     """
     Шаг 2: IMAP-сервер.
     Проверка через библиотечную validate_hostname().
+    /skip — оставить текущее значение.
     """
-    server = message.text.strip()
-    if not server:
-        await message.answer("⚠️ IMAP-сервер не может быть пустым. Введите адрес сервера:")
-        return
+    text = message.text.strip()
+    config = get_user_config(message.from_user.id) or {}
 
-    err = validate_hostname(server)
-    if err:
-        await message.answer(
-            f"⚠️ **{err}**\n\n"
-            "Пример правильного адреса: `imap.yandex.ru`\n"
-            "Имя сервера должно содержать домен.\n\n"
-            "Введите адрес IMAP-сервера ещё раз:",
-            parse_mode=ParseMode.MARKDOWN,
-        )
-        return
+    if text.lower() in ("/skip", "-"):
+        server = config.get("server", "")
+        if not server:
+            await message.answer(
+                "⚠️ Текущий IMAP-сервер не задан — введите адрес или начните заново: `/setup`.",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return
+    else:
+        if not text:
+            await message.answer("⚠️ IMAP-сервер не может быть пустым. Введите адрес сервера:")
+            return
+        err = validate_hostname(text)
+        if err:
+            await message.answer(
+                f"⚠️ **{err}**\n\n"
+                "Пример правильного адреса: `imap.yandex.ru`\n"
+                "Имя сервера должно содержать домен.\n\n"
+                "Введите адрес IMAP-сервера ещё раз (или `/skip` — оставить текущий):",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return
+        server = text
     await state.update_data(server=server)
 
-    config = get_user_config(message.from_user.id)
-    current = config["login"] if config else "не задан"
+    current = config.get("login") or "не задан"
     await message.answer(
         f"✅ IMAP-сервер: `{server}`\n\n"
         f"**Логин** ({current}):\n"
         "Введите логин для подключения к IMAP\n"
-        "(обычно это полный email-адрес):",
+        "(обычно это полный email-адрес)\n"
+        "или `/skip` — оставить текущий:",
         parse_mode=ParseMode.MARKDOWN,
     )
     await state.set_state(SetupState.login)
@@ -4086,21 +4111,33 @@ async def setup_server(message: Message, state: FSMContext):
 async def setup_login(message: Message, state: FSMContext):
     """
     Шаг 3: Логин.
-    Пользователь обязан ввести логин. Пустой ввод не допускается.
+    /skip — оставить текущее значение.
     """
-    login = message.text.strip()
-    if not login:
-        await message.answer("⚠️ Логин не может быть пустым. Введите логин:")
-        return
+    text = message.text.strip()
+    config = get_user_config(message.from_user.id) or {}
+
+    if text.lower() in ("/skip", "-"):
+        login = config.get("login", "")
+        if not login:
+            await message.answer(
+                "⚠️ Текущий логин не задан — введите логин или начните заново: `/setup`.",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return
+    else:
+        if not text:
+            await message.answer("⚠️ Логин не может быть пустым. Введите логин:")
+            return
+        login = text
     await state.update_data(login=login)
 
-    config = get_user_config(message.from_user.id)
-    current = "••••••••" if config and config.get("password") else "не задан"
+    current = "••••••••" if config.get("password") else "не задан"
     await message.answer(
         f"✅ Логин: `{login}`\n\n"
         f"**Пароль** ({current}):\n"
         "Введите пароль приложения для IMAP\n"
-        "(для Яндекса — создайте пароль приложения в настройках почты):",
+        "(для Яндекса — создайте пароль приложения в настройках почты)\n"
+        "или `/skip` — оставить текущий:",
         parse_mode=ParseMode.MARKDOWN,
     )
     await state.set_state(SetupState.password)
@@ -4110,18 +4147,32 @@ async def setup_login(message: Message, state: FSMContext):
 async def setup_password(message: Message, state: FSMContext):
     """
     Шаг 4: Пароль приложения.
-    Пользователь обязан ввести пароль. Пустой ввод не допускается.
     После ввода проверяем IMAP-подключение. Если всё ОК — сохраняем.
+    /skip — оставить текущий пароль.
     """
-    password = message.text.strip()
-    if not password:
-        await message.answer("⚠️ Пароль не может быть пустым. Введите пароль приложения:")
-        return
-    err = validate_password(password)
-    if err:
-        await message.answer(f"⚠️ **{err}**\n\nВведите пароль приложения (минимум 4 символа):",
-                             parse_mode=ParseMode.MARKDOWN)
-        return
+    text = message.text.strip()
+    config = get_user_config(message.from_user.id) or {}
+
+    if text.lower() in ("/skip", "-"):
+        password = config.get("password", "")
+        if not password:
+            await message.answer(
+                "⚠️ Текущий пароль не задан — введите пароль приложения или начните заново: `/setup`.",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return
+    else:
+        if not text:
+            await message.answer("⚠️ Пароль не может быть пустым. Введите пароль приложения:")
+            return
+        err = validate_password(text)
+        if err:
+            await message.answer(
+                f"⚠️ **{err}**\n\nВведите пароль приложения (минимум 4 символа):",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return
+        password = text
 
     data = await state.get_data()
     email = data.get("email", "")
@@ -4194,11 +4245,9 @@ async def setup_password(message: Message, state: FSMContext):
 
 @dp.message(SetupSingleField.value)
 async def setup_single_field(message: Message, state: FSMContext):
-    """Сохраняет одно поле настройки почты (email, imap, login, password)."""
-    value = message.text.strip()
-    if not value:
-        await message.answer("⚠️ Значение не может быть пустым. Введите снова:")
-        return
+    """Сохраняет одно поле настройки почты (email, imap, login, password).
+       /skip — оставить текущее значение."""
+    text = message.text.strip()
 
     data = await state.get_data()
     field = data.get("field", "email")
@@ -4208,6 +4257,22 @@ async def setup_single_field(message: Message, state: FSMContext):
     key = str(user_id)
     if key not in users:
         users[key] = {}
+
+    if text.lower() in ("/skip", "-"):
+        value = users[key].get(field, "")
+        if not value:
+            await message.answer(
+                f"⚠️ Текущее значение `{field}` не задано — введите его или начните заново.",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return
+        skipped = True
+    else:
+        if not text:
+            await message.answer("⚠️ Значение не может быть пустым. Введите снова:")
+            return
+        value = text
+        skipped = False
 
     old_val = users[key].get(field, "")
     users[key][field] = value
@@ -4222,8 +4287,9 @@ async def setup_single_field(message: Message, state: FSMContext):
         "password": "🔑 Пароль",
     }
     masked = f"`{value[:20]}...`" if field == "password" else f"`{value}`"
+    skip_note = " (оставлено прежнее значение)" if skipped else ""
     await message.answer(
-        f"✅ **{label_map.get(field, field)}** сохранён: {masked}\n\n"
+        f"✅ **{label_map.get(field, field)}** сохранён{skip_note}: {masked}\n\n"
         "Проверьте настройки: `/setup show all`",
         parse_mode=ParseMode.MARKDOWN,
     )
@@ -4485,11 +4551,24 @@ async def ai_setup_apikey(message: Message, state: FSMContext):
     """
     Сохраняет API key и запрашивает модель.
     Если endpoint ещё не задан (custom путь) — сначала endpoint, потом модель.
+    /skip — оставить текущий API key (из сохранённого AI-конфига).
     """
-    api_key = message.text.strip()
-    if not api_key:
-        await message.answer("⚠️ API Key не может быть пустым. Введите ключ:")
-        return
+    text = message.text.strip()
+    ai_config = get_ai_config(message.from_user.id) or {}
+
+    if text.lower() in ("/skip", "-"):
+        api_key = ai_config.get("api_key", "")
+        if not api_key:
+            await message.answer(
+                "⚠️ Текущий API Key не задан — введите ключ или начните заново: `/setup_ai`.",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return
+    else:
+        if not text:
+            await message.answer("⚠️ API Key не может быть пустым. Введите ключ:")
+            return
+        api_key = text
 
     data = await state.get_data()
     endpoint = data.get("ai_endpoint", "")
@@ -4535,29 +4614,58 @@ async def ai_setup_model(message: Message, state: FSMContext):
     """
     Сохраняет модель и завершает настройку AI.
     Если был выбран custom путь — сначала получаем endpoint (через _need_endpoint).
+    /skip — оставить текущее значение (модель или endpoint для custom-пути).
     """
-    model = message.text.strip()
-    if not model:
-        await message.answer("⚠️ Название модели не может быть пустым. Введите модель:")
-        return
+    text = message.text.strip()
+    ai_config = get_ai_config(message.from_user.id) or {}
 
     data = await state.get_data()
-    api_key = data.get("ai_api_key", "")
-    endpoint = data.get("ai_endpoint", "")
-
-    # Если endpoint ещё не задан (custom путь) — текущее сообщение это endpoint
     need_endpoint = data.get("_need_endpoint", False)
+
+    is_skip = text.lower() in ("/skip", "-")
+
     if need_endpoint:
-        endpoint = model
+        # Текущее сообщение — это endpoint (custom путь)
+        if is_skip:
+            endpoint = ai_config.get("endpoint", "")
+            if not endpoint:
+                await message.answer(
+                    "⚠️ Текущий endpoint не задан — введите URL или начните заново: `/setup_ai`.",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+                return
+        else:
+            if not text:
+                await message.answer("⚠️ Название модели не может быть пустым. Введите модель:")
+                return
+            endpoint = text
         model = ""
         await state.update_data(ai_endpoint=endpoint, _need_endpoint=False)
         await message.answer(
             "📝 Введите **название модели**:\n\n"
-            "Например: `gpt-4o`, `deepseek-chat`, `claude-sonnet-4`",
+            "Например: `gpt-4o`, `deepseek-chat`, `claude-sonnet-4`\n"
+            "или `/skip` — оставить текущую:",
             parse_mode=ParseMode.MARKDOWN,
         )
         await state.set_state(AiSetupState.model)
         return
+
+    if is_skip:
+        model = ai_config.get("model", "")
+        if not model:
+            await message.answer(
+                "⚠️ Текущая модель не задана — введите модель или начните заново: `/setup_ai`.",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return
+    else:
+        if not text:
+            await message.answer("⚠️ Название модели не может быть пустым. Введите модель:")
+            return
+        model = text
+
+    api_key = data.get("ai_api_key", "")
+    endpoint = data.get("ai_endpoint", "")
 
     if not endpoint:
         await message.answer("❌ Ошибка: не указан endpoint. Начните заново: `/setup_ai`")
@@ -4759,15 +4867,30 @@ async def cmd_setup_wiki_test(message: Message):
 
 @dp.message(DbSetupState.host)
 async def setup_db_host(message: Message, state: FSMContext):
-    """Шаг 1: хост PostgreSQL."""
-    host = message.text.strip()
-    if not host:
-        await message.answer("⚠️ Хост не может быть пустым. Введите хост:")
-        return
+    """Шаг 1: хост PostgreSQL. /skip — оставить текущее значение."""
+    text = message.text.strip()
+    db_config = get_db_config(message.from_user.id) or {}
+
+    if text.lower() in ("/skip", "-"):
+        host = db_config.get("host", "")
+        if not host:
+            await message.answer(
+                "⚠️ Текущий хост не задан — введите хост или начните заново: `/setup db`.",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return
+    else:
+        if not text:
+            await message.answer("⚠️ Хост не может быть пустым. Введите хост:")
+            return
+        host = text
     await state.update_data(host=host)
+
+    current_port = db_config.get("port") or 5432
     await message.answer(
         f"✅ Хост: `{host}`\n\n"
-        "Введите **порт** (по умолчанию 5432):",
+        f"Введите **порт** (текущий: `{current_port}`, по умолчанию 5432)\n"
+        "или `/skip` — оставить текущий:",
         parse_mode=ParseMode.MARKDOWN,
     )
     await state.set_state(DbSetupState.port)
@@ -4775,20 +4898,28 @@ async def setup_db_host(message: Message, state: FSMContext):
 
 @dp.message(DbSetupState.port)
 async def setup_db_port(message: Message, state: FSMContext):
-    """Шаг 2: порт PostgreSQL."""
+    """Шаг 2: порт PostgreSQL. /skip — оставить текущее значение."""
     raw = message.text.strip()
-    try:
-        port = int(raw) if raw else 5432
-    except ValueError:
-        await message.answer("⚠️ Порт должен быть числом. Введите число (например, 5432):")
-        return
-    if port < 1 or port > 65535:
-        await message.answer("⚠️ Порт должен быть от 1 до 65535. Введите снова:")
-        return
+    db_config = get_db_config(message.from_user.id) or {}
+
+    if raw.lower() in ("/skip", "-"):
+        port = db_config.get("port") or 5432
+    else:
+        try:
+            port = int(raw) if raw else 5432
+        except ValueError:
+            await message.answer("⚠️ Порт должен быть числом. Введите число (например, 5432):")
+            return
+        if port < 1 or port > 65535:
+            await message.answer("⚠️ Порт должен быть от 1 до 65535. Введите снова:")
+            return
     await state.update_data(port=port)
+
+    current_name = db_config.get("name") or "не задано"
     await message.answer(
         f"✅ Порт: `{port}`\n\n"
-        "Введите **имя базы данных**:",
+        f"Введите **имя базы данных** (текущее: `{current_name}`)\n"
+        "или `/skip` — оставить текущее:",
         parse_mode=ParseMode.MARKDOWN,
     )
     await state.set_state(DbSetupState.name)
@@ -4796,15 +4927,30 @@ async def setup_db_port(message: Message, state: FSMContext):
 
 @dp.message(DbSetupState.name)
 async def setup_db_name(message: Message, state: FSMContext):
-    """Шаг 3: имя базы данных."""
-    name = message.text.strip()
-    if not name:
-        await message.answer("⚠️ Имя БД не может быть пустым. Введите имя БД:")
-        return
+    """Шаг 3: имя базы данных. /skip — оставить текущее значение."""
+    text = message.text.strip()
+    db_config = get_db_config(message.from_user.id) or {}
+
+    if text.lower() in ("/skip", "-"):
+        name = db_config.get("name", "")
+        if not name:
+            await message.answer(
+                "⚠️ Текущее имя БД не задано — введите имя или начните заново: `/setup db`.",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return
+    else:
+        if not text:
+            await message.answer("⚠️ Имя БД не может быть пустым. Введите имя БД:")
+            return
+        name = text
     await state.update_data(name=name)
+
+    current_user = db_config.get("user") or "не задано"
     await message.answer(
         f"✅ База данных: `{name}`\n\n"
-        "Введите **имя пользователя**:",
+        f"Введите **имя пользователя** (текущее: `{current_user}`)\n"
+        "или `/skip` — оставить текущее:",
         parse_mode=ParseMode.MARKDOWN,
     )
     await state.set_state(DbSetupState.user)
@@ -4812,15 +4958,31 @@ async def setup_db_name(message: Message, state: FSMContext):
 
 @dp.message(DbSetupState.user)
 async def setup_db_user(message: Message, state: FSMContext):
-    """Шаг 4: пользователь PostgreSQL."""
-    user = message.text.strip()
-    if not user:
-        await message.answer("⚠️ Имя пользователя не может быть пустым. Введите имя:")
-        return
+    """Шаг 4: пользователь PostgreSQL. /skip — оставить текущее значение."""
+    text = message.text.strip()
+    db_config = get_db_config(message.from_user.id) or {}
+
+    if text.lower() in ("/skip", "-"):
+        user = db_config.get("user", "")
+        if not user:
+            await message.answer(
+                "⚠️ Текущее имя пользователя не задано — введите имя или начните заново: `/setup db`.",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return
+    else:
+        if not text:
+            await message.answer("⚠️ Имя пользователя не может быть пустым. Введите имя:")
+            return
+        user = text
     await state.update_data(user=user)
+
+    has_pw = bool(db_config.get("password"))
+    current_pw = "••••••••" if has_pw else "не задан"
     await message.answer(
         f"✅ Пользователь: `{user}`\n\n"
-        "Введите **пароль**:",
+        f"Введите **пароль** (текущий: `{current_pw}`)\n"
+        "или `/skip` — оставить текущий:",
         parse_mode=ParseMode.MARKDOWN,
     )
     await state.set_state(DbSetupState.password)
@@ -4830,11 +4992,23 @@ async def setup_db_user(message: Message, state: FSMContext):
 async def setup_db_password(message: Message, state: FSMContext):
     """Шаг 5: пароль PostgreSQL.
        После ввода всех параметров — тестируем подключение.
-       Пароль не показывается в логах."""
-    password = message.text.strip()
-    if not password:
-        await message.answer("⚠️ Пароль не может быть пустым. Введите пароль:")
-        return
+       Пароль не показывается в логах. /skip — оставить текущий пароль."""
+    text = message.text.strip()
+    db_config = get_db_config(message.from_user.id) or {}
+
+    if text.lower() in ("/skip", "-"):
+        password = db_config.get("password", "")
+        if not password:
+            await message.answer(
+                "⚠️ Текущий пароль не задан — введите пароль или начните заново: `/setup db`.",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return
+    else:
+        if not text:
+            await message.answer("⚠️ Пароль не может быть пустым. Введите пароль:")
+            return
+        password = text
 
     data = await state.get_data()
     host = data["host"]
