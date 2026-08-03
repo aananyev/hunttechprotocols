@@ -4346,6 +4346,46 @@ async def cmd_setup_start(message: Message, state: FSMContext, command: CommandO
     )
 
 
+def _setup_skip_done_keyboard() -> "ReplyKeyboardMarkup":
+    """Нижнее меню при вводе серверов/пароля в /setup email:
+    «Оставить прежнее» — подтвердить текущее/авто-значение (как /skip);
+    «Готово» — завершить настройку и сохранить (выйти из FSM).
+    «Изменить» — просто ввести новое значение с клавиатуры."""
+    from aiogram.types import KeyboardButton, ReplyKeyboardMarkup
+
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="Оставить прежнее"), KeyboardButton(text="Готово")],
+        ],
+        resize_keyboard=True,
+    )
+
+
+async def _finish_email_setup_early(message: Message, state: FSMContext) -> None:
+    """Досрочное завершение /setup email (кнопка «Готово»): сохраняет
+    введённые в state значения, недостающие поля берёт из текущего конфига.
+    Проверка IMAP/SMTP не выполняется (не все поля введены) — статус остаётся 🟡."""
+    from aiogram.types import ReplyKeyboardRemove
+
+    data = await state.get_data()
+    user_id = message.from_user.id
+    config = get_user_config(user_id) or {}
+    email = data.get("email") or config.get("email", "")
+    server = data.get("server") or config.get("server", "")
+    login = data.get("login") or config.get("login", "")
+    password = data.get("password") or config.get("password", "")
+    save_user_config(user_id, email, server, login, password)
+    await state.clear()
+    await message.answer(
+        "✅ Настройки почты сохранены (без проверки подключения).\n"
+        "Чтобы выполнить проверку SMTP/IMAP — пройдите `/setup email` до конца "
+        "или `/setup` → «🧪 Проверить».",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    await message.answer("🔧 Главное меню:", reply_markup=_main_menu_keyboard())
+
+
 @dp.message(SetupState.email)
 async def setup_email(message: Message, state: FSMContext):
     """
@@ -4419,7 +4459,12 @@ async def setup_server(message: Message, state: FSMContext):
     text = message.text.strip()
     config = get_user_config(message.from_user.id) or {}
 
-    if text.lower() in ("/skip", "-"):
+    # Кнопка «Готово» — досрочное завершение настройки
+    if text == "Готово":
+        await _finish_email_setup_early(message, state)
+        return
+
+    if text.lower() in ("/skip", "-") or text == "Оставить прежнее":
         server = config.get("server", "")
         if not server:
             await message.answer(
@@ -4452,6 +4497,7 @@ async def setup_server(message: Message, state: FSMContext):
         "(обычно это полный email-адрес)\n"
         "или `/skip` — оставить текущий:",
         parse_mode=ParseMode.MARKDOWN,
+        reply_markup=ReplyKeyboardRemove(),
     )
     await state.set_state(SetupState.login)
 
@@ -5948,12 +5994,12 @@ def _changelog_since_last_start() -> str | None:
     repo = Path(__file__).resolve().parent
     log = _git_changelog(repo, str(prev.get("git_head") or "")) if repo.is_dir() else ""
     if log:
-        lines = ["🆕 **Что изменилось в боте (после перезапуска):**", ""]
+        lines = ["🆕 Что изменилось в боте (после перезапуска):", ""]
         for line in log.splitlines()[:15]:
-            lines.append(f"• {escape_md_simple(line)}")
+            lines.append(f"• {line}")
         body = "\n".join(lines)
     else:
-        body = "🆕 **Алгоритмы бота обновлены.**\n\nКраткое описание изменений: см. git-историю проекта."
+        body = "🆕 Алгоритмы бота обновлены.\n\nКраткое описание изменений: см. git-историю проекта."
 
     # Обновляем маркер — чтобы при следующем запуске без изменений не выводить повторно
     try:
@@ -6096,13 +6142,17 @@ async def main():
             logger.warning("Startup message failed for admin %s: %s", _master_admin_id, e)
 
     # ── Однократный вывод изменений алгоритмов с прошлого перезапуска ──
+    # plain text (parse_mode=None): escape_md_simple рассчитан на MarkdownV2,
+    # а Legacy MARKDOWN его backslash-экранирования не рендерит — сырые
+    # звёздочки/слеши «пролезали» в чат (стандарт HuntTech: приветствия и
+    # changelog — только plain text, как в offer-боте)
     try:
         changelog = await asyncio.to_thread(_changelog_since_last_start)
         if changelog and _master_admin_id:
             await bot.send_message(
                 chat_id=_master_admin_id,
                 text=changelog,
-                parse_mode=ParseMode.MARKDOWN,
+                parse_mode=None,
                 reply_markup=_main_menu_keyboard(),
             )
             logger.info("Changelog message sent to admin %s", _master_admin_id)
