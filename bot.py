@@ -476,14 +476,27 @@ def extract_txt_attachments(msg) -> list[str]:
 
 # ── Общие IMAP-хелперы ────────────────────────────────────────
 
+def _email_config_error(config: dict | None) -> str | None:
+    """Проверить полноту email-конфига. Возвращает None если всё ок,
+    иначе сообщение об ошибке (неполная настройка)."""
+    if not config:
+        return "❌ Почта не настроена. Используйте /setup для настройки."
+    missing = [k for k in ("email", "server", "login", "password") if not config.get(k)]
+    if missing:
+        return ("❌ Настройка почты неполная (не хватает: "
+                + ", ".join(missing)
+                + "). Используйте /setup для настройки.")
+    return None
+
+
 def _connect_imap(config: dict) -> imaplib.IMAP4_SSL:
     """
     Подключается к IMAP-серверу по настройкам пользователя.
     Бизнес-правило: логин для IMAP часто совпадает с email, 
     но бывает отличается (например, логин — часть email до @).
     """
-    imap_login = config.get("login", config["email"])
-    logger.info("Подключение к IMAP %s (login: %s)...", config["server"], imap_login)
+    imap_login = config.get("login") or config.get("email", "")
+    logger.info("Подключение к IMAP %s (login: %s)...", config.get("server"), imap_login)
     server = imaplib.IMAP4_SSL(config["server"], config.get("port", 993))
     server.login(imap_login, config["password"])
     server.select("INBOX")
@@ -578,8 +591,10 @@ def fetch_notes(user_id: int) -> tuple[str, list]:
     и перепроверить в веб-почте.
     """
     config = get_user_config(user_id)
-    if not config:
-        return ("❌ Почта не настроена. Используйте /setup для настройки.", [])
+    err = _email_config_error(config)
+    if err:
+        return (err, [])
+    assert config is not None  # _email_config_error вернул бы ошибку при None
     server = _connect_imap(config)
     try:
         typ, data = server.search(None, "UNSEEN")
@@ -613,8 +628,10 @@ def fetch_new_notes(user_id: int) -> tuple[str, list]:
     IDs are saved in new_comms.json after display.
     """
     config = get_user_config(user_id)
-    if not config:
-        return ("Mail not configured. Use /setup.", [])
+    err = _email_config_error(config)
+    if err:
+        return (err, [])
+    assert config is not None
     server = _connect_imap(config)
     try:
         typ, data = server.search(None, "UNSEEN")
@@ -658,8 +675,10 @@ def fetch_notes_last_week(user_id: int) -> tuple[str, list]:
     на неделе — неважно, читал он это или нет.
     """
     config = get_user_config(user_id)
-    if not config:
-        return ("❌ Почта не настроена. Используйте /setup для настройки.", [])
+    err = _email_config_error(config)
+    if err:
+        return (err, [])
+    assert config is not None
     server = _connect_imap(config)
     try:
         typ, data = server.search(None, "ALL")
@@ -1038,8 +1057,9 @@ def _set_email_read(user_id: int, imap_msg_id: str) -> bool:
     """Помечает письмо по IMAP msg_id как прочитанное (флаг \\Seen).
        После успешной цепочки AI→Wiki→БД — письмо уходит из /list."""
     config = get_user_config(user_id)
-    if not config:
+    if _email_config_error(config):
         return False
+    assert config is not None
     try:
         server = _connect_imap(config)
         try:
@@ -3482,7 +3502,7 @@ async def cmd_get_notes(message: Message):
     sent = await message.answer("🔍 Ищу новые конспекты...")
 
     try:
-        _, items = fetch_notes(user.id)
+        header, items = fetch_notes(user.id)
     except imaplib.IMAP4.error as e:
         await sent.edit_text(f"❌ Ошибка IMAP: `{e}`")
         return
@@ -3493,7 +3513,7 @@ async def cmd_get_notes(message: Message):
         return
 
     if not items:
-        await sent.delete()
+        await sent.edit_text(header or "📭 Нет непрочитанных писем.")
         return
 
     await sent.delete()
@@ -3533,7 +3553,7 @@ async def cmd_list_new(message: Message):
     sent = await message.answer("Searching for new conspects...")
 
     try:
-        _, items = fetch_new_notes(user.id)
+        header, items = fetch_new_notes(user.id)
     except imaplib.IMAP4.error as e:
         await sent.edit_text(f"IMAP error: {e}")
         return
@@ -3544,8 +3564,7 @@ async def cmd_list_new(message: Message):
         return
 
     if not items:
-        await message.answer("No new conspects.")
-        await sent.delete()
+        await sent.edit_text(header or "No new conspects.")
         return
 
     await sent.delete()
@@ -3589,7 +3608,7 @@ async def cmd_list_all(message: Message):
     sent = await message.answer("🔍 Загружаю конспекты за неделю...")
 
     try:
-        _, items = fetch_notes_last_week(user.id)
+        header, items = fetch_notes_last_week(user.id)
     except imaplib.IMAP4.error as e:
         await sent.edit_text(f"❌ Ошибка IMAP: `{e}`")
         return
@@ -3600,7 +3619,7 @@ async def cmd_list_all(message: Message):
         return
 
     if not items:
-        await sent.delete()
+        await sent.edit_text(header or "📭 Нет конспектов за неделю.")
         return
 
     await sent.delete()
