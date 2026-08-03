@@ -4184,7 +4184,7 @@ async def cmd_setup_start(message: Message, state: FSMContext, command: CommandO
             if config and config.get(field):
                 current = f"\n\nТекущее значение: `{config[field][:20]}...`" if field == "password" else f"\n\nТекущее значение: `{config[field]}`"
             await message.answer(
-                f"{escape_md_simple(labels.get(field, ''))}{current}\n\n"
+                f"{labels.get(field, '')}{current}\n\n"
                 "или `/skip` — оставить текущее значение:",
                 parse_mode=ParseMode.MARKDOWN,
             )
@@ -4404,7 +4404,7 @@ async def setup_password(message: Message, state: FSMContext):
     report = "\n".join(r.short for r in results)
     await status.edit_text(
         f"✅ **Настройка завершена!**\n\n"
-        f"{escape_md_simple(format_email_config(cfg))}\n\n"
+        f"{format_email_config(cfg)}\n\n"
         f"{escape_md_simple(report)}",
         parse_mode=ParseMode.MARKDOWN,
     )
@@ -4500,7 +4500,7 @@ async def setup_single_field(message: Message, state: FSMContext):
     masked = f"`{value[:20]}...`" if field in ("password", "api_key") else f"`{value}`"
     skip_note = " (оставлено прежнее значение)" if skipped else ""
     await message.answer(
-        f"✅ **{escape_md_simple(label_map.get(field, field))}** сохранён{skip_note}: {masked}\n\n"
+        f"✅ **{label_map.get(field, escape_md_simple(field))}** сохранён{skip_note}: {masked}\n\n"
         "Проверьте настройки: `/setup show all`",
         parse_mode=ParseMode.MARKDOWN,
     )
@@ -4563,7 +4563,7 @@ async def setup_param_callback(callback: CallbackQuery, state: FSMContext):
         current = f"\n\nТекущее значение: `{cfg[field][:20]}...`" if secret else f"\n\nТекущее значение: `{cfg[field]}`"
 
     await callback.message.answer(
-        f"{escape_md_simple(labels.get(field, field))}{current}\n\n"
+        f"{labels.get(field, escape_md_simple(field))}{current}\n\n"
         "или `/skip` — оставить текущее значение:",
         parse_mode=ParseMode.MARKDOWN,
     )
