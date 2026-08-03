@@ -4265,17 +4265,12 @@ async def cmd_setup_start(message: Message, state: FSMContext, command: CommandO
                     "login" if arg in ("login", "user") else \
                     "password"
             await state.update_data(field=field)
-            labels = {
-                "imap": "🔌 **IMAP-сервер** — введите адрес IMAP-сервера (например, `imap.yandex.ru`):",
-                "login": "👤 **Логин** — введите логин для IMAP (обычно совпадает с email):",
-                "password": "🔑 **Пароль** — введите пароль приложения для IMAP:",
-            }
             config = get_user_config(message.from_user.id)
             current = ""
             if config and config.get(field):
                 current = f"\n\nТекущее значение: `{config[field][:20]}...`" if field == "password" else f"\n\nТекущее значение: `{config[field]}`"
             await message.answer(
-                f"{labels.get(field, '')}{current}\n\n"
+                f"{_single_field_prompt(field)}{current}\n\n"
                 "или `/skip` — оставить текущее значение:",
                 parse_mode=ParseMode.MARKDOWN,
             )
@@ -4544,7 +4539,8 @@ async def setup_password(message: Message, state: FSMContext):
 @dp.message(SetupSingleField.value)
 async def setup_single_field(message: Message, state: FSMContext):
     """Сохраняет одно поле настройки (email/imap/login/password | db:host.. | ai:endpoint..).
-       /skip — оставить текущее значение."""
+       /skip — оставить текущее значение.
+       После ввода значения — кнопки «✅ Подтвердить / ✏️ Редактировать / 🚫 Отмена»."""
     text = message.text.strip()
 
     data = await state.get_data()
@@ -4552,18 +4548,13 @@ async def setup_single_field(message: Message, state: FSMContext):
     field = data.get("field", "email")
     user_id = message.from_user.id
 
-    users = _load_users()
-    key = str(user_id)
-    if key not in users:
-        users[key] = {}
-
-    # Куда сохраняем: email — корень users[key], db/ai — вложенный dict
-    if section == "email":
-        cfg = users[key]
-    else:
-        cfg = users[key].setdefault(section, {})
-
+    # /skip — оставить текущее значение (сохраняем сразу, подтверждение не нужно)
     if text.lower() in ("/skip", "-"):
+        users = _load_users()
+        key = str(user_id)
+        if key not in users:
+            users[key] = {}
+        cfg = users[key] if section == "email" else users[key].setdefault(section, {})
         value = cfg.get(field, "")
         if not value:
             await message.answer(
@@ -4571,14 +4562,82 @@ async def setup_single_field(message: Message, state: FSMContext):
                 parse_mode=ParseMode.MARKDOWN,
             )
             return
-        skipped = True
-    else:
-        if not text:
-            await message.answer("⚠️ Значение не может быть пустым. Введите снова:")
-            return
-        value = text
-        skipped = False
+        _apply_single_field(user_id, section, field, value, skipped=True)
+        await message.answer(
+            f"✅ **{SETUP_FIELD_LABELS.get(field, escape_md_simple(field))}** сохранён (оставлено прежнее значение): `{value[:20]}...`"
+            if field in ("password", "api_key") and len(value) > 20
+            else f"✅ **{SETUP_FIELD_LABELS.get(field, escape_md_simple(field))}** сохранён (оставлено прежнее значение): `{value}`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        if section in SETUP_SECTIONS:
+            await message.answer(
+                _setup_section_text(user_id, section),
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=_setup_section_keyboard(user_id, section),
+            )
+        return
 
+    if not text:
+        await message.answer("⚠️ Значение не может быть пустым. Введите снова:")
+        return
+
+    # Запоминаем введённое значение и показываем предпросмотр с кнопками
+    await state.update_data(pending_value=text)
+    masked = f"`{text[:20]}...`" if field in ("password", "api_key") else f"`{text}`"
+    await message.answer(
+        f"Вы ввели: {masked}\n\n"
+        "Проверьте значение и выберите действие:",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Подтвердить", callback_data="setup_sf:confirm"),
+                InlineKeyboardButton(text="✏️ Редактировать", callback_data="setup_sf:edit"),
+            ],
+            [
+                InlineKeyboardButton(text="🚫 Отмена", callback_data="setup_sf:cancel"),
+            ],
+        ]),
+    )
+
+
+def _setup_test_keyboard(section: str) -> InlineKeyboardMarkup:
+    """Нижние кнопки после верификации: Подтверждение / Редактирование / Отмена."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Подтверждение", callback_data=f"setup_menu:{section}"),
+            InlineKeyboardButton(text="✏️ Редактирование", callback_data=f"setup_menu:{section}"),
+        ],
+        [
+            InlineKeyboardButton(text="🚫 Отмена", callback_data="setup_menu:root"),
+        ],
+    ])
+
+
+def _single_field_prompt(field: str) -> str:
+    """Текст запроса значения для одношаговой настройки поля."""
+    return {
+        "email": "📧 **Email** — введите новый адрес электронной почты:",
+        "server": "🔌 **IMAP-сервер** — введите адрес IMAP-сервера (например, `imap.yandex.ru`):",
+        "login": "👤 **Логин** — введите логин для IMAP (обычно совпадает с email):",
+        "password": "🔑 **Пароль** — введите пароль приложения для IMAP:",
+        "host": "🖥️ **Хост** — введите адрес PostgreSQL-сервера:",
+        "port": "🔢 **Порт** — введите порт PostgreSQL (например, 5432):",
+        "name": "🗄️ **Имя БД** — введите имя базы данных:",
+        "user": "👤 **Пользователь** — введите имя пользователя PostgreSQL:",
+        "endpoint": "🔗 **Endpoint** — введите URL OpenAI-совместимого API:",
+        "api_key": "🔑 **API Key** — введите ключ API:",
+        "model": "📝 **Модель** — введите название модели:",
+    }.get(field, f"✏️ **{escape_md_simple(field)}** — введите значение:")
+
+
+def _apply_single_field(user_id: int, section: str, field: str, value: str, skipped: bool = False) -> dict | None:
+    """Сохраняет значение поля в users.json. Если ввели email — пробует
+    определить серверы (imap/pop3/smtp). Возвращает detected (dict) или None."""
+    users = _load_users()
+    key = str(user_id)
+    if key not in users:
+        users[key] = {}
+    cfg = users[key] if section == "email" else users[key].setdefault(section, {})
     cfg[field] = value
     # Данные изменились (или прежние) — флаг «проверено» сбрасываем,
     # кроме /skip (значение не менялось, статус сохраняется)
@@ -4587,13 +4646,35 @@ async def setup_single_field(message: Message, state: FSMContext):
             users[key]["email_checked"] = False
         else:
             cfg["checked"] = False
-    _save_users(users)
-
     # Если ввели email — пробуем определить серверы (imap/pop3/smtp)
-    # и подставить их → кнопки настроек получают 🟡
-    auto_note = ""
+    detected = None
     if section == "email" and field == "email" and not skipped:
         detected = _auto_fill_mail_servers(user_id, value)
+    _save_users(users)
+    return detected
+
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("setup_sf:"))
+async def setup_single_field_callback(callback: CallbackQuery, state: FSMContext):
+    """Кнопки подтверждения одношаговой настройки: confirm / edit / cancel."""
+    action = callback.data.split(":", 1)[1]
+    user_id = callback.from_user.id
+    data = await state.get_data()
+    section = data.get("section", "email")
+    field = data.get("field", "email")
+    await callback.answer()
+
+    label = SETUP_FIELD_LABELS.get(field, escape_md_simple(field))
+
+    if action == "confirm":
+        value = data.get("pending_value", "")
+        if not value:
+            await callback.message.answer("⚠️ Значение не найдено. Начните настройку заново.",
+                                          parse_mode=ParseMode.MARKDOWN)
+            return
+        detected = _apply_single_field(user_id, section, field, value)
+        masked = f"`{value[:20]}...`" if field in ("password", "api_key") else f"`{value}`"
+        auto_note = ""
         if detected:
             auto_note = (
                 "\n\n✨ Определил серверы по домену:\n"
@@ -4601,39 +4682,46 @@ async def setup_single_field(message: Message, state: FSMContext):
                 f"• POP3: `{detected['pop3']}`\n"
                 f"• SMTP: `{detected['smtp']}`"
             )
-
-    await state.clear()
-
-    label_map = {
-        "email": "📧 Email",
-        "imap": "🔌 IMAP-сервер",
-        "login": "👤 Логин",
-        "password": "🔑 Пароль",
-        "host": "🖥️ Хост",
-        "port": "🔢 Порт",
-        "name": "🗄️ Имя БД",
-        "user": "👤 Пользователь",
-        "endpoint": "🔗 Endpoint",
-        "api_key": "🔑 API Key",
-        "model": "📝 Модель",
-    }
-    masked = f"`{value[:20]}...`" if field in ("password", "api_key") else f"`{value}`"
-    skip_note = " (оставлено прежнее значение)" if skipped else ""
-    await message.answer(
-        f"✅ **{label_map.get(field, escape_md_simple(field))}** сохранён{skip_note}: {masked}"
-        f"{auto_note}\n\n"
-        "Проверьте настройки: `/setup show all`",
-        parse_mode=ParseMode.MARKDOWN,
-    )
-
-    # Возвращаем меню секции — чтобы пользователь видел обновлённые флаги
-    # и мог продолжить настройку (email → меню email, db → меню db, ai → меню ai)
-    if section in SETUP_SECTIONS:
-        await message.answer(
-            _setup_section_text(user_id, section),
+        await callback.message.answer(
+            f"✅ **{label}** сохранён: {masked}"
+            f"{auto_note}\n\n"
+            "Проверьте настройки: `/setup show all`",
             parse_mode=ParseMode.MARKDOWN,
-            reply_markup=_setup_section_keyboard(user_id, section),
         )
+        await state.clear()
+        if section in SETUP_SECTIONS:
+            await callback.message.answer(
+                _setup_section_text(user_id, section),
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=_setup_section_keyboard(user_id, section),
+            )
+        return
+
+    if action == "edit":
+        await state.update_data(pending_value=None)
+        cfg, _, _ = _section_config(user_id, section)
+        current = ""
+        if cfg.get(field):
+            secret = field in ("password", "api_key")
+            current = f"\n\nТекущее значение: `{cfg[field][:20]}...`" if secret else f"\n\nТекущее значение: `{cfg[field]}`"
+        await callback.message.answer(
+            f"{_single_field_prompt(field)}{current}\n\n"
+            "или `/skip` — оставить текущее значение:",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        await state.set_state(SetupSingleField.value)
+        return
+
+    if action == "cancel":
+        await state.clear()
+        await callback.message.answer("🚫 Отменено. Значение не изменено.", parse_mode=ParseMode.MARKDOWN)
+        if section in SETUP_SECTIONS:
+            await callback.message.answer(
+                _setup_section_text(user_id, section),
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=_setup_section_keyboard(user_id, section),
+            )
+        return
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -4672,20 +4760,6 @@ async def setup_param_callback(callback: CallbackQuery, state: FSMContext):
 
     await state.update_data(section=section, field=field)
 
-    labels = {
-        "email": "📧 **Email** — введите новый адрес электронной почты:",
-        "server": "🔌 **IMAP-сервер** — введите адрес IMAP-сервера (например, `imap.yandex.ru`):",
-        "login": "👤 **Логин** — введите логин для IMAP (обычно совпадает с email):",
-        "password": "🔑 **Пароль** — введите пароль приложения для IMAP:",
-        "host": "🖥️ **Хост** — введите адрес PostgreSQL-сервера:",
-        "port": "🔢 **Порт** — введите порт PostgreSQL (например, 5432):",
-        "name": "🗄️ **Имя БД** — введите имя базы данных:",
-        "user": "👤 **Пользователь** — введите имя пользователя PostgreSQL:",
-        "endpoint": "🔗 **Endpoint** — введите URL OpenAI-совместимого API:",
-        "api_key": "🔑 **API Key** — введите ключ API:",
-        "model": "📝 **Модель** — введите название модели:",
-    }
-
     cfg, _, _ = _section_config(user_id, section)
     current = ""
     if cfg.get(field):
@@ -4693,7 +4767,7 @@ async def setup_param_callback(callback: CallbackQuery, state: FSMContext):
         current = f"\n\nТекущее значение: `{cfg[field][:20]}...`" if secret else f"\n\nТекущее значение: `{cfg[field]}`"
 
     await callback.message.answer(
-        f"{labels.get(field, escape_md_simple(field))}{current}\n\n"
+        f"{_single_field_prompt(field)}{current}\n\n"
         "или `/skip` — оставить текущее значение:",
         parse_mode=ParseMode.MARKDOWN,
     )
@@ -4769,6 +4843,7 @@ async def setup_test_callback(callback: CallbackQuery):
                 f"❌ **Ошибка подключения:**\n\n{escape_md_simple(details)}\n\n"
                 "Исправьте параметры или нажмите «▶️ Полная настройка».",
                 parse_mode=ParseMode.MARKDOWN,
+                reply_markup=_setup_test_keyboard(section),
             )
             return
         users = _load_users()
@@ -4781,6 +4856,7 @@ async def setup_test_callback(callback: CallbackQuery):
             f"✅ **Почта проверена!**\n\n{escape_md_simple(report)}\n\n"
             "Статус обновлён: 🟢 все параметры проверены.",
             parse_mode=ParseMode.MARKDOWN,
+            reply_markup=_setup_test_keyboard(section),
         )
         return
 
@@ -4806,9 +4882,14 @@ async def setup_test_callback(callback: CallbackQuery):
                 f"✅ **PostgreSQL проверен!**\n\n📊 Версия: `{ver}`\n\n"
                 "Статус обновлён: 🟢 все параметры проверены.",
                 parse_mode=ParseMode.MARKDOWN,
+                reply_markup=_setup_test_keyboard(section),
             )
         except Exception as e:
-            await callback.message.answer(f"❌ **Ошибка:** {escape_md_simple(e)}", parse_mode=ParseMode.MARKDOWN)
+            await callback.message.answer(
+                f"❌ **Ошибка:** {escape_md_simple(e)}",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=_setup_test_keyboard(section),
+            )
         return
 
     if section == "ai":
@@ -4834,6 +4915,7 @@ async def setup_test_callback(callback: CallbackQuery):
         await status.edit_text(
             f"🧪 **Результат теста AI**\n\n🔗 Endpoint: `{endpoint}`\n📝 Модель: `{model}`\n\n{escape_md_simple(result)}",
             parse_mode=ParseMode.MARKDOWN,
+            reply_markup=_setup_test_keyboard(section),
         )
         return
 
