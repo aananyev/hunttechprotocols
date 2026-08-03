@@ -30,6 +30,7 @@ import xml.etree.ElementTree as ET
 # ── Access control (из hunttech-bot-common) ───────────────
 from hunttech_bot_common.users import AccessManager
 from hunttech_bot_common.users.ptb import get_bot_access_path
+from hunttech_bot_common.telegram import escape_md_simple
 from hunttech_bot_common.email import (
     test_email_connections, format_email_config,
     validate_email, validate_hostname, validate_password,
@@ -1174,7 +1175,7 @@ def _format_prompt_list() -> str:
         lines.append("_Промптов пока нет._")
     else:
         for idx, topic in enumerate(sorted(prompts.keys()), 1):
-            lines.append(f"{idx}. {topic}")
+            lines.append(f"{idx}. {escape_md_simple(topic)}")
     lines.append("")
     lines.append("── Управление ──")
     lines.append("/add_prompt    — добавить новый промпт")
@@ -1242,7 +1243,7 @@ async def prompt_buttons_callback(callback: CallbackQuery, state: FSMContext):
                 reply_markup=_first_prompt_keyboard(),
             )
             return
-        topics = "\n".join(f"• {t}" for t in sorted(prompts.keys()))
+        topics = "\n".join(f"• {escape_md_simple(t)}" for t in sorted(prompts.keys()))
         await message.answer(
             f"📝 **Редактирование промпта**\n\n"
             f"Доступные промпты:\n{topics}\n\n"
@@ -1260,7 +1261,7 @@ async def prompt_buttons_callback(callback: CallbackQuery, state: FSMContext):
                 reply_markup=_first_prompt_keyboard(),
             )
             return
-        topics = "\n".join(f"• {t}" for t in sorted(prompts.keys()))
+        topics = "\n".join(f"• {escape_md_simple(t)}" for t in sorted(prompts.keys()))
         await message.answer(
             f"📜 **Доступные промпты:**\n{topics}\n\n"
             "Введите **тему** или **номер** промпта:",
@@ -1277,7 +1278,7 @@ async def prompt_buttons_callback(callback: CallbackQuery, state: FSMContext):
                 reply_markup=_first_prompt_keyboard(),
             )
             return
-        topics = "\n".join(f"• {t}" for t in sorted(prompts.keys()))
+        topics = "\n".join(f"• {escape_md_simple(t)}" for t in sorted(prompts.keys()))
         await message.answer(
             f"🗑 **Удаление промпта**\n\n"
             f"Доступные промпты:\n{topics}\n\n"
@@ -1310,7 +1311,8 @@ async def first_prompt_callback(callback: CallbackQuery, state: FSMContext):
         await message.answer("📝 Введите **тему** нового промпта:", parse_mode=ParseMode.MARKDOWN)
         await state.set_state(AddPromptState.topic)
     else:
-        await message.answer("❌ Хорошо. Если захотите — напишите `/add_prompt`")
+        await message.answer("❌ Хорошо. Если захотите — напишите `/add_prompt`",
+                             parse_mode=ParseMode.MARKDOWN)
         await state.clear()
 
 
@@ -1881,7 +1883,7 @@ async def choose_prompt_callback(callback: CallbackQuery, state: FSMContext):
 
     _dt, display, _txt = items[idx]
     await callback.message.answer(
-        f"📝 Для конспекта «{display}» не найден подходящий промпт.\n\n"
+        f"📝 Для конспекта «{escape_md_simple(display)}» не найден подходящий промпт.\n\n"
         f"Создайте промпт с названием, которое совпадает с началом строки:\n"
         f"📌 `/add_prompt` → тема: `{display.split()[0] if display.split() else display}` → текст промпта\n\n"
         f"Или используйте `/prompt` для управления промптами.",
@@ -2113,7 +2115,7 @@ async def cmd_list_prompts(message: Message, state: FSMContext, command: Command
                     prompts = _load_prompts()
                     if topic in prompts:
                         await message.answer(
-                            f"Prompt with topic \"{topic}\" already exists! "
+                            f"Prompt with topic \"{escape_md_simple(topic)}\" already exists! "
                             f"Current text:\n`{prompts[topic][:200]}`\n\n"
                             "Enter a **different** topic:",
                             parse_mode=ParseMode.MARKDOWN,
@@ -2122,7 +2124,7 @@ async def cmd_list_prompts(message: Message, state: FSMContext, command: Command
                         return
                     await state.update_data(topic=topic)
                     await message.answer(
-                        f"Topic \"{topic}\" accepted.\n\n"
+                        f"Topic \"{escape_md_simple(topic)}\" accepted.\n\n"
                         "Now enter the **text** of the prompt:\n"
                         "_(or attach a file: txt, docx, pdf, rtf, doc, pages)_",
                         parse_mode=ParseMode.MARKDOWN,
@@ -2148,7 +2150,7 @@ async def cmd_list_prompts(message: Message, state: FSMContext, command: Command
                 await state.set_state(AskAddFirstPrompt.waiting)
                 return
             sorted_topics = sorted(prompts.keys())
-            topics = "\n".join(f"• {t}" for t in sorted_topics)
+            topics = "\n".join(f"• {escape_md_simple(t)}" for t in sorted_topics)
             await message.answer(
                 f"📝 **Редактирование промпта**\n\n"
                 f"Доступные промпты:\n{topics}\n\n"
@@ -2168,7 +2170,7 @@ async def cmd_list_prompts(message: Message, state: FSMContext, command: Command
                 await state.set_state(AskAddFirstPrompt.waiting)
                 return
             sorted_topics = sorted(prompts.keys())
-            topics = "\n".join(f"• {t}" for t in sorted_topics)
+            topics = "\n".join(f"• {escape_md_simple(t)}" for t in sorted_topics)
             await message.answer(
                 f"📜 **Доступные промпты:**\n{topics}\n\n"
                 "Введите **тему** или **номер** промпта:",
@@ -2187,7 +2189,7 @@ async def cmd_list_prompts(message: Message, state: FSMContext, command: Command
                 await state.set_state(AskAddFirstPrompt.waiting)
                 return
             sorted_topics = sorted(prompts.keys())
-            topics = "\n".join(f"• {t}" for t in sorted_topics)
+            topics = "\n".join(f"• {escape_md_simple(t)}" for t in sorted_topics)
             await message.answer(
                 f"🗑 **Удаление промпта**\n\n"
                 f"Доступные промпты:\n{topics}\n\n"
@@ -2224,7 +2226,8 @@ async def ask_add_first_prompt(message: Message, state: FSMContext):
             parse_mode=ParseMode.MARKDOWN,
         )
     else:
-        await message.answer("❌ Хорошо. Если захотите — напишите `/add_prompt`")
+        await message.answer("❌ Хорошо. Если захотите — напишите `/add_prompt`",
+                             parse_mode=ParseMode.MARKDOWN)
         await state.clear()
 
 
@@ -2256,7 +2259,7 @@ async def add_prompt_topic(message: Message, state: FSMContext):
                 prompts = _load_prompts()
                 if topic in prompts:
                     await message.answer(
-                        f"⚠️ Промпт с темой «{topic}» уже существует!\n"
+                        f"⚠️ Промпт с темой «{escape_md_simple(topic)}» уже существует!\n"
                         f"Текущий текст:\n`{prompts[topic][:200]}`\n\n"
                         "Введите **другую** тему или пришлите другой файл:",
                         parse_mode=ParseMode.MARKDOWN,
@@ -2264,7 +2267,7 @@ async def add_prompt_topic(message: Message, state: FSMContext):
                     return
                 await state.update_data(topic=topic, file_text=file_text)
                 await message.answer(
-                    f"✅ Из файла определена тема: **«{topic}»**\\n\\n"
+                    f"✅ Из файла определена тема: **«{escape_md_simple(topic)}»**\\n\\n"
                     "Теперь введите **текст** промпта или пришлите другой файл:\n"
                     "_(если оставить пустым — будет использован текст из файла)_",
                     parse_mode=ParseMode.MARKDOWN,
@@ -2276,7 +2279,7 @@ async def add_prompt_topic(message: Message, state: FSMContext):
                 preview = file_text[:100].replace("\n", " ")
                 await state.update_data(file_text=file_text)
                 await message.answer(
-                    f"📄 Текст из файла (первые 100 символов):\n`{preview}...`\n\n"
+                    f"📄 Текст из файла (первые 100 символов):\n`{escape_md_simple(preview)}...`\n\n"
                     "Не удалось автоматически определить тему.\n"
                     "Введите **тему** этого промпта вручную:",
                     parse_mode=ParseMode.MARKDOWN,
@@ -2295,7 +2298,7 @@ async def add_prompt_topic(message: Message, state: FSMContext):
     prompts = _load_prompts()
     if topic in prompts:
         await message.answer(
-            f"⚠️ Промпт с темой «{topic}» уже существует!\n"
+            f"⚠️ Промпт с темой «{escape_md_simple(topic)}» уже существует!\n"
             f"Текущий текст:\n`{prompts[topic][:200]}`\n\n"
             "Введите **другую** тему:",
             parse_mode=ParseMode.MARKDOWN,
@@ -2304,7 +2307,7 @@ async def add_prompt_topic(message: Message, state: FSMContext):
 
     await state.update_data(topic=topic)
     await message.answer(
-        f"✅ Тема «{topic}» принята.\n\n"
+        f"✅ Тема «{escape_md_simple(topic)}» принята.\n\n"
         "Теперь введите **текст** промпта:\n"
         "_(или пришлите файл: txt, docx, pdf, rtf, doc, pages)_",
         parse_mode=ParseMode.MARKDOWN,
@@ -2344,7 +2347,7 @@ async def add_prompt_text(message: Message, state: FSMContext):
     _save_prompts(prompts)
 
     await message.answer(
-        f"🧠 **Промпт «{topic}» добавлен в память.**\n\n"
+        f"🧠 **Промпт «{escape_md_simple(topic)}» добавлен в память.**\n\n"
         f"📄 Длина: {len(text)} символов",
         parse_mode=ParseMode.MARKDOWN,
     )
@@ -2373,7 +2376,7 @@ async def add_prompt_topic_from_file(message: Message, state: FSMContext):
     prompts = _load_prompts()
     if topic in prompts:
         await message.answer(
-            f"⚠️ Промпт с темой «{topic}» уже существует!\n"
+            f"⚠️ Промпт с темой «{escape_md_simple(topic)}» уже существует!\n"
             f"Текущий текст:\n`{prompts[topic][:200]}`\n\n"
             "Введите **другую** тему:",
             parse_mode=ParseMode.MARKDOWN,
@@ -2386,7 +2389,7 @@ async def add_prompt_topic_from_file(message: Message, state: FSMContext):
         prompts[topic] = file_text
         _save_prompts(prompts)
         await message.answer(
-            f"🧠 **Промпт «{topic}» добавлен в память.**\n\n"
+            f"🧠 **Промпт «{escape_md_simple(topic)}» добавлен в память.**\n\n"
             f"📄 Длина: {len(file_text)} символов (из файла)",
             parse_mode=ParseMode.MARKDOWN,
         )
@@ -2395,7 +2398,7 @@ async def add_prompt_topic_from_file(message: Message, state: FSMContext):
         await message.answer(list_text, parse_mode=ParseMode.MARKDOWN, reply_markup=_prompt_keyboard())
     else:
         await message.answer(
-            f"✅ Тема «{topic}» принята.\n\n"
+            f"✅ Тема «{escape_md_simple(topic)}» принята.\n\n"
             "Теперь введите **текст** промпта или пришлите файл:",
             parse_mode=ParseMode.MARKDOWN,
         )
@@ -2434,12 +2437,12 @@ async def cmd_text_prompt_start(message: Message, state: FSMContext):
             if 0 <= idx < len(sorted_topics):
                 topic = sorted_topics[idx]
                 text = prompts[topic]
-                full = f"📌 **{topic}**\n\n{text}"
+                full = f"📌 **{escape_md_simple(topic)}**\n\n{escape_md_simple(text)}"
                 if len(full) <= MAX_MSG_LEN:
                     await message.answer(full, parse_mode=ParseMode.MARKDOWN)
                 else:
                     await message.answer(
-                        f"📌 **{topic}**\n\n{text[:MAX_MSG_LEN - 50]}\n\n"
+                        f"📌 **{escape_md_simple(topic)}**\n\n{escape_md_simple(text[:MAX_MSG_LEN - 50])}\n\n"
                         f"_…текст слишком длинный, сохранён в боте_",
                         parse_mode=ParseMode.MARKDOWN,
                     )
@@ -2453,19 +2456,19 @@ async def cmd_text_prompt_start(message: Message, state: FSMContext):
             # Аргумент — не число, возможно это тема промпта
             if arg in prompts:
                 text = prompts[arg]
-                full = f"📌 **{arg}**\n\n{text}"
+                full = f"📌 **{escape_md_simple(arg)}**\n\n{escape_md_simple(text)}"
                 if len(full) <= MAX_MSG_LEN:
                     await message.answer(full, parse_mode=ParseMode.MARKDOWN)
                 else:
                     await message.answer(
-                        f"📌 **{arg}**\n\n{text[:MAX_MSG_LEN - 50]}\n\n"
+                        f"📌 **{escape_md_simple(arg)}**\n\n{escape_md_simple(text[:MAX_MSG_LEN - 50])}\n\n"
                         f"_…текст слишком длинный, сохранён в боте_",
                         parse_mode=ParseMode.MARKDOWN,
                     )
                 return
 
     # Без аргументов — запускаем FSM диалог выбора
-    topics = "\n".join(f"• {t}" for t in sorted_topics)
+    topics = "\n".join(f"• {escape_md_simple(t)}" for t in sorted_topics)
     await message.answer(
         f"📜 **Доступные промпты:**\n{topics}\n\n"
         "Введите **тему** или **номер** промпта:",
@@ -2504,7 +2507,7 @@ async def text_prompt_show(message: Message, state: FSMContext):
 
     if topic is None:
         # Ничего не нашли — показываем список и просим повторить
-        topics = "\n".join(f"• {t}" for t in sorted_topics)
+        topics = "\n".join(f"• {escape_md_simple(t)}" for t in sorted_topics)
         await message.answer(
             f"⚠️ Не найдено. Доступные промпты:\n{topics}\n\n"
             "Введите **тему** или **номер**:",
@@ -2513,12 +2516,12 @@ async def text_prompt_show(message: Message, state: FSMContext):
         return
 
     text = prompts[topic]
-    full = f"📌 **{topic}**\n\n{text}"
+    full = f"📌 **{escape_md_simple(topic)}**\n\n{escape_md_simple(text)}"
     if len(full) <= MAX_MSG_LEN:
         await message.answer(full, parse_mode=ParseMode.MARKDOWN)
     else:
         await message.answer(
-            f"📌 **{topic}**\n\n{text[:MAX_MSG_LEN - 50]}\n\n"
+            f"📌 **{escape_md_simple(topic)}**\n\n{escape_md_simple(text[:MAX_MSG_LEN - 50])}\n\n"
             f"_…текст слишком длинный, сохранён в боте_",
             parse_mode=ParseMode.MARKDOWN,
         )
@@ -2560,7 +2563,7 @@ async def cmd_delete_prompt_start(message: Message, state: FSMContext):
                 del prompts[topic]
                 _save_prompts(prompts)
                 await message.answer(
-                    f"🗑 **Промпт «{topic}» удалён.**",
+                    f"🗑 **Промпт «{escape_md_simple(topic)}» удалён.**",
                     parse_mode=ParseMode.MARKDOWN,
                     reply_markup=_prompt_keyboard(),
                 )
@@ -2576,14 +2579,14 @@ async def cmd_delete_prompt_start(message: Message, state: FSMContext):
                 del prompts[arg]
                 _save_prompts(prompts)
                 await message.answer(
-                    f"🗑 **Промпт «{arg}» удалён.**",
+                    f"🗑 **Промпт «{escape_md_simple(arg)}» удалён.**",
                     parse_mode=ParseMode.MARKDOWN,
                     reply_markup=_prompt_keyboard(),
                 )
                 return
 
     # Без аргументов — FSM диалог
-    topics = "\n".join(f"• {t}" for t in sorted_topics)
+    topics = "\n".join(f"• {escape_md_simple(t)}" for t in sorted_topics)
     await message.answer(
         f"🗑 **Удаление промпта**\n\n"
         f"Доступные промпты:\n{topics}\n\n"
@@ -2619,7 +2622,7 @@ async def delete_prompt_confirm(message: Message, state: FSMContext):
         topic = arg
 
     if topic is None:
-        topics = "\n".join(f"• {t}" for t in sorted_topics)
+        topics = "\n".join(f"• {escape_md_simple(t)}" for t in sorted_topics)
         await message.answer(
             f"⚠️ Не найдено. Доступные промпты:\n{topics}\n\n"
             "Введите **тему** или **номер**:",
@@ -2631,7 +2634,7 @@ async def delete_prompt_confirm(message: Message, state: FSMContext):
     _save_prompts(prompts)
 
     await message.answer(
-        f"🗑 **Промпт «{topic}» удалён.**",
+        f"🗑 **Промпт «{escape_md_simple(topic)}» удалён.**",
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=_prompt_keyboard(),
     )
@@ -2675,7 +2678,7 @@ async def cmd_edit_prompt_start(message: Message, state: FSMContext):
                 topic = sorted_topics[idx]
                 await state.update_data(topic=topic)
                 await message.answer(
-                    f"📝 Редактирование промпта **«{topic}»**\n\n"
+                    f"📝 Редактирование промпта **«{escape_md_simple(topic)}»**\n\n"
                     f"Текущий текст:\n`{prompts[topic][:200]}`\n\n"
                     "Введите **новый текст** промпта:",
                     parse_mode=ParseMode.MARKDOWN,
@@ -2691,7 +2694,7 @@ async def cmd_edit_prompt_start(message: Message, state: FSMContext):
             if arg in prompts:
                 await state.update_data(topic=arg)
                 await message.answer(
-                    f"📝 Редактирование промпта **«{arg}»**\n\n"
+                    f"📝 Редактирование промпта **«{escape_md_simple(arg)}»**\n\n"
                     f"Текущий текст:\n`{prompts[arg][:200]}`\n\n"
                     "Введите **новый текст** промпта:",
                     parse_mode=ParseMode.MARKDOWN,
@@ -2700,7 +2703,7 @@ async def cmd_edit_prompt_start(message: Message, state: FSMContext):
                 return
 
     # Без аргументов — спрашиваем тему
-    topics = "\n".join(f"• {t}" for t in sorted_topics)
+    topics = "\n".join(f"• {escape_md_simple(t)}" for t in sorted_topics)
     await message.answer(
         f"📝 **Редактирование промпта**\n\n"
         f"Доступные промпты:\n{topics}\n\n"
@@ -2736,7 +2739,7 @@ async def edit_prompt_topic(message: Message, state: FSMContext):
         topic = arg
 
     if topic is None:
-        topics = "\n".join(f"• {t}" for t in sorted_topics)
+        topics = "\n".join(f"• {escape_md_simple(t)}" for t in sorted_topics)
         await message.answer(
             f"⚠️ Не найдено. Доступные промпты:\n{topics}\n\n"
             "Введите **тему** или **номер**:",
@@ -2746,7 +2749,7 @@ async def edit_prompt_topic(message: Message, state: FSMContext):
 
     await state.update_data(topic=topic)
     await message.answer(
-        f"📝 Редактирование промпта **«{topic}»**\n\n"
+        f"📝 Редактирование промпта **«{escape_md_simple(topic)}»**\n\n"
         f"Текущий текст:\n`{prompts[topic][:200]}`\n\n"
         "Введите **новый текст** промпта:",
         parse_mode=ParseMode.MARKDOWN,
@@ -3246,9 +3249,9 @@ async def cmd_start(message: Message, state: FSMContext):
                         chat_id=_master_admin_id,
                         text=(
                             f"🔔 Новый запрос доступа к боту *HuntTech Protocols*\n\n"
-                            f"Пользователь: {display_name}\n"
+                            f"Пользователь: {escape_md_simple(display_name)}\n"
                             f"ID: `{user_id}`\n"
-                            f"Username: @{user.username or '-'}\n\n"
+                            f"Username: @{escape_md_simple(user.username or '-')}\n\n"
                             f"Разрешить: /user add {user_id}"
                         ),
                         parse_mode=ParseMode.MARKDOWN,
@@ -3317,9 +3320,9 @@ async def cmd_request_access(message: Message):
                 chat_id=_master_admin_id,
                 text=(
                     f"🔔 Новый запрос доступа к боту *HuntTech Protocols*\n\n"
-                    f"Пользователь: {display_name}\n"
+                    f"Пользователь: {escape_md_simple(display_name)}\n"
                     f"ID: `{user_id}`\n"
-                    f"Username: @{user.username or '-'}\n\n"
+                    f"Username: @{escape_md_simple(user.username or '-')}\n\n"
                     f"Разрешить: /user add {user_id}"
                 ),
                 parse_mode=ParseMode.MARKDOWN,
@@ -3865,7 +3868,7 @@ async def _cmd_setup_ai_test(message: Message):
         f"🧪 **Результат теста AI**\n\n"
         f"🔗 Endpoint: `{endpoint}`\n"
         f"📝 Модель: `{model}`\n\n"
-        f"{result}",
+        f"{escape_md_simple(result)}",
         parse_mode=ParseMode.MARKDOWN,
     )
 
@@ -4007,7 +4010,7 @@ async def cmd_setup_start(message: Message, state: FSMContext, command: CommandO
                 _save_users(users)
             mode_labels = {"auto": "🚀 Авто (сразу в Wiki)", "button": "📤 По кнопке", "off": "⏸️ Выключено"}
             await message.answer(
-                f"✅ **Режим публикации в Wiki:** {mode_labels.get(mode, mode)}\n\n"
+                f"✅ **Режим публикации в Wiki:** {escape_md_simple(mode_labels.get(mode, mode))}\n\n"
                 f"Текущий режим: `/setup show wiki`",
                 parse_mode=ParseMode.MARKDOWN,
             )
@@ -4052,7 +4055,7 @@ async def cmd_setup_start(message: Message, state: FSMContext, command: CommandO
                     parse_mode=ParseMode.MARKDOWN,
                 )
             except Exception as e:
-                await message.answer(f"❌ **Ошибка:** {e}", parse_mode=ParseMode.MARKDOWN)
+                await message.answer(f"❌ **Ошибка:** {escape_md_simple(e)}", parse_mode=ParseMode.MARKDOWN)
             return
 
         if arg == "email test":
@@ -4152,7 +4155,7 @@ async def cmd_setup_start(message: Message, state: FSMContext, command: CommandO
                     lines.append(f"👤 **Генерировали саммари:** {len(users_who_generated)} пользователей")
                 await message.answer("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
             except Exception as e:
-                await message.answer(f"❌ **Ошибка:** {e}", parse_mode=ParseMode.MARKDOWN)
+                await message.answer(f"❌ **Ошибка:** {escape_md_simple(e)}", parse_mode=ParseMode.MARKDOWN)
             return
 
         if arg == "email":
@@ -4181,7 +4184,7 @@ async def cmd_setup_start(message: Message, state: FSMContext, command: CommandO
             if config and config.get(field):
                 current = f"\n\nТекущее значение: `{config[field][:20]}...`" if field == "password" else f"\n\nТекущее значение: `{config[field]}`"
             await message.answer(
-                f"{labels.get(field, '')}{current}\n\n"
+                f"{escape_md_simple(labels.get(field, ''))}{current}\n\n"
                 "или `/skip` — оставить текущее значение:",
                 parse_mode=ParseMode.MARKDOWN,
             )
@@ -4221,7 +4224,7 @@ async def setup_email(message: Message, state: FSMContext):
         err = validate_email(text)
         if err:
             await message.answer(
-                f"⚠️ **{err}**\n\n"
+                f"⚠️ **{escape_md_simple(err)}**\n\n"
                 "Пример правильного адреса: `ivan@example.ru`\n"
                 "Email должен содержать `@` и домен (например, `.ru`, `.com`).\n\n"
                 "Введите email ещё раз (или `/skip` — оставить текущий):",
@@ -4234,7 +4237,7 @@ async def setup_email(message: Message, state: FSMContext):
     current = config.get("server") or "не задан"
     await message.answer(
         f"✅ Email: `{email_val}`\n\n"
-        f"**IMAP-сервер** ({current}):\n"
+        f"**IMAP-сервер** ({escape_md_simple(current)}):\n"
         "Введите адрес IMAP-сервера\n"
         "(например: `imap.yandex.ru`, `imap.mail.ru`)\n"
         "или `/skip` — оставить текущий:",
@@ -4268,7 +4271,7 @@ async def setup_server(message: Message, state: FSMContext):
         err = validate_hostname(text)
         if err:
             await message.answer(
-                f"⚠️ **{err}**\n\n"
+                f"⚠️ **{escape_md_simple(err)}**\n\n"
                 "Пример правильного адреса: `imap.yandex.ru`\n"
                 "Имя сервера должно содержать домен.\n\n"
                 "Введите адрес IMAP-сервера ещё раз (или `/skip` — оставить текущий):",
@@ -4281,7 +4284,7 @@ async def setup_server(message: Message, state: FSMContext):
     current = config.get("login") or "не задан"
     await message.answer(
         f"✅ IMAP-сервер: `{server}`\n\n"
-        f"**Логин** ({current}):\n"
+        f"**Логин** ({escape_md_simple(current)}):\n"
         "Введите логин для подключения к IMAP\n"
         "(обычно это полный email-адрес)\n"
         "или `/skip` — оставить текущий:",
@@ -4317,7 +4320,7 @@ async def setup_login(message: Message, state: FSMContext):
     current = "••••••••" if config.get("password") else "не задан"
     await message.answer(
         f"✅ Логин: `{login}`\n\n"
-        f"**Пароль** ({current}):\n"
+        f"**Пароль** ({escape_md_simple(current)}):\n"
         "Введите пароль приложения для IMAP\n"
         "(для Яндекса — создайте пароль приложения в настройках почты)\n"
         "или `/skip` — оставить текущий:",
@@ -4379,7 +4382,7 @@ async def setup_password(message: Message, state: FSMContext):
     if has_error and not any("нет данных" in r.message for r in results):
         details = "\n".join(r.short for r in results)
         await status.edit_text(
-            f"❌ **Ошибка подключения:**\n\n{details}\n\n"
+            f"❌ **Ошибка подключения:**\n\n{escape_md_simple(details)}\n\n"
             "Попробуйте ещё раз:\n"
             "• Убедитесь, что IMAP включён в настройках почты\n"
             "• Проверьте логин и пароль\n\n"
@@ -4401,8 +4404,8 @@ async def setup_password(message: Message, state: FSMContext):
     report = "\n".join(r.short for r in results)
     await status.edit_text(
         f"✅ **Настройка завершена!**\n\n"
-        f"{format_email_config(cfg)}\n\n"
-        f"{report}",
+        f"{escape_md_simple(format_email_config(cfg))}\n\n"
+        f"{escape_md_simple(report)}",
         parse_mode=ParseMode.MARKDOWN,
     )
 
@@ -4497,7 +4500,7 @@ async def setup_single_field(message: Message, state: FSMContext):
     masked = f"`{value[:20]}...`" if field in ("password", "api_key") else f"`{value}`"
     skip_note = " (оставлено прежнее значение)" if skipped else ""
     await message.answer(
-        f"✅ **{label_map.get(field, field)}** сохранён{skip_note}: {masked}\n\n"
+        f"✅ **{escape_md_simple(label_map.get(field, field))}** сохранён{skip_note}: {masked}\n\n"
         "Проверьте настройки: `/setup show all`",
         parse_mode=ParseMode.MARKDOWN,
     )
@@ -4560,7 +4563,7 @@ async def setup_param_callback(callback: CallbackQuery, state: FSMContext):
         current = f"\n\nТекущее значение: `{cfg[field][:20]}...`" if secret else f"\n\nТекущее значение: `{cfg[field]}`"
 
     await callback.message.answer(
-        f"{labels.get(field, field)}{current}\n\n"
+        f"{escape_md_simple(labels.get(field, field))}{current}\n\n"
         "или `/skip` — оставить текущее значение:",
         parse_mode=ParseMode.MARKDOWN,
     )
@@ -4579,7 +4582,7 @@ async def setup_full_callback(callback: CallbackQuery, state: FSMContext):
         current = config["email"] if config else "не задан"
         await callback.message.answer(
             "📧 **Настройка подключения к почте**\n\n"
-            f"**Email** ({current}):\n"
+            f"**Email** ({escape_md_simple(current)}):\n"
             "Введите адрес электронной почты:",
             parse_mode=ParseMode.MARKDOWN,
         )
@@ -4633,7 +4636,7 @@ async def setup_test_callback(callback: CallbackQuery):
         if has_error and not any("нет данных" in r.message for r in results):
             details = "\n".join(r.short for r in results)
             await status.edit_text(
-                f"❌ **Ошибка подключения:**\n\n{details}\n\n"
+                f"❌ **Ошибка подключения:**\n\n{escape_md_simple(details)}\n\n"
                 "Исправьте параметры или нажмите «▶️ Полная настройка».",
                 parse_mode=ParseMode.MARKDOWN,
             )
@@ -4645,7 +4648,7 @@ async def setup_test_callback(callback: CallbackQuery):
             _save_users(users)
         report = "\n".join(r.short for r in results)
         await status.edit_text(
-            f"✅ **Почта проверена!**\n\n{report}\n\n"
+            f"✅ **Почта проверена!**\n\n{escape_md_simple(report)}\n\n"
             "Статус обновлён: 🟢 все параметры проверены.",
             parse_mode=ParseMode.MARKDOWN,
         )
@@ -4675,7 +4678,7 @@ async def setup_test_callback(callback: CallbackQuery):
                 parse_mode=ParseMode.MARKDOWN,
             )
         except Exception as e:
-            await callback.message.answer(f"❌ **Ошибка:** {e}", parse_mode=ParseMode.MARKDOWN)
+            await callback.message.answer(f"❌ **Ошибка:** {escape_md_simple(e)}", parse_mode=ParseMode.MARKDOWN)
         return
 
     if section == "ai":
@@ -4699,7 +4702,7 @@ async def setup_test_callback(callback: CallbackQuery):
                 users[key]["ai"]["checked"] = True
                 _save_users(users)
         await status.edit_text(
-            f"🧪 **Результат теста AI**\n\n🔗 Endpoint: `{endpoint}`\n📝 Модель: `{model}`\n\n{result}",
+            f"🧪 **Результат теста AI**\n\n🔗 Endpoint: `{endpoint}`\n📝 Модель: `{model}`\n\n{escape_md_simple(result)}",
             parse_mode=ParseMode.MARKDOWN,
         )
         return
@@ -4896,7 +4899,8 @@ async def ai_after_setup_callback(callback: CallbackQuery, state: FSMContext):
         )
         await state.set_state(AiSetupState.provider)
     else:
-        await callback.message.answer("🚫 Хорошо. Если захотите — `/setup_ai`")
+        await callback.message.answer("🚫 Хорошо. Если захотите — `/setup_ai`",
+                                      parse_mode=ParseMode.MARKDOWN)
 
 @dp.message(Command("setup_ai", "setup_llm"))
 async def cmd_setup_ai(message: Message, state: FSMContext):
@@ -5078,7 +5082,8 @@ async def ai_setup_model(message: Message, state: FSMContext):
     endpoint = data.get("ai_endpoint", "")
 
     if not endpoint:
-        await message.answer("❌ Ошибка: не указан endpoint. Начните заново: `/setup_ai`")
+        await message.answer("❌ Ошибка: не указан endpoint. Начните заново: `/setup_ai`",
+                             parse_mode=ParseMode.MARKDOWN)
         await state.clear()
         return
 
@@ -5105,7 +5110,7 @@ async def ai_setup_model(message: Message, state: FSMContext):
             f"🧩 Провайдер: `{provider_label}`\n"
             f"🔗 Endpoint: `{endpoint}`\n"
             f"📝 Модель: `{model}`\n\n"
-            f"**{test_result}**\n\n"
+            f"**{escape_md_simple(test_result)}**\n\n"
             "Теперь кнопка «Саммари» будет работать!",
             parse_mode=ParseMode.MARKDOWN,
         )
@@ -5115,7 +5120,7 @@ async def ai_setup_model(message: Message, state: FSMContext):
             f"🧩 Провайдер: `{provider_label}`\n"
             f"🔗 Endpoint: `{endpoint}`\n"
             f"📝 Модель: `{model}`\n\n"
-            f"{test_result}\n\n"
+            f"{escape_md_simple(test_result)}\n\n"
             "Проверьте ключ и модель. Введите `/setup ai` для перенастройки "
             "или `/setup show ai` для просмотра текущих настроек.",
             parse_mode=ParseMode.MARKDOWN,
@@ -5250,7 +5255,7 @@ async def setup_wiki_authorized_key(message: Message, state: FSMContext):
             )
         await status.edit_text(
             f"❌ **IAM-токен получен, но подключение к Вики не прошло.**\n\n"
-            f"{report}"
+            f"{escape_md_simple(report)}"
             f"{org_hint}",
             parse_mode=ParseMode.MARKDOWN,
         )
@@ -5259,7 +5264,7 @@ async def setup_wiki_authorized_key(message: Message, state: FSMContext):
     await state.clear()
     await status.edit_text(
         f"✅ **Яндекс Вики настроена!**\n\n"
-        f"{report}",
+        f"{escape_md_simple(report)}",
         parse_mode=ParseMode.MARKDOWN,
     )
 
@@ -5453,7 +5458,7 @@ async def setup_db_password(message: Message, state: FSMContext):
         await status_msg.edit_text(msg, parse_mode=ParseMode.MARKDOWN)
     else:
         await status_msg.edit_text(
-            f"{msg}\n\n"
+            f"{escape_md_simple(msg)}\n\n"
             "Проверьте параметры и введите `/setup db` заново.",
             parse_mode=ParseMode.MARKDOWN,
         )
