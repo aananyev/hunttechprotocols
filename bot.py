@@ -3429,10 +3429,31 @@ async def cmd_start(message: Message, state: FSMContext):
         )
         await _start_init(message, state)
         return
+
+    # Настроенный пользователь — приветственное сообщение
+    # (стандарт HuntTech: plain text, parse_mode=None, нижнее меню
+    # актуальной клавиатуры — Telegram кэширует ReplyKeyboard по чату)
+    ai_cfg = get_ai_config(user_id)
+    ai_model = (ai_cfg or {}).get("model") or "не настроен"
     await message.answer(
-        "👋 Привет! Я бот для конспектов встреч и промптов.\n\n"
-        "Напиши `/help` — покажу все команды.",
-        parse_mode=ParseMode.MARKDOWN,
+        "🚀 HuntTech Protocols Bot\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "👋 Добро пожаловать!\n"
+        "✅ Бот готов к работе!\n"
+        f"🤖 AI: {ai_model}\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "📋 Назначение: достаю из почты «Конспекты встреч», извлекаю "
+        "текстовые отчёты и генерирую саммари по шаблону через нейросеть.\n"
+        "\n"
+        "Как это работает:\n"
+        "1️⃣ /list — непрочитанные конспекты встреч\n"
+        "2️⃣ /prompt — список промптов для саммари\n"
+        "3️⃣ /setup — настройка почты и AI\n"
+        "4️⃣ /help — все команды\n"
+        "\n"
+        "Напиши /help — покажу все команды.",
+        parse_mode=None,
+        reply_markup=_main_menu_keyboard(),
     )
 
 
