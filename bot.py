@@ -30,8 +30,31 @@ import xml.etree.ElementTree as ET
 # ── Access control (из hunttech-bot-common) ───────────────
 from hunttech_bot_common.users import AccessManager
 from hunttech_bot_common.users.ptb import get_bot_access_path
+from hunttech_bot_common.email import (
+    test_email_connections, format_email_config,
+    validate_email, validate_hostname, validate_password,
+)
 
-import db  # Модуль PostgreSQL (включается при наличии DB_HOST в .env)
+try:
+    import db  # Модуль PostgreSQL (включается при наличии DB_HOST в .env)
+except ImportError:
+    import types
+    db = types.ModuleType('db')
+    db.DB_ENABLED = False
+    db.DB_POOL = None
+    db.ADMIN_USER_ID = 0
+    db.apply_config = lambda *a, **kw: (False, "db module not available")
+    db.init_db_pool = lambda *a, **kw: None
+    db.close_db_pool = lambda *a, **kw: None
+    db.ensure_tables = lambda *a, **kw: None
+    db.save_meeting = lambda *a, **kw: None
+    db.get_meeting_by_msg_id = lambda *a, **kw: None
+    db.save_summary = lambda *a, **kw: None
+    db.get_recent_meetings = lambda *a, **kw: []
+    db.get_summaries_for_meeting = lambda *a, **kw: []
+    db.get_stats = lambda *a, **kw: {}
+    logging.getLogger("bot").info("📦 Модуль PostgreSQL не подключён — работаю без БД")
+
 
 # ── Логирование ──────────────────────────────────────────────────
 # Логи нужны, чтобы отслеживать работу бота в фоне — кто и когда
@@ -45,7 +68,7 @@ logger = logging.getLogger("bot")
 
 from aiogram import Bot, Dispatcher
 from aiogram.filters import Command, CommandObject
-from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from aiogram.types import BotCommand, Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from aiogram.enums import ParseMode
 
 import os
@@ -1335,7 +1358,7 @@ AI_PROVIDERS = {
     "deepseek": {
         "label": "DeepSeek 🇨🇳",
         "endpoint": "https://api.deepseek.com/v1",
-        "hint_model": "deepseek-chat",
+        "hint_model": "deepseek-v4-flash",
     },
     "qwen": {
         "label": "Qwen (Alibaba) 🇨🇳",
@@ -1409,7 +1432,7 @@ AI_MODELS_PER_PROVIDER = {
         "google/gemini-2.0-flash-001",
         "meta-llama/llama-4-maverick", "qwen/qwen-max",
     ],
-    "deepseek": ["deepseek-chat", "deepseek-reasoner", "deepseek-v3"],
+    "deepseek": ["deepseek-v4-flash", "deepseek-chat", "deepseek-reasoner", "deepseek-v3"],
     "qwen": ["qwen-max", "qwen-plus", "qwen-turbo", "qwen2.5-72b-instruct"],
     "gemini": ["gemini-2.0-flash-001", "gemini-2.0-pro", "gemini-1.5-pro", "gemini-1.5-flash"],
     "zhipu": ["glm-4-flash", "glm-4-plus", "glm-4-air", "glm-4-0520"],
@@ -2749,6 +2772,24 @@ HELP_COMMANDS = {
         "syntax": "/help [раздел]", "aliases": ["/помощь", "/команды"],
         "admin": False, "public": True,
     },
+    "user": {
+        "emoji": "👥", "group": "setup", "title": "Управление пользователями",
+        "short": "Управление пользователями (только админ)",
+        "syntax": "/user [list|add <id>|remove <id>|ban <id>|unban <id>]",
+        "aliases": [], "admin": True, "public": False,
+        "details": "Только для администратора.\n"
+            "Подкоманды:\n"
+            "• `list` — список пользователей (AccessManager)\n"
+            "• `add <id>` — добавить пользователя по ID\n"
+            "• `remove <id>` — удалить пользователя\n"
+            "• `ban <id>` — заблокировать пользователя\n"
+            "• `unban <id>` — разблокировать пользователя",
+    },
+    "request_access": {
+        "emoji": "🔑", "group": "setup", "title": "Запросить доступ",
+        "short": "Запросить доступ к боту",
+        "syntax": "/request_access", "aliases": [], "admin": False, "public": True,
+    },
 }
 
 
@@ -3806,6 +3847,46 @@ async def cmd_setup_start(message: Message, state: FSMContext, command: CommandO
                 await message.answer(f"❌ **Ошибка:** {e}", parse_mode=ParseMode.MARKDOWN)
             return
 
+        if arg == "email test":
+            # Тест SMTP и IMAP
+            user_id = message.from_user.id
+            config = get_user_config(user_id)
+            if not config:
+                await message.answer("❌ **Почта не настроена.** Сначала выполните `/setup` или `/init`.",
+                                     parse_mode=ParseMode.MARKDOWN)
+                return
+            cfg = {
+                "sender": config.get("login") or config.get("email"),
+                "password": config.get("password"),
+                "smtp_host": config.get("server", "").replace("imap", "smtp") if "imap" in config.get("server", "") else "smtp.yandex.ru",
+                "smtp_port": 465,
+                "imap_host": config.get("server", "imap.yandex.ru"),
+                "imap_port": 993,
+            }
+            progress = await message.answer("🔄 Проверяю SMTP и IMAP...")
+            results = await test_email_connections(cfg, timeout=15)
+            await progress.edit_text(
+                "📧 **Результаты проверки:**\n\n" + "\n".join(r.short for r in results),
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return
+
+        if arg == "email show":
+            config = get_user_config(message.from_user.id)
+            if not config:
+                await message.answer("❌ **Почта не настроена.**", parse_mode=ParseMode.MARKDOWN)
+                return
+            cfg = {
+                "sender": config.get("login") or config.get("email", ""),
+                "password": config.get("password", ""),
+                "smtp_host": config.get("server", "").replace("imap", "smtp") if "imap" in config.get("server", "") else "smtp.yandex.ru",
+                "smtp_port": 465,
+                "imap_host": config.get("server", "imap.yandex.ru"),
+                "imap_port": 993,
+            }
+            await message.answer(format_email_config(cfg), parse_mode=ParseMode.MARKDOWN)
+            return
+
         if arg == "db stat":
             # Статистика данных в БД (только для администратора)
             user_id = message.from_user.id
@@ -3906,32 +3987,29 @@ async def cmd_setup_start(message: Message, state: FSMContext, command: CommandO
 async def setup_email(message: Message, state: FSMContext):
     """
     Шаг 1: Email.
-    Пользователь обязан ввести корректный email. Пустой ввод не допускается.
-    Проверяем формат: local-part@domain.tld
+    Проверка через библиотечную validate_email().
     """
-    import re
-    email = message.text.strip()
-    if not email:
+    email_val = message.text.strip()
+    if not email_val:
         await message.answer("⚠️ Email не может быть пустым. Введите адрес электронной почты:")
         return
 
-    # Проверка формата email: что-то@домен.что-то
-    email_pattern = re.compile(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$')
-    if not email_pattern.match(email):
+    err = validate_email(email_val)
+    if err:
         await message.answer(
-            "⚠️ Некорректный формат email.\n\n"
+            f"⚠️ **{err}**\n\n"
             "Пример правильного адреса: `ivan@example.ru`\n"
             "Email должен содержать `@` и домен (например, `.ru`, `.com`).\n\n"
             "Введите email ещё раз:",
             parse_mode=ParseMode.MARKDOWN,
         )
         return
-    await state.update_data(email=email)
+    await state.update_data(email=email_val)
 
     config = get_user_config(message.from_user.id)
     current = config["server"] if config else "не задан"
     await message.answer(
-        f"✅ Email: `{email}`\n\n"
+        f"✅ Email: `{email_val}`\n\n"
         f"**IMAP-сервер** ({current}):\n"
         "Введите адрес IMAP-сервера\n"
         "(например: `imap.yandex.ru`, `imap.mail.ru`):",
@@ -3944,30 +4022,19 @@ async def setup_email(message: Message, state: FSMContext):
 async def setup_server(message: Message, state: FSMContext):
     """
     Шаг 2: IMAP-сервер.
-    Пользователь обязан ввести корректный хост IMAP-сервера.
-    Проверяем формат: valid hostname (например, imap.yandex.ru).
+    Проверка через библиотечную validate_hostname().
     """
-    import re
     server = message.text.strip()
     if not server:
         await message.answer("⚠️ IMAP-сервер не может быть пустым. Введите адрес сервера:")
         return
 
-    # Проверка формата hostname: буквы, цифры, точки, дефисы
-    hostname_pattern = re.compile(r'^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?$')
-    if not hostname_pattern.match(server):
+    err = validate_hostname(server)
+    if err:
         await message.answer(
-            "⚠️ Некорректный формат IMAP-сервера.\n\n"
+            f"⚠️ **{err}**\n\n"
             "Пример правильного адреса: `imap.yandex.ru`\n"
-            "Имя сервера должно содержать хотя бы одну точку\n"
-            "и состоять только из букв, цифр, точек и дефисов.\n\n"
-            "Введите адрес IMAP-сервера ещё раз:",
-            parse_mode=ParseMode.MARKDOWN,
-        )
-        return
-    if "." not in server:
-        await message.answer(
-            "⚠️ IMAP-сервер должен содержать домен (например: `imap.yandex.ru`).\n\n"
+            "Имя сервера должно содержать домен.\n\n"
             "Введите адрес IMAP-сервера ещё раз:",
             parse_mode=ParseMode.MARKDOWN,
         )
@@ -3977,10 +4044,10 @@ async def setup_server(message: Message, state: FSMContext):
     config = get_user_config(message.from_user.id)
     current = config["login"] if config else "не задан"
     await message.answer(
-        f"✅ Сервер: `{server}`\n\n"
+        f"✅ IMAP-сервер: `{server}`\n\n"
         f"**Логин** ({current}):\n"
         "Введите логин для подключения к IMAP\n"
-        "(обычно совпадает с email):",
+        "(обычно это полный email-адрес):",
         parse_mode=ParseMode.MARKDOWN,
     )
     await state.set_state(SetupState.login)
@@ -4021,6 +4088,11 @@ async def setup_password(message: Message, state: FSMContext):
     if not password:
         await message.answer("⚠️ Пароль не может быть пустым. Введите пароль приложения:")
         return
+    err = validate_password(password)
+    if err:
+        await message.answer(f"⚠️ **{err}**\n\nВведите пароль приложения (минимум 4 символа):",
+                             parse_mode=ParseMode.MARKDOWN)
+        return
 
     data = await state.get_data()
     email = data.get("email", "")
@@ -4028,28 +4100,27 @@ async def setup_password(message: Message, state: FSMContext):
     login = data.get("login", "")
     user_id = message.from_user.id
 
-    # Проверяем подключение — лучше ошибиться здесь, чем при /list
-    status = await message.answer("🔄 Проверяю подключение...")
-    try:
-        test_server = imaplib.IMAP4_SSL(server, 993)
-        test_server.login(login, password)
-        test_server.select("INBOX")
-        test_server.close()
-        test_server.logout()
-    except imaplib.IMAP4.error as e:
+    # Проверяем IMAP и SMTP — через библиотеку
+    cfg = {
+        "sender": login or email,
+        "password": password,
+        "smtp_host": server.replace("imap", "smtp") if "imap" in server else "smtp.yandex.ru",
+        "smtp_port": 465,
+        "imap_host": server,
+        "imap_port": 993,
+    }
+    status = await message.answer("🔄 Шаг 5: Проверяю SMTP и IMAP...")
+    results = await test_email_connections(cfg, timeout=15)
+
+    has_error = any(not r.success for r in results if r.service in ("SMTP", "IMAP"))
+    if has_error and not any("нет данных" in r.message for r in results):
+        details = "\n".join(r.short for r in results)
         await status.edit_text(
-            f"❌ Ошибка подключения: `{e}`\n\n"
+            f"❌ **Ошибка подключения:**\n\n{details}\n\n"
             "Попробуйте ещё раз:\n"
             "• Убедитесь, что IMAP включён в настройках почты\n"
             "• Проверьте логин и пароль\n\n"
             "Начните заново: `/setup`",
-            parse_mode=ParseMode.MARKDOWN,
-        )
-        await state.clear()
-        return
-    except Exception as e:
-        await status.edit_text(
-            f"❌ Ошибка: `{e}`\n\nНачните заново: `/setup`",
             parse_mode=ParseMode.MARKDOWN,
         )
         await state.clear()
@@ -4059,12 +4130,11 @@ async def setup_password(message: Message, state: FSMContext):
     save_user_config(user_id, email, server, login, password)
     await state.clear()
 
+    report = "\n".join(r.short for r in results)
     await status.edit_text(
         f"✅ **Настройка завершена!**\n\n"
-        f"📧 Email: `{email}`\n"
-        f"🖥  IMAP: `{server}:993`\n"
-        f"🔑 Логин: `{login}`\n\n"
-        "Теперь можно использовать команды:",
+        f"{format_email_config(cfg)}\n\n"
+        f"{report}",
         parse_mode=ParseMode.MARKDOWN,
     )
 
@@ -4959,6 +5029,20 @@ async def main():
 
     # Запускаем фоновую задачу
     asyncio.create_task(check_new_conspects())
+
+    # ── Устанавливаем нижнее меню команд ──────────────────────
+    try:
+        cmds = [
+            BotCommand(command="start", description="🚀 Запустить бота"),
+            BotCommand(command="help", description="❓ Справка и команды"),
+            BotCommand(command="prompt", description="📋 Список промптов"),
+            BotCommand(command="setup", description="🔧 Настройка почты и AI"),
+            BotCommand(command="user", description="👤 Информация о пользователе"),
+        ]
+        await bot.set_my_commands(commands=cmds)
+        logger.info("✅ Нижнее меню команд установлено (%d команд)", len(cmds))
+    except Exception as e:
+        logger.warning("⚠️ Не удалось установить меню команд: %s", e)
 
     await dp.start_polling(bot)
 

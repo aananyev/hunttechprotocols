@@ -2,8 +2,8 @@
 """Tests for centralized help registry in tg_conspect_bot."""
 
 import sys, os
-sys.path.insert(0, "/root/tg_conspect_bot")
-os.chdir("/root/tg_conspect_bot")
+sys.path.insert(0, os.path.expanduser("~/StudioProjects/hunttechprotocols"))
+os.chdir(os.path.expanduser("~/StudioProjects/hunttechprotocols"))
 
 from bot import (
     render_help_overview, render_help_group,
