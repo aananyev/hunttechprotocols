@@ -5994,12 +5994,12 @@ def _changelog_since_last_start() -> str | None:
     repo = Path(__file__).resolve().parent
     log = _git_changelog(repo, str(prev.get("git_head") or "")) if repo.is_dir() else ""
     if log:
-        lines = ["🆕 Что изменилось в боте (после перезапуска):", ""]
+        lines = ["🆕 *Что изменилось в боте (после перезапуска):*", ""]
         for line in log.splitlines()[:15]:
-            lines.append(f"• {line}")
+            lines.append(f"• {escape_md_simple(line)}")
         body = "\n".join(lines)
     else:
-        body = "🆕 Алгоритмы бота обновлены.\n\nКраткое описание изменений: см. git-историю проекта."
+        body = "🆕 *Алгоритмы бота обновлены.*\n\nКраткое описание изменений: см. git-историю проекта."
 
     # Обновляем маркер — чтобы при следующем запуске без изменений не выводить повторно
     try:
@@ -6142,17 +6142,16 @@ async def main():
             logger.warning("Startup message failed for admin %s: %s", _master_admin_id, e)
 
     # ── Однократный вывод изменений алгоритмов с прошлого перезапуска ──
-    # plain text (parse_mode=None): escape_md_simple рассчитан на MarkdownV2,
-    # а Legacy MARKDOWN его backslash-экранирования не рендерит — сырые
-    # звёздочки/слеши «пролезали» в чат (стандарт HuntTech: приветствия и
-    # changelog — только plain text, как в offer-боте)
+    # Жирный заголовок — одинарные звёздочки *...*: двойные **...** Telegram
+    # Markdown не рендерит вообще (проверено через Bot API: entities=null),
+    # парсер молча съедает их. Строки git log экранируются escape_md_simple.
     try:
         changelog = await asyncio.to_thread(_changelog_since_last_start)
         if changelog and _master_admin_id:
             await bot.send_message(
                 chat_id=_master_admin_id,
                 text=changelog,
-                parse_mode=None,
+                parse_mode=ParseMode.MARKDOWN,
                 reply_markup=_main_menu_keyboard(),
             )
             logger.info("Changelog message sent to admin %s", _master_admin_id)
