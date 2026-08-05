@@ -1117,6 +1117,26 @@ def _main_menu_keyboard() -> "ReplyKeyboardMarkup":
         one_time_keyboard=False,
         input_field_placeholder="Выберите действие или введите команду...",
     )
+
+
+LOGO_PATH = Path(__file__).resolve().parent / "assets" / "hunttech_logo.png"
+
+
+async def _send_logo(chat_id: int) -> bool:
+    """Отправляет фото-логотип HuntTech перед приветствием (/start, старт бота).
+    Возвращает True при успехе; при отсутствии файла или ошибке — False
+    (не роняет поток приветствия)."""
+    from aiogram.types import FSInputFile
+
+    try:
+        if not LOGO_PATH.exists():
+            logger.warning("Логотип не найден: %s", LOGO_PATH)
+            return False
+        await bot.send_photo(chat_id=chat_id, photo=FSInputFile(str(LOGO_PATH)))
+        return True
+    except Exception as e:
+        logger.warning("Не удалось отправить логотип %s: %s", chat_id, e)
+        return False
 if not _master_admin_id:
     logger.warning(
         "⚠️ MASTER_ADMIN_ID не задан! "
@@ -3419,6 +3439,8 @@ async def cmd_start(message: Message, state: FSMContext):
                 return
 
     # ── Существующая логика /start ─────────────────────────
+    # Фото-логотип HuntTech перед приветствием (бренд; при ошибке — не мешаем)
+    await _send_logo(message.from_user.id)
     config = get_user_config(user_id)
     if not config:
         await message.answer(
@@ -4560,6 +4582,7 @@ async def setup_email(message: Message, state: FSMContext):
         "(например: `imap.yandex.ru`, `imap.mail.ru`)\n"
         "или `/skip` — оставить текущий:",
         parse_mode=ParseMode.MARKDOWN,
+        reply_markup=_setup_skip_done_keyboard(),
     )
     await state.set_state(SetupState.server)
 
@@ -4649,6 +4672,7 @@ async def setup_login(message: Message, state: FSMContext):
         "(для Яндекса — создайте пароль приложения в настройках почты)\n"
         "или `/skip` — оставить текущий:",
         parse_mode=ParseMode.MARKDOWN,
+        reply_markup=_setup_skip_done_keyboard(),
     )
     await state.set_state(SetupState.password)
 
@@ -4663,7 +4687,12 @@ async def setup_password(message: Message, state: FSMContext):
     text = message.text.strip()
     config = get_user_config(message.from_user.id) or {}
 
-    if text.lower() in ("/skip", "-"):
+    # Кнопка «Готово» — досрочное завершение настройки (пароль не введён)
+    if text == "Готово":
+        await _finish_email_setup_early(message, state)
+        return
+
+    if text.lower() in ("/skip", "-") or text == "Оставить прежнее":
         password = config.get("password", "")
         if not password:
             await message.answer(
@@ -4712,6 +4741,7 @@ async def setup_password(message: Message, state: FSMContext):
             "• Проверьте логин и пароль\n\n"
             "Начните заново: `/setup`",
             parse_mode=ParseMode.MARKDOWN,
+            reply_markup=ReplyKeyboardRemove(),
         )
         await state.clear()
         return
@@ -4734,8 +4764,13 @@ async def setup_password(message: Message, state: FSMContext):
     )
 
     # Автоматически показываем справку — чтобы новый пользователь
-    # сразу видел, какие команды доступны.
-    await message.answer(_help_text(), parse_mode=ParseMode.MARKDOWN)
+    # сразу видел, какие команды доступны. ReplyKeyboardRemove — убрать
+    # нижнее меню «Оставить прежнее/Готово» после завершения настройки.
+    await message.answer(
+        _help_text(),
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=ReplyKeyboardRemove(),
+    )
 
     # Спрашиваем, хочет ли пользователь настроить AI для Саммари
     await message.answer(
@@ -6272,6 +6307,8 @@ async def main():
     # пользователь продолжает видеть старые (мёртвые) кнопки)
     if _master_admin_id:
         try:
+            # Фото-логотип HuntTech перед стартовым приветствием
+            await _send_logo(_master_admin_id)
             ai_cfg = get_ai_config(_master_admin_id)
             ai_model = (ai_cfg or {}).get("model") or "не настроен"
             startup_text = (
