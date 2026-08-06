@@ -1124,6 +1124,15 @@ async def _send_logo(chat_id: int) -> bool:
     from hunttech_bot_common.media import send_logo
 
     return await send_logo(bot, chat_id)
+
+
+def _bot_version() -> str:
+    """Версия бота (стандарт HuntTech): pyproject.toml → короткий SHA."""
+    from hunttech_bot_common.services.startup import bot_version
+
+    return bot_version(Path(__file__).resolve().parent)
+
+
 if not _master_admin_id:
     logger.warning(
         "⚠️ MASTER_ADMIN_ID не задан! "
@@ -6197,6 +6206,7 @@ async def main():
             ai_model = (ai_cfg or {}).get("model") or "не настроен"
             startup_text = (
                 "🚀 HuntTech Protocols Bot\n"
+                f"🤖 Версия бота: {_bot_version()}\n"
                 "━━━━━━━━━━━━━━━━━━━━━━\n"
                 "✅ Бот запущен и готов к работе!\n"
                 f"🤖 AI: {ai_model}\n"
