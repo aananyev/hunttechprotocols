@@ -1,0 +1,23 @@
+#!/bin/sh
+# Инкремент подверсии бота (pyproject.toml) при каждом коммите.
+# Пропускается: merge-коммиты, пустой staged-набор, если pyproject.toml
+# уже изменён в staged-наборе (пользователь сам бампил версию).
+
+# Merge-коммит — версию не поднимаем (она растёт только на содержательные коммиты).
+if [ -f "$(git rev-parse --git-path MERGE_HEAD)" ]; then
+    exit 0
+fi
+
+# Пустой staged-набор — коммитить нечего.
+if git diff --cached --quiet; then
+    exit 0
+fi
+
+# pyproject.toml уже в staged-наборе — не инкрементим повторно.
+if git diff --cached --name-only | grep -qx 'pyproject.toml'; then
+    exit 0
+fi
+
+ROOT="$(git rev-parse --show-toplevel)"
+python3 "$ROOT/scripts/bump-version.py" || exit 1
+git add pyproject.toml
