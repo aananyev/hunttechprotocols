@@ -16,3 +16,6 @@ Thumbs.db
 # Old/unused files
 bot_imap.py
 processed_uids.json
+
+# Bot startup state
+data/startup_state.json

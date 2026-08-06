@@ -1119,24 +1119,11 @@ def _main_menu_keyboard() -> "ReplyKeyboardMarkup":
     )
 
 
-LOGO_PATH = Path(__file__).resolve().parent / "assets" / "hunttech_logo.png"
-
-
 async def _send_logo(chat_id: int) -> bool:
-    """Отправляет фото-логотип HuntTech перед приветствием (/start, старт бота).
-    Возвращает True при успехе; при отсутствии файла или ошибке — False
-    (не роняет поток приветствия)."""
-    from aiogram.types import FSInputFile
+    """Логотип HuntTech перед приветствием — из общей библиотеки."""
+    from hunttech_bot_common.media import send_logo
 
-    try:
-        if not LOGO_PATH.exists():
-            logger.warning("Логотип не найден: %s", LOGO_PATH)
-            return False
-        await bot.send_photo(chat_id=chat_id, photo=FSInputFile(str(LOGO_PATH)))
-        return True
-    except Exception as e:
-        logger.warning("Не удалось отправить логотип %s: %s", chat_id, e)
-        return False
+    return await send_logo(bot, chat_id)
 if not _master_admin_id:
     logger.warning(
         "⚠️ MASTER_ADMIN_ID не задан! "
@@ -6095,109 +6082,6 @@ async def unknown_command(message: Message):
 # ЗАПУСК
 # ═══════════════════════════════════════════════════════════════════
 
-# ── Changelog после перезапуска (однократный вывод изменений кода) ────────
-# Тот же механизм, что в @hrm_hunttech_docs_bot: fingerprint кода против
-# маркера last_startup.json. Выводится после приветствия админу, один раз.
-
-def _hermes_home() -> Path:
-    """~/.hermes (или HERMES_HOME) — база state-файлов ботов."""
-    env = os.environ.get("HERMES_HOME")
-    if env:
-        return Path(env)
-    return Path.home() / ".hermes"
-
-
-def _code_fingerprint() -> str:
-    """SHA-256 от отсортированных имён + содержимого bot.py.
-    Меняется при любом изменении алгоритмов бота."""
-    import hashlib
-
-    source = Path(__file__).resolve()
-    digest = hashlib.sha256()
-    digest.update(source.name.encode("utf-8"))
-    try:
-        digest.update(source.read_bytes())
-    except OSError:
-        pass
-    return digest.hexdigest()
-
-
-def _git_head(repo: Path) -> str:
-    import subprocess
-
-    try:
-        result = subprocess.run(
-            ["git", "-C", str(repo), "rev-parse", "HEAD"],
-            capture_output=True, text=True, timeout=5,
-        )
-        return result.stdout.strip() if result.returncode == 0 else ""
-    except Exception:
-        return ""
-
-
-def _git_changelog(repo: Path, prev_head: str) -> str:
-    """Краткое описание изменений кода между prev_head и текущим HEAD.
-    При пустом prev_head (первый запуск с changelog-механикой) — последние
-    коммиты. Пусто, если git недоступен или изменений нет."""
-    import subprocess
-
-    head = _git_head(repo)
-    if not head or head == prev_head:
-        return ""
-    try:
-        if prev_head:
-            args = ["git", "-C", str(repo), "log", "--oneline", "--no-decorate", f"{prev_head}..{head}"]
-        else:
-            args = ["git", "-C", str(repo), "log", "--oneline", "--no-decorate", "-15", head]
-        result = subprocess.run(args, capture_output=True, text=True, timeout=5)
-        if result.returncode != 0:
-            return ""
-        return result.stdout.strip()
-    except Exception:
-        return ""
-
-
-def _changelog_since_last_start() -> str | None:
-    """Возвращает текст «Что изменилось в боте» (или None) — однократно.
-    Сравнивает fingerprint кода с сохранённым маркером last_startup.json.
-    Если код не менялся с прошлого запуска — None (повторно не выводим)."""
-    marker_path = _hermes_home() / "hunttechprotocols" / "last_startup.json"
-    fingerprint = _code_fingerprint()
-
-    prev = {}
-    if marker_path.is_file():
-        try:
-            prev = json.loads(marker_path.read_text(encoding="utf-8"))
-        except Exception:
-            prev = {}
-
-    # Код не менялся — ничего не выводим (однократность)
-    if prev.get("fingerprint") == fingerprint:
-        return None
-
-    # Описание изменений — git log репо (если доступен), иначе кратко о факте
-    repo = Path(__file__).resolve().parent
-    log = _git_changelog(repo, str(prev.get("git_head") or "")) if repo.is_dir() else ""
-    if log:
-        lines = ["🆕 *Что изменилось в боте (после перезапуска):*", ""]
-        for line in log.splitlines()[:15]:
-            lines.append(f"• {escape_md_simple(line)}")
-        body = "\n".join(lines)
-    else:
-        body = "🆕 *Алгоритмы бота обновлены.*\n\nКраткое описание изменений: см. git-историю проекта."
-
-    # Обновляем маркер — чтобы при следующем запуске без изменений не выводить повторно
-    try:
-        marker_path.parent.mkdir(parents=True, exist_ok=True)
-        marker_path.write_text(
-            json.dumps({"fingerprint": fingerprint, "git_head": _git_head(repo)}, ensure_ascii=False),
-            encoding="utf-8",
-        )
-    except Exception:
-        logger.warning("Could not write changelog marker", exc_info=True)
-    return body
-
-
 async def main():
     logger.info("🤖 Бот конспектов встреч запускается...")
 
@@ -6328,22 +6212,17 @@ async def main():
         except Exception as e:
             logger.warning("Startup message failed for admin %s: %s", _master_admin_id, e)
 
-    # ── Однократный вывод изменений алгоритмов с прошлого перезапуска ──
-    # Жирный заголовок — одинарные звёздочки *...*: двойные **...** Telegram
-    # Markdown не рендерит вообще (проверено через Bot API: entities=null),
-    # парсер молча съедает их. Строки git log экранируются escape_md_simple.
-    try:
-        changelog = await asyncio.to_thread(_changelog_since_last_start)
-        if changelog and _master_admin_id:
-            await bot.send_message(
-                chat_id=_master_admin_id,
-                text=changelog,
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=_main_menu_keyboard(),
-            )
-            logger.info("Changelog message sent to admin %s", _master_admin_id)
-    except Exception as e:
-        logger.warning("Changelog message failed: %s", e)
+    # ── Сводка изменений с прошлого запуска (стандарт HuntTech, эталон —
+    # @hunttech_open_close_vacancy_bot): после приветствия, plain text.
+    if _master_admin_id:
+        try:
+            from hunttech_bot_common.services.startup import send_startup_changelog
+
+            REPO_DIR = Path(__file__).resolve().parent
+            STATE_PATH = Path(__file__).resolve().parent / "data" / "startup_state.json"
+            await send_startup_changelog(bot, _master_admin_id, repo_dir=REPO_DIR, state_path=STATE_PATH)
+        except Exception as e:
+            logger.warning("Changelog message failed: %s", e)
 
     await dp.start_polling(bot)
 
