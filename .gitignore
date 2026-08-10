@@ -19,3 +19,7 @@ processed_uids.json
 
 # Bot startup state
 data/startup_state.json
+data/bot.log
+
+# Runtime notification tracking
+notified_comms.json
