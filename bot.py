@@ -1445,11 +1445,20 @@ async def process_conspect_to_wiki(user_id: int, item, progress: WikiProgress | 
         await progress.done()
 
     logger.info("[WIKI-FLOW] user=%s: УСПЕХ — конспект и протокол размещены (%s)", user_id, page_name)
-    return True, (
-        f"📄 {_md(display)}\n\n"
-        f"{msg1}\n{msg2}\n\n"
-        f"🗂 {page_name}"
-    ), result
+
+    # Без дублирования «✅ Страница опубликована: …»: подписываем ссылки
+    # (конспект и протокол — разные страницы, но с одинаковым шаблоном).
+    def _label_published(label: str, msg: str) -> str:
+        prefix = "✅ Страница опубликована: "
+        if msg.startswith(prefix):
+            return f"✅ {label} опубликован: {msg[len(prefix):]}"
+        return msg
+
+    summary_parts = [f"📄 {_md(display)}", "",
+                     _label_published("Конспект", msg1),
+                     _label_published("Протокол", msg2),
+                     "", f"🗂 {page_name}"]
+    return True, "\n".join(summary_parts), result
 
 
 # ═══════════════════════════════════════════════════════════════════
