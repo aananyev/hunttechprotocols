@@ -2370,7 +2370,8 @@ def _ai_provider_keyboard() -> InlineKeyboardMarkup:
 # Если промпт не найден — жёлтая "Выбрать промпт" с предложением создать.
 
 
-def _get_item_button(idx: int, display: str, user_id: int | None = None) -> InlineKeyboardMarkup | None:
+def _get_item_button(idx: int, display: str, user_id: int | None = None,
+                     list_id: str = "") -> InlineKeyboardMarkup | None:
     """
     Создаёт кнопку под конспектом в списке.
 
@@ -2387,6 +2388,10 @@ def _get_item_button(idx: int, display: str, user_id: int | None = None) -> Inli
     Бизнес-правило сопоставления: название конспекта должно начинаться
     с темы промпта (без учёта регистра). Например, промпт "План развития"
     подойдёт к конспекту "План развития на Q2".
+
+    callback_data несут list_id — идентификатор показанного списка,
+    чтобы нажатие работало с тем списком, который видел пользователь
+    (даже если кэш позже перезаписан другим списком).
     """
     prompts = _load_prompts() or {}
 
@@ -2410,13 +2415,13 @@ def _get_item_button(idx: int, display: str, user_id: int | None = None) -> Inli
             [
                 InlineKeyboardButton(
                     text=f"📝 Расшифровать и разместить в wiki #{idx}",
-                    callback_data=f"wiki_proc:{idx}"
+                    callback_data=f"wiki_proc:{list_id}:{idx}"
                 )
             ],
             [
                 InlineKeyboardButton(
                     text=f"📌 Кратко #{idx}",
-                    callback_data=f"brief:{idx}"
+                    callback_data=f"brief:{list_id}:{idx}"
                 )
             ],
         ])
@@ -2427,19 +2432,19 @@ def _get_item_button(idx: int, display: str, user_id: int | None = None) -> Inli
             [
                 InlineKeyboardButton(
                     text=f"🟡 Выбрать промпт #{idx}",
-                    callback_data=f"choose_prompt:{idx}"
+                    callback_data=f"choose_prompt:{list_id}:{idx}"
                 )
             ],
             [
                 InlineKeyboardButton(
                     text=f"📝 Расшифровать и разместить в wiki #{idx}",
-                    callback_data=f"wiki_proc:{idx}"
+                    callback_data=f"wiki_proc:{list_id}:{idx}"
                 )
             ],
             [
                 InlineKeyboardButton(
                     text=f"📌 Кратко #{idx}",
-                    callback_data=f"brief:{idx}"
+                    callback_data=f"brief:{list_id}:{idx}"
                 )
             ],
         ])
@@ -2456,20 +2461,26 @@ async def summary_callback(callback: CallbackQuery, state: FSMContext):
     - Отправляем в нейросеть через call_ai()
     - Показываем результат
     
-    Формат callback_data: summary:IDX:PROMPT_TOPIC
+    Формат callback_data: summary:{list_id}:{IDX} (новый) или summary:IDX:PROMPT_TOPIC (старый)
     """
     parts = callback.data.split(":", 2)
     if len(parts) < 3:
         await callback.answer("❌ Ошибка данных", show_alert=True)
         return
-    _, idx_str, prompt_topic = parts
+    _, a, b = parts
+    if a.isdigit():
+        # Старый формат: summary:IDX:PROMPT_TOPIC (idx 1-based)
+        list_id, idx_str, prompt_topic = "", a, b
+    else:
+        # Новый формат: summary:{list_id}:{IDX} — тему промпта найдём по названию
+        list_id, idx_str, prompt_topic = a, b, ""
     idx = int(idx_str) - 1  # 0-based
     await callback.answer()
 
     user_id = callback.from_user.id
 
     # Загружаем из кеша — конспекты с txt-содержимым
-    items = _load_notes_cache(user_id)
+    items = _load_notes_cache(user_id, list_id)
     if idx < 0 or idx >= len(items):
         await callback.message.answer("❌ Конспект устарел. Запросите /list заново.")
         return
@@ -2481,7 +2492,12 @@ async def summary_callback(callback: CallbackQuery, state: FSMContext):
     imap_id = item[5] if len(item) >= 6 else ""
 
     # Загружаем промпт
-    prompts = _load_prompts()
+    prompts = _load_prompts() or {}
+    if not prompt_topic:
+        for topic in prompts:
+            if display.lower().startswith(topic.lower()):
+                prompt_topic = topic
+                break
     prompt_text = prompts.get(prompt_topic, "")
     if not prompt_text:
         await callback.message.answer(f"❌ Промпт «{_md(prompt_topic)}» не найден.")
@@ -2576,15 +2592,22 @@ async def wiki_proc_callback(callback: CallbackQuery, state: FSMContext):
        AI-расшифровка, протокол в «Протоколы»."""
     await callback.answer()
     user_id = callback.from_user.id
+    parts = callback.data.split(":", 1)[1].split(":")
+    # Новый формат: wiki_proc:{list_id}:{idx}; старый: wiki_proc:{idx}
+    if len(parts) == 2 and parts[0] and not parts[0].isdigit():
+        list_id, idx_str = parts[0], parts[1]
+    else:
+        list_id, idx_str = "", parts[0]
     try:
-        idx = int(callback.data.split(":", 1)[1])
+        idx = int(idx_str)
     except ValueError:
         await callback.message.answer("❌ Некорректные данные кнопки.")
         return
 
-    items = _load_notes_cache(user_id)
+    items = _load_notes_cache(user_id, list_id)
     if idx < 0 or idx >= len(items):
-        logger.warning("[WIKI-BTN] user=%s idx=%d вне диапазона кэша (len=%d)", user_id, idx, len(items))
+        logger.warning("[WIKI-BTN] user=%s idx=%d вне диапазона кэша list_id=%r (len=%d)",
+                       user_id, idx, list_id, len(items))
         await callback.message.answer("❌ Конспект устарел. Запросите /list заново.")
         return
     item = items[idx]
@@ -2687,15 +2710,17 @@ async def choose_prompt_callback(callback: CallbackQuery, state: FSMContext):
     Бизнес-правило: подсказываем первое слово из названия конспекта
     как тему нового промпта.
     """
-    parts = callback.data.split(":", 1)
-    if len(parts) < 2:
-        await callback.answer("❌ Ошибка данных", show_alert=True)
-        return
-    idx = int(parts[1]) - 1
+    parts = callback.data.split(":", 1)[1].split(":")
+    # Новый формат: choose_prompt:{list_id}:{idx}; старый: choose_prompt:{idx}
+    if len(parts) == 2 and parts[0] and not parts[0].isdigit():
+        list_id, idx_str = parts[0], parts[1]
+    else:
+        list_id, idx_str = "", parts[0]
+    idx = int(idx_str) - 1
     await callback.answer()
 
     user_id = callback.from_user.id
-    items = _load_notes_cache(user_id)
+    items = _load_notes_cache(user_id, list_id)
     if idx < 0 or idx >= len(items):
         await callback.message.answer("❌ Конспект устарел. Запросите /list заново.")
         return
@@ -2821,12 +2846,18 @@ BRIEF_PROMPT = (
 async def brief_callback(callback: CallbackQuery, state: FSMContext):
     """Кнопка «📌 Кратко» под конспектом: AI делает краткий контекст встречи."""
     user_id = callback.from_user.id
+    parts = callback.data.split(":", 1)[1].split(":")
+    # Новый формат: brief:{list_id}:{idx}; старый: brief:{idx}
+    if len(parts) == 2 and parts[0] and not parts[0].isdigit():
+        list_id, idx_str = parts[0], parts[1]
+    else:
+        list_id, idx_str = "", parts[0]
     try:
-        idx = int(callback.data.split(":", 1)[1])
+        idx = int(idx_str) - 1
     except ValueError:
         await callback.answer("❌ Некорректные данные", show_alert=True)
         return
-    items = _load_notes_cache(user_id)
+    items = _load_notes_cache(user_id, list_id)
     if idx < 0 or idx >= len(items):
         await callback.answer("❌ Конспект устарел. Запросите /list заново.", show_alert=True)
         return
@@ -4453,7 +4484,7 @@ async def cmd_get_notes(message: Message):
     await sent.delete()
 
     # Сохраняем txt-содержимое в кеш — нужно для кнопки Саммари
-    _save_notes_cache(user.id, items)
+    list_id = _save_notes_cache(user.id, items)
 
     total = len(items)
     await message.answer(f"📋 **Новые конспекты встреч** — всего {total}", parse_mode=ParseMode.MARKDOWN)
@@ -4463,7 +4494,7 @@ async def cmd_get_notes(message: Message):
         dt, display = item[0], item[1]
         date_str = dt.strftime("%d.%m.%Y %H:%M")
         text = f"**{idx}.** {_md(display)}\n📅 {date_str}"
-        button = _get_item_button(idx, display, user.id)
+        button = _get_item_button(idx, display, user.id, list_id)
         await message.answer(text, parse_mode=ParseMode.MARKDOWN, reply_markup=button)
 
 
@@ -4506,7 +4537,7 @@ async def cmd_list_new(message: Message):
     msg_ids = [f"{item[0].timestamp()}:{item[1]}" for item in items]
     _mark_new_comms_shown(user.id, msg_ids)
 
-    _save_notes_cache(user.id, items)
+    list_id = _save_notes_cache(user.id, items)
 
     total = len(items)
     await message.answer(f"New conspects: {total} total", parse_mode=ParseMode.MARKDOWN)
@@ -4515,7 +4546,7 @@ async def cmd_list_new(message: Message):
         dt, display = item[0], item[1]
         date_str = dt.strftime("%d.%m.%Y %H:%M")
         text = f"**{idx}.** {_md(display)}\n{date_str}"
-        button = _get_item_button(idx, display, user.id)
+        button = _get_item_button(idx, display, user.id, list_id)
         await message.answer(text, parse_mode=ParseMode.MARKDOWN, reply_markup=button)
 
 
@@ -4558,7 +4589,7 @@ async def cmd_list_all(message: Message):
 
     await sent.delete()
 
-    _save_notes_cache(user.id, items)
+    list_id = _save_notes_cache(user.id, items)
 
     total = len(items)
     await message.answer(f"📋 **Конспекты встреч за неделю** — всего {total}", parse_mode=ParseMode.MARKDOWN)
@@ -4567,7 +4598,7 @@ async def cmd_list_all(message: Message):
         dt, display = item[0], item[1]
         date_str = dt.strftime("%d.%m.%Y %H:%M")
         text = f"**{idx}.** {_md(display)}\n📅 {date_str}"
-        button = _get_item_button(idx, display, user.id)
+        button = _get_item_button(idx, display, user.id, list_id)
         await message.answer(text, parse_mode=ParseMode.MARKDOWN, reply_markup=button)
 
 
@@ -5959,8 +5990,17 @@ async def setup_test_callback(callback: CallbackQuery):
 NOTES_CACHE_FILE = Path(__file__).parent / "notes_cache.json"
 
 
-def _save_notes_cache(user_id: int, items: list):
-    """Сохраняет конспекты (с txt-содержимым) в кеш после /list или /list_all."""
+def _save_notes_cache(user_id: int, items: list) -> str:
+    """Сохраняет снапшот списка конспектов в кэш (на диск, переживает рестарты).
+
+    Каждый показ списка (/list, /list_new, /list_all) создаёт ОТДЕЛЬНУЮ
+    запись с уникальным list_id — кнопки под конспектами несут этот
+    list_id, поэтому нажатие всегда работает со СВОИМ списком, даже если
+    позже бот показал другой список или фоновый цикл что-то сохранил.
+
+    Возвращает list_id (короткий хеш). Хранится до 5 последних списков
+    на пользователя (старые вытесняются).
+    """
     cache = {}
     if NOTES_CACHE_FILE.exists():
         try:
@@ -5980,19 +6020,55 @@ def _save_notes_cache(user_id: int, items: list):
         if len(item) >= 6:
             entry["imap_id"] = item[5]
         serialized.append(entry)
-    cache[str(user_id)] = serialized
+
+    list_id = _short_uid(f"{time.time()}:{len(items)}")[:8]
+    per_user = cache.setdefault(str(user_id), {})
+    if isinstance(per_user, list):
+        # Миграция старого формата {user_id: [items]} → {user_id: {list_id: ...}}
+        logger.info("[NOTES-CACHE] user=%s: миграция старого формата кэша (%d записей)",
+                    user_id, len(per_user))
+        legacy_id = _short_uid("legacy-format")[:8]
+        cache[str(user_id)] = {legacy_id: {"items": per_user, "ts": 0}}
+        per_user = cache[str(user_id)]
+    per_user[list_id] = {"items": serialized, "ts": time.time()}
+    # Оставляем 5 последних списков
+    while len(per_user) > 5:
+        oldest = min(per_user, key=lambda k: per_user[k].get("ts", 0))
+        del per_user[oldest]
     NOTES_CACHE_FILE.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
+    logger.info("[NOTES-CACHE] user=%s: сохранён снапшот list_id=%r (%d конспектов)",
+                user_id, list_id, len(items))
+    return list_id
 
 
-def _load_notes_cache(user_id: int) -> list:
-    """Загружает последний кеш конспектов пользователя."""
+def _load_notes_cache(user_id: int, list_id: str | None = None) -> list:
+    """Загружает снапшот списка конспектов пользователя.
+
+    list_id задан — возвращает именно этот список (кнопка из показанного
+    когда-то /list); None — самый свежий снапшот (обратная совместимость).
+    """
     if not NOTES_CACHE_FILE.exists():
         return []
     try:
         cache = json.loads(NOTES_CACHE_FILE.read_text(encoding="utf-8"))
     except Exception:
         return []
-    serialized = cache.get(str(user_id), [])
+    per_user = cache.get(str(user_id), {})
+    if isinstance(per_user, list):
+        # Миграция старого формата {user_id: [items]}
+        legacy_id = _short_uid("legacy-format")[:8]
+        per_user = {legacy_id: {"items": per_user, "ts": 0}}
+    if not per_user:
+        return []
+    if list_id:
+        snapshot = per_user.get(list_id)
+        if not snapshot:
+            logger.warning("[NOTES-CACHE] user=%s: list_id=%r не найден — список устарел", user_id, list_id)
+            return []
+        serialized = snapshot.get("items", [])
+    else:
+        latest = max(per_user.values(), key=lambda s: s.get("ts", 0))
+        serialized = latest.get("items", [])
     items = []
     for entry in serialized:
         dt = datetime.fromisoformat(entry["dt"]) if entry.get("dt") else datetime.now()
@@ -7071,7 +7147,12 @@ async def main():
                             # Сохраняем в кеш для кнопки Саммари
                             notified_ids = [f"{item[0].timestamp()}:{item[1]}" for item in new_notifications]
                             _mark_notified(user_id, notified_ids)
-                            _save_notes_cache(user_id, items)
+                            # ВНИМАНИЕ: НЕ перезаписываем notes_cache здесь!
+                            # Фоновый цикл видит другой набор писем (fetch_new_notes),
+                            # и его сохранение сбивало индексы кнопок из /list.
+                            # Каждый показанный список — отдельный снапшот (list_id),
+                            # фоновому циклу он не нужен (кнопки уведомлений идут
+                            # через pending-кэш по ключу).
 
                     except Exception as e:
                         logger.error(
