@@ -42,16 +42,41 @@ class FakeMessage:
 
 
 class FakeServer:
-    """Имитирует imaplib: fetch возвращает (typ, [(метаданные, заголовки)]).."""
+    """Имитирует imaplib: uid-команды возвращают (typ, [(метаданные, заголовки)]).."""
 
     def __init__(self, hdr=b"", fail=False):
         self.hdr = hdr
         self.fail = fail
 
+    def uid(self, cmd, *args):
+        if self.fail:
+            raise RuntimeError("boom")
+        return "OK", [(b"1 (UID 42 BODY[HEADER.FIELDS (SUBJECT FROM)] {100}", self.hdr)]
+
     def fetch(self, msg_id, what):
         if self.fail:
             raise RuntimeError("boom")
         return "OK", [(b"1 (BODY[HEADER.FIELDS (SUBJECT FROM)] {100}", self.hdr)]
+
+
+class FakeFilterServer:
+    """Имитирует IMAP для _filter_and_extract: search не нужен (список приходит
+    снаружи), fetch отдаёт заголовки/полное письмо, store запоминает вызовы."""
+
+    def __init__(self, email_bytes, uid):
+        self.email_bytes = email_bytes
+        self.uid = uid
+        self.stored = []
+
+    def fetch(self, msg_id, what):
+        if "HEADER.FIELDS" in what:
+            hdr = self.email_bytes.split(b"\r\n\r\n")[0] + b"\r\n\r\n"
+            return "OK", [(b"1 (BODY[HEADER.FIELDS (SUBJECT)] {100}", hdr)]
+        return "OK", [(b"5 (UID %s BODY[] {200}" % self.uid, self.email_bytes)]
+
+    def store(self, msg_id, *args):
+        self.stored.append((msg_id, args))
+        return "OK", None
 
 
 def mime_word(text):
@@ -87,6 +112,30 @@ async def main():
     # 5. Ошибка IMAP — фолбэк на imap_msg_id, не падаем
     brief = bot._fetch_email_brief_from_server(FakeServer(fail=True), "42")
     check("5.1 ошибка IMAP → imap_msg_id", brief == "42", brief)
+
+    # 6. _filter_and_extract: imap_id — это UID (стабильный), а не seq-номер
+    subj_enc = mime_word("Конспект встречи: Планёрка").encode()
+    email_bytes = (
+        b"From: test@hunttech.ru\r\n"
+        b"Subject: " + subj_enc + b"\r\n"
+        b"Message-ID: <abc@hunttech.ru>\r\n"
+        b"Date: Mon, 13 Jul 2026 10:00:00 +0400\r\n"
+        b"MIME-Version: 1.0\r\n"
+        b"Content-Type: text/plain; charset=utf-8\r\n"
+        b"\r\n"
+        b"hello\r\n"
+    )
+    fs = FakeFilterServer(email_bytes, b"4567")
+    matched = bot._filter_and_extract(fs, [b"5"])
+    check("6.1 письмо распознано", len(matched) == 1, matched)
+    check("6.2 imap_id = UID 4567 (не seq 5)", bool(matched) and matched[0][5] == "4567", matched)
+    check("6.3 display из темы", bool(matched) and "Планёрка" in matched[0][1], matched)
+    check("6.4 -FLAGS \\Seen снят (store вызван)", len(fs.stored) == 1, fs.stored)
+
+    # 7. _filter_and_extract: нет UID в ответе — фолбэк на seq (не падаем)
+    fs = FakeFilterServer(email_bytes, b"")
+    matched = bot._filter_and_extract(fs, [b"5"])
+    check("7.1 фолбэк imap_id = seq", bool(matched) and matched[0][5] == "5", matched)
 
     print(f"\nИтог: {pass_count} passed, {fail_count} failed")
     sys.exit(1 if fail_count else 0)

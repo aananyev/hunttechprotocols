@@ -593,8 +593,9 @@ def _filter_and_extract(server, msg_ids: list[bytes]) -> list[tuple]:
             pass  # заголовок не получить — пробуем полное тело ниже (старое поведение)
 
         # BODY.PEEK[] — единственный правильный способ читать письмо
-        # не снимая флаг UNSEEN.
-        typ, msg_data = server.fetch(msg_id, "(BODY.PEEK[])")
+        # не снимая флаг UNSEEN. UID в том же FETCH — стабильный
+        # идентификатор письма (см. ниже).
+        typ, msg_data = server.fetch(msg_id, "(UID BODY.PEEK[])")
         if typ != "OK":
             continue
 
@@ -627,7 +628,21 @@ def _filter_and_extract(server, msg_ids: list[bytes]) -> list[tuple]:
 
         email_msg_id = msg.get("Message-ID", "") or ""
         email_from = decode_mime_header(msg.get("From", ""))
-        imap_msg_id = msg_id.decode() if isinstance(msg_id, bytes) else str(msg_id)
+        # UID — СТАБИЛЬНЫЙ идентификатор письма. Seq-номер (позиция в INBOX)
+        # меняется при любом изменении ящика (новое письмо, expunge), и
+        # тогда кнопка «Да, в корзину» могла удалить НЕ то письмо
+        # (08.2026: в корзину ушли CDEK-документы и рассылка Яндекса).
+        # Для IMAP-операций (прочитано/корзина) используем только UID.
+        imap_msg_id = ""
+        try:
+            meta = msg_data[0][0] if isinstance(msg_data[0], (tuple, list)) else b""
+            m_uid = re.search(rb"UID (\d+)", meta if isinstance(meta, bytes) else str(meta).encode())
+            if m_uid:
+                imap_msg_id = m_uid.group(1).decode()
+        except Exception:
+            imap_msg_id = ""
+        if not imap_msg_id:
+            imap_msg_id = msg_id.decode() if isinstance(msg_id, bytes) else str(msg_id)
 
         matched.append((dt, display, txt_content, email_msg_id, email_from, imap_msg_id))
 
@@ -1523,8 +1538,11 @@ async def process_conspect_to_wiki(user_id: int, item, progress: WikiProgress | 
 
 
 def _set_email_read(user_id: int, imap_msg_id: str) -> bool:
-    """Помечает письмо по IMAP msg_id как прочитанное (флаг \\Seen).
-       После успешной цепочки AI→Wiki→БД — письмо уходит из /list."""
+    """Помечает письмо по UID как прочитанное (флаг \\Seen).
+       После успешной цепочки AI→Wiki→БД — письмо уходит из /list.
+
+       UID вместо seq-номера: seq сдвигается при изменении ящика и
+       пометка ушла бы чужому письму (08.2026)."""
     config = get_user_config(user_id)
     if _email_config_error(config):
         return False
@@ -1532,7 +1550,7 @@ def _set_email_read(user_id: int, imap_msg_id: str) -> bool:
     try:
         server = _connect_imap(config)
         try:
-            server.store(imap_msg_id.encode(), "+FLAGS", "(\\Seen)")
+            server.uid("STORE", imap_msg_id, "+FLAGS", "(\\Seen)")
             logger.info("📩 Письмо %s помечено прочитанным (%s)", imap_msg_id, user_id)
             return True
         finally:
@@ -1585,8 +1603,8 @@ def _fetch_email_brief_from_server(server, imap_msg_id: str) -> str:
     При ошибке возвращает imap_msg_id, чтобы сообщение бота не падало.
     """
     try:
-        typ_h, hdr_data = server.fetch(
-            str(imap_msg_id), "(BODY.PEEK[HEADER.FIELDS (SUBJECT FROM)])"
+        typ_h, hdr_data = server.uid(
+            "FETCH", str(imap_msg_id), "(BODY.PEEK[HEADER.FIELDS (SUBJECT FROM)])"
         )
         if typ_h == "OK" and hdr_data and hdr_data[0]:
             raw_hdr = hdr_data[0][1] if isinstance(hdr_data[0], (tuple, list)) and len(hdr_data[0]) > 1 else b""
@@ -1628,11 +1646,14 @@ def _fetch_email_brief(user_id: int, imap_msg_id: str) -> str:
 
 
 def _move_email_to_trash(user_id: int, imap_msg_id: str) -> tuple[bool, str]:
-    r"""Перемещает письмо (по seq-номеру IMAP) в корзину почтового ящика.
-       Сначала пробует UID MOVE (RFC 6851), при неудаче — COPY + \Deleted + EXPUNGE.
+    r"""Перемещает письмо (по UID IMAP) в корзину почтового ящика.
+       Сначала UID MOVE (RFC 6851), при неудаче — COPY + \Deleted + EXPUNGE.
 
        Возвращает (ok, brief), где brief — «тема» от отправителя (или imap_msg_id),
-       чтобы бот мог написать, какое именно письмо переместил/не переместил."""
+       чтобы бот мог написать, какое именно письмо переместил/не переместил.
+
+       UID вместо seq-номера: seq сдвигается при изменении ящика и в корзину
+       ушло бы ДРУГОЕ письмо (08.2026: CDEK-документы и рассылка Яндекса)."""
     config = get_user_config(user_id)
     if _email_config_error(config):
         return False, imap_msg_id
@@ -1647,6 +1668,14 @@ def _move_email_to_trash(user_id: int, imap_msg_id: str) -> tuple[bool, str]:
             # Описание письма читаем ДО перемещения (после MOVE/EXPUNGE
             # письма в INBOX уже не будет).
             brief = _fetch_email_brief_from_server(server, imap_msg_id)
+            # Проверяем, что письмо с таким UID ещё в INBOX: UID MOVE на
+            # несуществующем UID может «успешно» ничего не сделать.
+            typ_f, data_f = server.uid("FETCH", str(imap_msg_id), "(UID)")
+            exists = typ_f == "OK" and bool(data_f and data_f[0])
+            if not exists:
+                logger.warning("[TRASH] user=%s: письмо %s уже не в INBOX — не трогаю",
+                               user_id, imap_msg_id)
+                return False, brief
             trash = _find_trash_folder(server)
             if not trash:
                 logger.error("Папка корзины не найдена (user=%s)", user_id)
@@ -1654,27 +1683,19 @@ def _move_email_to_trash(user_id: int, imap_msg_id: str) -> tuple[bool, str]:
             logger.info("[TRASH] user=%s: перемещаю письмо %s → %s", user_id, imap_msg_id, trash)
 
             # 1) Пробуем UID MOVE (RFC 6851) — надёжно, без EXPUNGE
-            typ_f, data = server.fetch(str(imap_msg_id), "(UID)")
-            uid = None
-            if typ_f == "OK" and data and data[0]:
-                raw = data[0] if isinstance(data[0], bytes) else data[0][0]
-                m = re.search(rb"UID (\d+)", raw)
-                if m:
-                    uid = m.group(1).decode()
-            if uid:
-                typ_m, _ = server.uid("MOVE", uid, trash)
-                if typ_m == "OK":
-                    logger.info("[TRASH] user=%s: UID MOVE ok (письмо %s → %s)", user_id, imap_msg_id, trash)
-                    return True, brief
-                logger.warning("[TRASH] user=%s: UID MOVE не удался (%s), fallback COPY+DELETE", user_id, typ_m)
+            typ_m, _ = server.uid("MOVE", str(imap_msg_id), trash)
+            if typ_m == "OK":
+                logger.info("[TRASH] user=%s: UID MOVE ok (письмо %s → %s)", user_id, imap_msg_id, trash)
+                return True, brief
+            logger.warning("[TRASH] user=%s: UID MOVE не удался (%s), fallback COPY+DELETE", user_id, typ_m)
 
             # 2) Fallback: COPY + \Deleted + EXPUNGE
-            typ_c, _ = server.copy(str(imap_msg_id), trash)
+            typ_c, _ = server.uid("COPY", str(imap_msg_id), trash)
             if typ_c != "OK":
                 logger.error("[TRASH] user=%s: COPY письма %s в %s не удался (%s)",
                              user_id, imap_msg_id, trash, typ_c)
                 return False, brief
-            server.store(str(imap_msg_id), "+FLAGS", "\\Deleted")
+            server.uid("STORE", str(imap_msg_id), "+FLAGS", "(\\Deleted)")
             server.expunge()
             logger.info("[TRASH] user=%s: письмо %s перемещено в %s (COPY+EXPUNGE)", user_id, imap_msg_id, trash)
             return True, brief
