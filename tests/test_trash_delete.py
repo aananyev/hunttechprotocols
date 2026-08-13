@@ -137,6 +137,47 @@ async def main():
     matched = bot._filter_and_extract(fs, [b"5"])
     check("7.1 фолбэк imap_id = seq", bool(matched) and matched[0][5] == "5", matched)
 
+    # 8. СТРАЖ: _verify_telemost_email пропускает только протоколы Телемоста
+    tele_hdr = (
+        f"Subject: {mime_word('Конспект встречи: Планёрка')}\r\n"
+        "From: Хранитель встреч Телемоста <keeper@telemost.yandex.ru>\r\n\r\n"
+    ).encode()
+    ok, brief = bot._verify_telemost_email(FakeServer(tele_hdr), "42")
+    check("8.1 телемост: тема+отправитель → True", ok is True, brief)
+    check("8.2 телемост: brief с темой", "«Конспект встречи: Планёрка»" in brief, brief)
+
+    # 8.3 чужой отправитель (CDEK) при теме конспекта → False (fail-closed)
+    cdek_hdr = (
+        f"Subject: {mime_word('Конспект встречи: Планёрка')}\r\n"
+        "From: noreply-oplata@cdek.ru\r\n\r\n"
+    ).encode()
+    ok, _ = bot._verify_telemost_email(FakeServer(cdek_hdr), "42")
+    check("8.3 чужой отправитель → False", ok is False)
+
+    # 8.4 чужая тема при отправителе телемоста → False
+    bad_subj_hdr = (
+        f"Subject: {mime_word('Пакет документов СВЯ-0427778 на оплату')}\r\n"
+        "From: Хранитель встреч Телемоста <keeper@telemost.yandex.ru>\r\n\r\n"
+    ).encode()
+    ok, _ = bot._verify_telemost_email(FakeServer(bad_subj_hdr), "42")
+    check("8.4 чужая тема → False", ok is False)
+
+    # 8.5 полное чужое письмо (тема+отправитель не телемост) → False
+    full_foreign = (
+        "Subject: Пакет документов СВЯ-0427778 от 26.07.2026 на оплату\r\n"
+        "From: noreply-oplata@cdek.ru\r\n\r\n"
+    ).encode()
+    ok, _ = bot._verify_telemost_email(FakeServer(full_foreign), "42")
+    check("8.5 чужое письмо целиком → False", ok is False)
+
+    # 8.6 ошибка IMAP → False (fail-closed), brief = imap_id
+    ok, brief = bot._verify_telemost_email(FakeServer(fail=True), "42")
+    check("8.6 ошибка IMAP → (False, '42')", ok is False and brief == "42", brief)
+
+    # 8.7 пустые заголовки → False (fail-closed)
+    ok, brief = bot._verify_telemost_email(FakeServer(b""), "42")
+    check("8.7 пустые заголовки → (False, '42')", ok is False and brief == "42", brief)
+
     print(f"\nИтог: {pass_count} passed, {fail_count} failed")
     sys.exit(1 if fail_count else 0)
 

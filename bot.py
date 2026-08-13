@@ -1550,6 +1550,14 @@ def _set_email_read(user_id: int, imap_msg_id: str) -> bool:
     try:
         server = _connect_imap(config)
         try:
+            # ФИНАЛЬНЫЙ СТРАЖ (08.2026): помечаем прочитанным ТОЛЬКО протокол
+            # Телемоста. Если UID по любой причине указывает на другое письмо —
+            # не трогаем его (иначе «украдём» непрочитанное у чужого письма).
+            ok_t, _ = _verify_telemost_email(server, imap_msg_id)
+            if not ok_t:
+                logger.warning("[GUARD] user=%s: НЕ помечаю прочитанным письмо %s — не протокол Телемоста",
+                               user_id, imap_msg_id)
+                return False
             server.uid("STORE", imap_msg_id, "+FLAGS", "(\\Seen)")
             logger.info("📩 Письмо %s помечено прочитанным (%s)", imap_msg_id, user_id)
             return True
@@ -1623,6 +1631,47 @@ def _fetch_email_brief_from_server(server, imap_msg_id: str) -> str:
     return imap_msg_id
 
 
+def _verify_telemost_email(server, imap_msg_id: str) -> tuple[bool, str]:
+    """Проверяет, что письмо с данным UID — протокол Телемоста.
+
+    Бизнес-правило (владелец, 08.2026): бот имеет право работать ТОЛЬКО
+    с протоколами телемоста — тема начинается с SUBJECT_FILTER
+    («Конспект встречи») И отправитель — Телемост (keeper@telemost.yandex.ru).
+    Любое другое письмо бот НЕ имеет права помечать прочитанным или
+    перемещать в корзину: после инцидента 08.2026 (seq-сдвиг чуть не
+    удалил документы CDEK и рассылки Яндекса) это финальный страж перед
+    любой мутацией почты.
+
+    Возвращает (ok, brief), где brief — «тема» от отправителя для сообщений.
+    При ошибке/пустом ответе — (False, imap_msg_id) (fail-closed).
+    """
+    try:
+        typ_h, hdr_data = server.uid(
+            "FETCH", str(imap_msg_id), "(BODY.PEEK[HEADER.FIELDS (SUBJECT FROM)])"
+        )
+        if typ_h == "OK" and hdr_data and hdr_data[0]:
+            raw_hdr = hdr_data[0][1] if isinstance(hdr_data[0], (tuple, list)) and len(hdr_data[0]) > 1 else b""
+            msg = email.message_from_bytes(raw_hdr)
+            subject = decode_mime_header(msg.get("Subject", "")).strip()
+            frm = decode_mime_header(msg.get("From", "")).strip()
+            is_telemost = (
+                subject.lower().startswith(SUBJECT_FILTER.lower())
+                and "telemost" in frm.lower()
+            )
+            parts = []
+            if subject:
+                parts.append(f"«{subject}»")
+            if frm:
+                parts.append(f"от {frm}")
+            brief = " ".join(parts) if parts else str(imap_msg_id)
+            if not is_telemost:
+                logger.warning("[GUARD] письмо %s — НЕ протокол Телемоста (%s)", imap_msg_id, brief)
+            return is_telemost, brief
+    except Exception as e:
+        logger.error("[GUARD] Не удалось проверить письмо %s: %s", imap_msg_id, e)
+    return False, str(imap_msg_id)
+
+
 def _fetch_email_brief(user_id: int, imap_msg_id: str) -> str:
     """Открывает INBOX и возвращает краткое описание письма
     («тема» от отправителя) — для сообщений бота."""
@@ -1665,16 +1714,25 @@ def _move_email_to_trash(user_id: int, imap_msg_id: str) -> tuple[bool, str]:
             if typ != "OK":
                 logger.error("Не удалось выбрать INBOX (user=%s)", user_id)
                 return False, imap_msg_id
-            # Описание письма читаем ДО перемещения (после MOVE/EXPUNGE
+            # Описание/проверка письма ДО перемещения (после MOVE/EXPUNGE
             # письма в INBOX уже не будет).
-            brief = _fetch_email_brief_from_server(server, imap_msg_id)
             # Проверяем, что письмо с таким UID ещё в INBOX: UID MOVE на
             # несуществующем UID может «успешно» ничего не сделать.
             typ_f, data_f = server.uid("FETCH", str(imap_msg_id), "(UID)")
             exists = typ_f == "OK" and bool(data_f and data_f[0])
+            # ФИНАЛЬНЫЙ СТРАЖ (08.2026): перемещать в корзину можно ТОЛЬКО
+            # протокол Телемоста. Даже если UID по какой-то причине указывает
+            # на другое письмо (сдвиг seq/устаревшая кнопка) — бот откажется:
+            # чужое письмо (документы CDEK, рассылки Яндекса и т.п.) в корзину
+            # не уйдёт.
+            ok_t, brief = _verify_telemost_email(server, imap_msg_id)
             if not exists:
                 logger.warning("[TRASH] user=%s: письмо %s уже не в INBOX — не трогаю",
                                user_id, imap_msg_id)
+                return False, brief
+            if not ok_t:
+                logger.warning("[GUARD] user=%s: отказ перемещать письмо %s — не протокол Телемоста (%s)",
+                               user_id, imap_msg_id, brief)
                 return False, brief
             trash = _find_trash_folder(server)
             if not trash:
