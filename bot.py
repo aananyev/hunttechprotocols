@@ -1381,6 +1381,113 @@ def _set_email_read(user_id: int, imap_msg_id: str) -> bool:
         return False
 
 
+# ── Перемещение письма в корзину почтового ящика ────────────
+# Бизнес-правило (владелец, 08.2026): после успешной расшифровки
+# конспекта бот помечает письмо прочитанным и СПРАШИВАЕТ пользователя
+# (кнопки да/нет) о перемещении письма в корзину. При «да» — письмо
+# перемещается в папку Trash корпоративного ящика.
+
+
+def _find_trash_folder(server) -> str:
+    """Находит папку корзины (Trash/Корзина) в списке папок IMAP."""
+    try:
+        typ, data = server.list()
+        if typ != "OK":
+            return "Trash"
+        for raw in data or []:
+            if not isinstance(raw, bytes):
+                continue
+            line = raw.decode("utf-8", "replace")
+            # Атрибут \Trash — надёжный признак корзины
+            if "\\Trash" in line:
+                m = re.search(r'"([^"]+)"\s*$', line)
+                if m:
+                    return m.group(1)
+        # Fallback: имя папки
+        for raw in data or []:
+            if not isinstance(raw, bytes):
+                continue
+            line = raw.decode("utf-8", "replace")
+            m = re.search(r'"([^"]+)"\s*$', line)
+            if m and ("trash" in m.group(1).lower() or "корзин" in m.group(1).lower()):
+                return m.group(1)
+    except Exception as e:
+        logger.error("Ошибка поиска корзины: %s", e)
+    return "Trash"
+
+
+def _move_email_to_trash(user_id: int, imap_msg_id: str) -> bool:
+    """Перемещает письмо (по seq-номеру IMAP) в корзину почтового ящика.
+       Сначала пробует UID MOVE (RFC 6851), при неудаче — COPY + \Deleted + EXPUNGE."""
+    config = get_user_config(user_id)
+    if _email_config_error(config):
+        return False
+    assert config is not None
+    try:
+        server = _connect_imap(config)
+        try:
+            typ, _ = server.select("INBOX")
+            if typ != "OK":
+                logger.error("Не удалось выбрать INBOX (user=%s)", user_id)
+                return False
+            trash = _find_trash_folder(server)
+            if not trash:
+                logger.error("Папка корзины не найдена (user=%s)", user_id)
+                return False
+            logger.info("[TRASH] user=%s: перемещаю письмо %s → %s", user_id, imap_msg_id, trash)
+
+            # 1) Пробуем UID MOVE (RFC 6851) — надёжно, без EXPUNGE
+            typ_f, data = server.fetch(str(imap_msg_id), "(UID)")
+            uid = None
+            if typ_f == "OK" and data and data[0]:
+                raw = data[0] if isinstance(data[0], bytes) else data[0][0]
+                m = re.search(rb"UID (\d+)", raw)
+                if m:
+                    uid = m.group(1).decode()
+            if uid:
+                typ_m, _ = server.uid("MOVE", uid, trash)
+                if typ_m == "OK":
+                    logger.info("[TRASH] user=%s: UID MOVE ok (письмо %s → %s)", user_id, imap_msg_id, trash)
+                    return True
+                logger.warning("[TRASH] user=%s: UID MOVE не удался (%s), fallback COPY+DELETE", user_id, typ_m)
+
+            # 2) Fallback: COPY + \Deleted + EXPUNGE
+            typ_c, _ = server.copy(str(imap_msg_id), trash)
+            if typ_c != "OK":
+                logger.error("[TRASH] user=%s: COPY письма %s в %s не удался (%s)",
+                             user_id, imap_msg_id, trash, typ_c)
+                return False
+            server.store(str(imap_msg_id), "+FLAGS", "\\Deleted")
+            server.expunge()
+            logger.info("[TRASH] user=%s: письмо %s перемещено в %s (COPY+EXPUNGE)", user_id, imap_msg_id, trash)
+            return True
+        finally:
+            server.close()
+            server.logout()
+    except Exception as e:
+        logger.error("[TRASH] Исключение для user %s, письмо %s: %s", user_id, imap_msg_id, e, exc_info=True)
+        return False
+
+
+async def _ask_trash_after_publish(callback: CallbackQuery, user_id: int, item) -> None:
+    """После успешной расшифровки: помечает письмо прочитанным и
+       спрашивает пользователя (кнопки да/нет) о перемещении в корзину."""
+    imap_id = item[5] if len(item) >= 6 else ""
+    if not imap_id:
+        logger.info("[TRASH] user=%s: imap_id отсутствует — пометка/корзина пропущены", user_id)
+        return
+    _set_email_read(user_id, imap_id)
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton("🗑 Да, в корзину", callback_data=f"trash_yes:{imap_id}"),
+        InlineKeyboardButton("Нет, оставить", callback_data=f"trash_no:{imap_id}"),
+    ]])
+    await callback.message.answer(
+        "📬 Письмо помечено прочитанным.\n\n"
+        "Переместить это письмо в корзину почтового ящика?",
+        reply_markup=kb,
+    )
+
+
 import json
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
@@ -2374,6 +2481,8 @@ async def wiki_proc_callback(callback: CallbackQuery, state: FSMContext):
         ok, msg = await process_conspect_to_wiki(user_id, item)
         logger.info("[WIKI-BTN] user=%s результат: ok=%s msg=%r", user_id, ok, (msg or "")[:150])
         await status_msg.edit_text(msg, parse_mode=ParseMode.MARKDOWN)
+        if ok:
+            await _ask_trash_after_publish(callback, user_id, item)
     except Exception as e:
         logger.error("[WIKI-BTN] user=%s исключение: %s", user_id, e, exc_info=True)
         try:
@@ -2420,6 +2529,7 @@ async def wiki_process_callback(callback: CallbackQuery, state: FSMContext):
         if ok:
             _remove_wiki_pending(user_id, uid)
             logger.info("[WIKI-BTN] user=%s: конспект «%s» обработан в wiki", user_id, display[:70])
+            await _ask_trash_after_publish(callback, user_id, item)
         else:
             logger.warning("[WIKI-BTN] user=%s: флоу вернул ошибку: %r", user_id, (msg or "")[:150])
         await status_msg.edit_text(msg, parse_mode=ParseMode.MARKDOWN)
@@ -2499,12 +2609,36 @@ async def publish_wiki_callback(callback: CallbackQuery, state: FSMContext):
     try:
         ok, msg = await process_conspect_to_wiki(user_id, item)
         await status_msg.edit_text(msg, parse_mode=ParseMode.MARKDOWN)
+        if ok:
+            await _ask_trash_after_publish(callback, user_id, item)
     except Exception as e:
-        logger.error("Ошибка publish_wiki для user %s: %s", user_id, e)
+        logger.error("Ошибка publish_wiki для user %s: %s", user_id, e, exc_info=True)
         try:
             await status_msg.edit_text(f"❌ Ошибка: {e}")
         except Exception:
             pass
+
+
+# ── Кнопки «Да/Нет» про перемещение письма в корзину ────────
+
+@dp.callback_query(lambda c: c.data and (c.data.startswith("trash_yes:") or c.data.startswith("trash_no:")))
+async def trash_callback(callback: CallbackQuery, state: FSMContext):
+    """После расшифровки пользователь отвечает, перемещать ли письмо в корзину."""
+    user_id = callback.from_user.id
+    imap_id = callback.data.split(":", 1)[1]
+    if callback.data.startswith("trash_yes:"):
+        logger.info("[TRASH-BTN] user=%s: пользователь согласился переместить письмо %s в корзину",
+                    user_id, imap_id)
+        ok = _move_email_to_trash(user_id, imap_id)
+        if ok:
+            await callback.answer("🗑 Перемещено в корзину.")
+            await callback.message.answer("🗑 Письмо перемещено в корзину почтового ящика.")
+        else:
+            await callback.answer("❌ Не удалось переместить письмо.", show_alert=True)
+            await callback.message.answer("❌ Не удалось переместить письмо в корзину.")
+    else:
+        logger.info("[TRASH-BTN] user=%s: пользователь оставил письмо %s в папке", user_id, imap_id)
+        await callback.answer("Оставляю письмо в папке.")
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -5627,12 +5761,14 @@ def _save_wiki_pending(user_id: int, item) -> None:
             logger.warning("[WIKI-PENDING] Файл повреждён (%s), стартуем с пустым кэшем", e)
             cache = {}
     dt, display, txt = item[0], item[1], item[2]
+    imap_id = item[5] if len(item) >= 6 else ""
     uid = f"{dt.timestamp()}:{display}"
     per_user = cache.setdefault(str(user_id), {})
     per_user[uid] = {
         "dt": dt.isoformat(),
         "display": display,
         "txt": txt,
+        "imap_id": imap_id,
     }
     WIKI_PENDING_FILE.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
     logger.info("[WIKI-PENDING] Сохранён конспект user=%s uid=%r (всего у пользователя: %d)",
@@ -5657,7 +5793,7 @@ def _load_wiki_pending(user_id: int) -> dict:
         except Exception as e:
             logger.warning("[WIKI-PENDING] Пропускаю битую запись %r: %s", uid[:40], e)
             continue
-        items[uid] = (dt, entry["display"], entry["txt"], "", "", "")
+        items[uid] = (dt, entry["display"], entry["txt"], "", "", entry.get("imap_id", ""))
     logger.info("[WIKI-PENDING] Загружено %d ожидающих конспектов (user=%s)", len(items), user_id)
     return items
 
