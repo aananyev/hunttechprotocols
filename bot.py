@@ -81,7 +81,7 @@ logger = logging.getLogger("bot")
 
 from aiogram import Bot, Dispatcher
 from aiogram.filters import Command, CommandObject
-from aiogram.types import BotCommand, Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from aiogram.types import BotCommand, Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, ChatMemberUpdated
 from aiogram.enums import ParseMode
 
 import os
@@ -342,6 +342,39 @@ def get_wiki_config(user_id: int) -> dict | None:
     if config and "wiki" in config:
         return config["wiki"]
     return None
+
+
+# ── Целевая группа для публикации протоколов ──────────────────
+# Бизнес-правило (владелец, 08.2026): после публикации протокола в Вики
+# бот может одним нажатием опубликовать его дайджест в группе, где он
+# является администратором. Группа запоминается автоматически, когда
+# пользователь добавляет бота в группу и выдаёт ему права администратора.
+
+def save_group_target(user_id: int, chat_id: int, title: str) -> None:
+    """Сохраняет группу, где бот — администратор (для кнопки «📢 Опубликовать в группе»)."""
+    users = _load_users()
+    key = str(user_id)
+    if key not in users:
+        users[key] = {}
+    users[key]["group"] = {"chat_id": chat_id, "title": title, "ts": time.time()}
+    _save_users(users)
+
+
+def get_group_target(user_id: int) -> dict | None:
+    """Возвращает целевую группу пользователя (chat_id, title) или None."""
+    config = get_user_config(user_id)
+    if config and config.get("group"):
+        return config["group"]
+    return None
+
+
+def remove_group_target(user_id: int) -> None:
+    """Удаляет целевую группу (бота исключили/лишили прав администратора)."""
+    users = _load_users()
+    key = str(user_id)
+    if key in users and "group" in users[key]:
+        del users[key]["group"]
+        _save_users(users)
 
 
 def get_wiki_mode(user_id: int) -> str:
@@ -2644,9 +2677,7 @@ async def wiki_proc_callback(callback: CallbackQuery, state: FSMContext):
         if ok:
             key = _short_uid(f"{item[0].timestamp()}:{item[1]}")
             _save_summary_cache(user_id, key, item[1], summary)
-            kb = InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton(text="📄 Показать саммари", callback_data=f"show_summary:{key}")
-            ]])
+            kb = _after_publish_keyboard(key)
             await status_msg.edit_text(final, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
             await _ask_trash_after_publish(callback, user_id, item)
         else:
@@ -2700,9 +2731,7 @@ async def wiki_process_callback(callback: CallbackQuery, state: FSMContext):
             _remove_wiki_pending(user_id, uid)
             logger.info("[WIKI-BTN] user=%s: конспект «%s» обработан в wiki", user_id, display[:70])
             _save_summary_cache(user_id, uid, display, summary)
-            kb = InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton(text="📄 Показать саммари", callback_data=f"show_summary:{uid}")
-            ]])
+            kb = _after_publish_keyboard(uid)
             await status_msg.edit_text(final, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
             await _ask_trash_after_publish(callback, user_id, item)
         else:
@@ -2811,9 +2840,7 @@ async def publish_wiki_callback(callback: CallbackQuery, state: FSMContext):
         if ok:
             key = _short_uid(f"{item[0].timestamp()}:{item[1]}")
             _save_summary_cache(user_id, key, item[1], summary)
-            kb = InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton(text="📄 Показать саммари", callback_data=f"show_summary:{key}")
-            ]])
+            kb = _after_publish_keyboard(key)
             await status_msg.edit_text(final, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
             await _ask_trash_after_publish(callback, user_id, item)
         else:
@@ -2864,6 +2891,132 @@ async def show_summary_callback(callback: CallbackQuery, state: FSMContext):
     logger.info("[SHOW-SUMMARY] user=%s: показывает саммари «%s» (%d симв.)",
                 user_id, (entry.get("display") or "")[:60], len(entry.get("summary") or ""))
     await _send_summary(callback.message, entry.get("display", ""), entry.get("summary", ""))
+
+
+# ── Публикация дайджеста протокола в группу ────────────────────
+# Бизнес-правило (владелец, 08.2026): после успешной публикации в Вики
+# бот предлагает кнопку «📢 Опубликовать в группе» — публикует ПЕРЕРАБОТАННЫЙ
+# протокол (внутренний промпт: только самое основное, не более 10 предложений,
+# корректный Markdown) в группу, где бот является администратором.
+
+def _after_publish_keyboard(key: str) -> InlineKeyboardMarkup:
+    """Кнопки после успешной публикации в Вики:
+       «📄 Показать саммари» и «📢 Опубликовать в группе»."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="📄 Показать саммари", callback_data=f"show_summary:{key}"),
+        ],
+        [
+            InlineKeyboardButton(text="📢 Опубликовать в группе", callback_data=f"publish_group:{key}"),
+        ],
+    ])
+
+
+# Внутренний промпт дайджеста (не из Вики): только основное, ≤10 предложений,
+# корректный Markdown для публикации в рабочей группе.
+GROUP_DIGEST_PROMPT = (
+    "Ты — секретарь IT-компании HUNTTECH. Ниже — протокол встречи. "
+    "Переработай его в КОРОТКИЙ ДАЙДЖЕСТ для публикации в рабочей группе:\n"
+    "1) оставь только самое основное: решения, задачи, сроки, ответственные;\n"
+    "2) максимум 10 предложений;\n"
+    "3) используй корректное форматирование Markdown: заголовок, списки "
+    "(- или 1.), жирный текст для ключевого;\n"
+    "4) без воды, вводных фраз и приветствий."
+)
+
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("publish_group:"))
+async def publish_group_callback(callback: CallbackQuery, state: FSMContext):
+    """Кнопка «📢 Опубликовать в группе» после публикации в Вики:
+       перерабатывает протокол внутренним промптом (только основное,
+       не более 10 предложений, корректный Markdown) и публикует в группу,
+       где бот — администратор."""
+    user_id = callback.from_user.id
+    key = callback.data.split(":", 1)[1]
+    cache = _load_summary_cache(user_id)
+    entry = cache.get(key)
+    if not entry:
+        await callback.answer("❌ Протокол уже недоступен (кэш очищен).", show_alert=True)
+        return
+    target = get_group_target(user_id)
+    if not target:
+        await callback.answer(
+            "❌ Бот не добавлен администратором ни в одну группу.\n"
+            "Добавьте бота в группу и выдайте ему права администратора.",
+            show_alert=True,
+        )
+        return
+    await callback.answer()
+    display = entry.get("display", "")
+    protocol = entry.get("summary", "")
+    logger.info("[GROUP-PUB] user=%s: готовлю дайджест «%s» для группы %s (%s)",
+                user_id, display[:60], target.get("chat_id"), target.get("title"))
+    status = await callback.message.answer(
+        f"⏳ Готовлю дайджест «{_md(display)}» для публикации в группе...",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    try:
+        digest = await call_ai(user_id, GROUP_DIGEST_PROMPT, protocol)
+        if not digest or digest.startswith("❌"):
+            await status.edit_text(digest or "❌ Нейросеть не ответила.", parse_mode=ParseMode.MARKDOWN)
+            return
+        header = f"📋 {_md(display)}\n\n"
+        full = header + digest
+        try:
+            await bot.send_message(
+                chat_id=target["chat_id"], text=full,
+                parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True,
+            )
+        except Exception as e:
+            # ИИ мог выдать невалидную Markdown-разметку — отправляем без разметки
+            logger.warning("[GROUP-PUB] user=%s: markdown упал (%s), шлю без разметки", user_id, e)
+            await bot.send_message(
+                chat_id=target["chat_id"], text=full,
+                disable_web_page_preview=True,
+            )
+        await status.edit_text(
+            f"✅ Опубликовано в группе «{_md(target.get('title') or target['chat_id'])}».",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    except Exception as e:
+        logger.error("[GROUP-PUB] user=%s исключение: %s", user_id, e, exc_info=True)
+        try:
+            await status.edit_text(f"❌ Ошибка публикации: {e}")
+        except Exception:
+            pass
+
+
+@dp.my_chat_member()
+async def on_my_chat_member(update: ChatMemberUpdated):
+    """Запоминает группу, где бота сделали администратором (для кнопки
+       «📢 Опубликовать в группе»). При исключении/снятии прав — удаляет."""
+    try:
+        chat = update.chat
+        if chat.type not in ("group", "supergroup"):
+            return
+        new_status = update.new_chat_member.status
+        actor_id = update.from_user.id if update.from_user else 0
+        if not actor_id:
+            return
+        if new_status == "administrator":
+            title = chat.title or f"группа {chat.id}"
+            save_group_target(actor_id, chat.id, title)
+            logger.info("[GROUP-TARGET] user=%s: бот стал администратором в «%s» (%s)",
+                        actor_id, title, chat.id)
+            try:
+                await bot.send_message(
+                    chat_id=actor_id,
+                    text=f"✅ Бот назначен администратором группы «{title}».\n"
+                         f"Теперь протоколы можно публиковать туда кнопкой «📢 Опубликовать в группе».",
+                )
+            except Exception as e:
+                logger.warning("[GROUP-TARGET] не удалось уведомить user=%s: %s", actor_id, e)
+        elif new_status in ("kicked", "left", "member", "restricted"):
+            remove_group_target(actor_id)
+            logger.info("[GROUP-TARGET] user=%s: бот больше не администратор группы %s (%s)",
+                        actor_id, chat.id, new_status)
+    except Exception as e:
+        logger.error("[GROUP-TARGET] Ошибка обработки my_chat_member: %s", e, exc_info=True)
 
 
 # ── Кнопка «📌 Кратко» ────────────────────────────────────────
