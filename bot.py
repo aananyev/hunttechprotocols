@@ -1578,12 +1578,64 @@ def _find_trash_folder(server) -> str:
     return "Trash"
 
 
-def _move_email_to_trash(user_id: int, imap_msg_id: str) -> bool:
-    """Перемещает письмо (по seq-номеру IMAP) в корзину почтового ящика.
-       Сначала пробует UID MOVE (RFC 6851), при неудаче — COPY + \Deleted + EXPUNGE."""
+def _fetch_email_brief_from_server(server, imap_msg_id: str) -> str:
+    """Краткое описание письма «тема» от отправителя (для сообщений бота).
+
+    Читает только заголовки (BODY.PEEK) — письмо не помечается прочитанным.
+    При ошибке возвращает imap_msg_id, чтобы сообщение бота не падало.
+    """
+    try:
+        typ_h, hdr_data = server.fetch(
+            str(imap_msg_id), "(BODY.PEEK[HEADER.FIELDS (SUBJECT FROM)])"
+        )
+        if typ_h == "OK" and hdr_data and hdr_data[0]:
+            raw_hdr = hdr_data[0][1] if isinstance(hdr_data[0], (tuple, list)) and len(hdr_data[0]) > 1 else b""
+            msg = email.message_from_bytes(raw_hdr)
+            subject = decode_mime_header(msg.get("Subject", "")).strip()
+            frm = decode_mime_header(msg.get("From", "")).strip()
+            parts = []
+            if subject:
+                parts.append(f"«{subject}»")
+            if frm:
+                parts.append(f"от {frm}")
+            if parts:
+                return " ".join(parts)
+    except Exception as e:
+        logger.error("[TRASH] Не удалось прочитать тему письма %s: %s", imap_msg_id, e)
+    return imap_msg_id
+
+
+def _fetch_email_brief(user_id: int, imap_msg_id: str) -> str:
+    """Открывает INBOX и возвращает краткое описание письма
+    («тема» от отправителя) — для сообщений бота."""
     config = get_user_config(user_id)
     if _email_config_error(config):
-        return False
+        return imap_msg_id
+    assert config is not None
+    try:
+        server = _connect_imap(config)
+        try:
+            typ, _ = server.select("INBOX")
+            if typ != "OK":
+                return imap_msg_id
+            return _fetch_email_brief_from_server(server, imap_msg_id)
+        finally:
+            server.close()
+            server.logout()
+    except Exception as e:
+        logger.error("[TRASH] Не удалось получить описание письма %s: %s", imap_msg_id, e)
+        return imap_msg_id
+
+
+def _move_email_to_trash(user_id: int, imap_msg_id: str) -> tuple[bool, str]:
+    r"""Перемещает письмо (по seq-номеру IMAP) в корзину почтового ящика.
+       Сначала пробует UID MOVE (RFC 6851), при неудаче — COPY + \Deleted + EXPUNGE.
+
+       Возвращает (ok, brief), где brief — «тема» от отправителя (или imap_msg_id),
+       чтобы бот мог написать, какое именно письмо переместил/не переместил."""
+    config = get_user_config(user_id)
+    if _email_config_error(config):
+        return False, imap_msg_id
     assert config is not None
     try:
         server = _connect_imap(config)
@@ -1591,11 +1643,14 @@ def _move_email_to_trash(user_id: int, imap_msg_id: str) -> bool:
             typ, _ = server.select("INBOX")
             if typ != "OK":
                 logger.error("Не удалось выбрать INBOX (user=%s)", user_id)
-                return False
+                return False, imap_msg_id
+            # Описание письма читаем ДО перемещения (после MOVE/EXPUNGE
+            # письма в INBOX уже не будет).
+            brief = _fetch_email_brief_from_server(server, imap_msg_id)
             trash = _find_trash_folder(server)
             if not trash:
                 logger.error("Папка корзины не найдена (user=%s)", user_id)
-                return False
+                return False, brief
             logger.info("[TRASH] user=%s: перемещаю письмо %s → %s", user_id, imap_msg_id, trash)
 
             # 1) Пробуем UID MOVE (RFC 6851) — надёжно, без EXPUNGE
@@ -1610,7 +1665,7 @@ def _move_email_to_trash(user_id: int, imap_msg_id: str) -> bool:
                 typ_m, _ = server.uid("MOVE", uid, trash)
                 if typ_m == "OK":
                     logger.info("[TRASH] user=%s: UID MOVE ok (письмо %s → %s)", user_id, imap_msg_id, trash)
-                    return True
+                    return True, brief
                 logger.warning("[TRASH] user=%s: UID MOVE не удался (%s), fallback COPY+DELETE", user_id, typ_m)
 
             # 2) Fallback: COPY + \Deleted + EXPUNGE
@@ -1618,17 +1673,17 @@ def _move_email_to_trash(user_id: int, imap_msg_id: str) -> bool:
             if typ_c != "OK":
                 logger.error("[TRASH] user=%s: COPY письма %s в %s не удался (%s)",
                              user_id, imap_msg_id, trash, typ_c)
-                return False
+                return False, brief
             server.store(str(imap_msg_id), "+FLAGS", "\\Deleted")
             server.expunge()
             logger.info("[TRASH] user=%s: письмо %s перемещено в %s (COPY+EXPUNGE)", user_id, imap_msg_id, trash)
-            return True
+            return True, brief
         finally:
             server.close()
             server.logout()
     except Exception as e:
         logger.error("[TRASH] Исключение для user %s, письмо %s: %s", user_id, imap_msg_id, e, exc_info=True)
-        return False
+        return False, imap_msg_id
 
 
 async def _ask_trash_after_publish(callback: CallbackQuery, user_id: int, item) -> None:
@@ -1643,9 +1698,17 @@ async def _ask_trash_after_publish(callback: CallbackQuery, user_id: int, item) 
         InlineKeyboardButton(text="🗑 Да, в корзину", callback_data=f"trash_yes:{imap_id}"),
         InlineKeyboardButton(text="Нет, оставить", callback_data=f"trash_no:{imap_id}"),
     ]])
+    # Бизнес-правило (владелец, 08.2026): в вопросе о корзине пишем,
+    # КАКОЕ письмо можно удалить (тема + отправитель).
+    subject = item[1] if len(item) > 1 else ""
+    frm = item[4] if len(item) > 4 else ""
+    brief = " ".join(
+        p for p in (f"«{subject}»" if subject else "", f"от {frm}" if frm else "") if p
+    ) or imap_id
     await callback.message.answer(
-        "📬 Письмо помечено прочитанным.\n\n"
-        "Переместить это письмо в корзину почтового ящика?",
+        f"📬 Письмо помечено прочитанным.\n\n"
+        f"🗑 Можно удалить письмо: {brief}.\n\n"
+        f"Переместить его в корзину почтового ящика?",
         reply_markup=kb,
     )
 
@@ -2937,19 +3000,23 @@ async def trash_callback(callback: CallbackQuery, state: FSMContext):
     if callback.data.startswith("trash_yes:"):
         logger.info("[TRASH-BTN] user=%s: пользователь согласился переместить письмо %s в корзину",
                     user_id, imap_id)
-        ok = await asyncio.to_thread(_move_email_to_trash, user_id, imap_id)
+        ok, brief = await asyncio.to_thread(_move_email_to_trash, user_id, imap_id)
         if ok:
             await callback.answer("🗑 Перемещено в корзину.")
-            await callback.message.answer("🗑 Письмо перемещено в корзину почтового ящика.")
+            # Бизнес-правило (владелец, 08.2026): после удаления пишем,
+            # какое именно письмо удалили (тема + отправитель).
+            await callback.message.answer(f"🗑 Удалил письмо в корзину почтового ящика: {brief}.")
             # Письмо в корзине — запрос «Переместить в корзину?» и его кнопки
             # больше не нужны (бизнес-правило владельца, 08.2026).
             await _delete_trash_request(callback.message)
         else:
             await callback.answer("❌ Не удалось переместить письмо.", show_alert=True)
-            await callback.message.answer("❌ Не удалось переместить письмо в корзину.")
+            await callback.message.answer(f"❌ Не удалось переместить письмо в корзину: {brief}.")
     else:
         logger.info("[TRASH-BTN] user=%s: пользователь оставил письмо %s в папке", user_id, imap_id)
+        brief = await asyncio.to_thread(_fetch_email_brief, user_id, imap_id)
         await callback.answer("Оставляю письмо в папке.")
+        await callback.message.answer(f"📥 Оставил письмо в папке: {brief}.")
 
 
 # ── Кнопка «📄 Показать саммари» ─────────────────────────────

@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Быстрый тест _delete_trash_request: после перемещения письма в корзину
 сообщение-запрос («Переместить это письмо в корзину?») с кнопками удаляется;
-при ошибке удаления бот не падает."""
+при ошибке удаления бот не падает. Плюс _fetch_email_brief_from_server:
+краткое описание письма («тема» от отправителя) для сообщений бота."""
 import asyncio
+import base64
 import os
 import sys
 from pathlib import Path
@@ -39,6 +41,23 @@ class FakeMessage:
         self.deleted = True
 
 
+class FakeServer:
+    """Имитирует imaplib: fetch возвращает (typ, [(метаданные, заголовки)]).."""
+
+    def __init__(self, hdr=b"", fail=False):
+        self.hdr = hdr
+        self.fail = fail
+
+    def fetch(self, msg_id, what):
+        if self.fail:
+            raise RuntimeError("boom")
+        return "OK", [(b"1 (BODY[HEADER.FIELDS (SUBJECT FROM)] {100}", self.hdr)]
+
+
+def mime_word(text):
+    return f"=?UTF-8?B?{base64.b64encode(text.encode()).decode()}?="
+
+
 async def main():
     # 1. Обычный случай: запрос удалён, возвращает True
     m = FakeMessage()
@@ -51,6 +70,23 @@ async def main():
     ok = await bot._delete_trash_request(m)
     check("2.1 не падает при ошибке", True)
     check("2.2 возвращает False", ok is False)
+
+    # 3. Описание письма из заголовков (тема + отправитель)
+    hdr = (
+        f"Subject: {mime_word('Конспект встречи: Планёрка')}\r\n"
+        f"From: {mime_word('Александр')} <a@hunttech.ru>\r\n\r\n"
+    ).encode()
+    brief = bot._fetch_email_brief_from_server(FakeServer(hdr), "42")
+    check("3.1 тема письма в описании", "«Конспект встречи: Планёрка»" in brief, brief)
+    check("3.2 отправитель в описании", "от Александр <a@hunttech.ru>" in brief, brief)
+
+    # 4. Пустые заголовки — фолбэк на imap_msg_id
+    brief = bot._fetch_email_brief_from_server(FakeServer(b""), "42")
+    check("4.1 пустые заголовки → imap_msg_id", brief == "42", brief)
+
+    # 5. Ошибка IMAP — фолбэк на imap_msg_id, не падаем
+    brief = bot._fetch_email_brief_from_server(FakeServer(fail=True), "42")
+    check("5.1 ошибка IMAP → imap_msg_id", brief == "42", brief)
 
     print(f"\nИтог: {pass_count} passed, {fail_count} failed")
     sys.exit(1 if fail_count else 0)
