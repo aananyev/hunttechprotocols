@@ -2518,6 +2518,36 @@ def _get_item_button(idx: int, display: str, user_id: int | None = None,
         ])
 
 
+async def _remove_wiki_proc_button(message) -> None:
+    """После успешного прохождения сценария «Расшифровать и разместить
+    в wiki» убирает эту кнопку у ТОГО сообщения, с которого она нажата.
+
+    Остальные кнопки сообщения («📌 Кратко», «🟡 Выбрать промпт») и
+    кнопки у других сообщений (другие конспекты списка, уведомления)
+    не трогаем — бизнес-правило владельца (08.2026).
+    """
+    try:
+        markup = message.reply_markup
+        if not markup or not markup.inline_keyboard:
+            return
+        had_wiki = any(
+            (b.callback_data or "").startswith("wiki_proc:")
+            for row in markup.inline_keyboard for b in row
+        )
+        if not had_wiki:
+            return
+        rows = [
+            [b for b in row if not (b.callback_data or "").startswith("wiki_proc:")]
+            for row in markup.inline_keyboard
+        ]
+        rows = [row for row in rows if row]
+        kb = InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
+        await message.edit_reply_markup(reply_markup=kb)
+        logger.info("[WIKI-BTN] кнопка «Расшифровать в wiki» убрана у сообщения")
+    except Exception as e:
+        logger.warning("[WIKI-BTN] не удалось убрать кнопку у сообщения: %s", e)
+
+
 # ── Callback-хендлер для кнопки Саммари ─────────────────────
 
 @dp.callback_query(lambda c: c.data and c.data.startswith("summary:"))
@@ -2703,6 +2733,9 @@ async def wiki_proc_callback(callback: CallbackQuery, state: FSMContext):
             kb = _after_publish_keyboard(key)
             await status_msg.edit_text(final, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
             await _ask_trash_after_publish(callback, user_id, item)
+            # Сценарий прошёл без ошибок — убираем кнопку у ЭТОГО сообщения
+            # (у других сообщений кнопка остаётся).
+            await _remove_wiki_proc_button(callback.message)
         else:
             await status_msg.edit_text(final, parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
