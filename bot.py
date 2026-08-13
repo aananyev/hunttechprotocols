@@ -578,6 +578,20 @@ def _filter_and_extract(server, msg_ids: list[bytes]) -> list[tuple]:
     matched: list[tuple] = []
 
     for msg_id in msg_ids:
+        # Быстрый предфильтр по теме: сначала тянем только заголовок,
+        # полное тело (с вложениями) — лишь для подходящих писем.
+        # Без этого при сотнях непрочитанных писем каждая проверка
+        # выкачивает весь ящик и надолго блокирует event loop бота.
+        try:
+            typ_h, hdr_data = server.fetch(msg_id, "(BODY.PEEK[HEADER.FIELDS (SUBJECT)])")
+            if typ_h == "OK" and hdr_data and hdr_data[0]:
+                raw_hdr = hdr_data[0][1] if isinstance(hdr_data[0], (tuple, list)) and len(hdr_data[0]) > 1 else b""
+                subject_hdr = decode_mime_header(email.message_from_bytes(raw_hdr).get("Subject", ""))
+                if subject_hdr and not subject_hdr.lower().startswith(SUBJECT_FILTER.lower()):
+                    continue  # тема не подходит — полное тело не тянем
+        except Exception:
+            pass  # заголовок не получить — пробуем полное тело ниже (старое поведение)
+
         # BODY.PEEK[] — единственный правильный способ читать письмо
         # не снимая флаг UNSEEN.
         typ, msg_data = server.fetch(msg_id, "(BODY.PEEK[])")
@@ -1624,7 +1638,7 @@ async def _ask_trash_after_publish(callback: CallbackQuery, user_id: int, item) 
     if not imap_id:
         logger.info("[TRASH] user=%s: imap_id отсутствует — пометка/корзина пропущены", user_id)
         return
-    _set_email_read(user_id, imap_id)
+    await asyncio.to_thread(_set_email_read, user_id, imap_id)
     kb = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="🗑 Да, в корзину", callback_data=f"trash_yes:{imap_id}"),
         InlineKeyboardButton(text="Нет, оставить", callback_data=f"trash_no:{imap_id}"),
@@ -2872,7 +2886,7 @@ async def trash_callback(callback: CallbackQuery, state: FSMContext):
     if callback.data.startswith("trash_yes:"):
         logger.info("[TRASH-BTN] user=%s: пользователь согласился переместить письмо %s в корзину",
                     user_id, imap_id)
-        ok = _move_email_to_trash(user_id, imap_id)
+        ok = await asyncio.to_thread(_move_email_to_trash, user_id, imap_id)
         if ok:
             await callback.answer("🗑 Перемещено в корзину.")
             await callback.message.answer("🗑 Письмо перемещено в корзину почтового ящика.")
@@ -4710,7 +4724,7 @@ async def cmd_get_notes(message: Message):
     sent = await message.answer("🔍 Ищу новые конспекты...")
 
     try:
-        header, items = fetch_notes(user.id)
+        header, items = await asyncio.to_thread(fetch_notes, user.id)
     except imaplib.IMAP4.error as e:
         await sent.edit_text(f"❌ Ошибка IMAP: `{e}`")
         return
@@ -7327,7 +7341,7 @@ async def main():
                         if not config.get("email") or not config.get("password"):
                             continue
 
-                        header, items = fetch_new_notes(user_id)
+                        header, items = await asyncio.to_thread(fetch_new_notes, user_id)
                         if items:
                             # Фильтруем те, о которых уже уведомляли
                             notified = _get_notified_comms_for_user(user_id)
