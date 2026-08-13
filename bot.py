@@ -1194,14 +1194,18 @@ async def process_conspect_to_wiki(user_id: int, item) -> tuple[bool, str]:
     if not folder:
         return False, f"⚠️ Для «{escape_md_simple(display)}» не задан подраздел Вики (проверьте wiki.routing)."
 
-    # 2) Промпт из Вики
+    # 2) Промпт из Вики: сначала из prompt_slug (корень раздела),
+    #    если там пусто — fallback на промпт внутри самого подраздела
     prompt_slug = wiki.get("prompt_slug") or ""
     if not prompt_slug:
         return False, "⚠️ Не задана страница промпта (wiki.prompt_slug)."
     page_content = await wiki_get_page_content(wiki, prompt_slug)
     prompt_text = wiki_extract_prompt(page_content)
     if not prompt_text:
-        return False, f"⚠️ Промпт не найден на странице {prompt_slug}."
+        page_content = await wiki_get_page_content(wiki, folder)
+        prompt_text = wiki_extract_prompt(page_content)
+    if not prompt_text:
+        return False, f"⚠️ Промпт не найден ни на {prompt_slug}, ни в подразделе {folder}."
 
     # 3) AI-обработка: промпт (system) + конспект (user)
     ai_text = (
