@@ -288,13 +288,16 @@ def get_ai_config(user_id: int) -> dict | None:
 # API endpoint: https://api.wiki.yandex.net/v1/
 
 
-def save_wiki_config(user_id: int, authorized_key: str, org_id: str = "", mode: str = "", folder: str = ""):
+def save_wiki_config(user_id: int, authorized_key: str, org_id: str = "", mode: str = "", folder: str = "", collab_id: str = "", oauth_token: str = ""):
     """Сохраняет настройки Яндекс Вики: авторизованный ключ сервисного аккаунта и ID организации.
        Бизнес-правило: authorized_key — это JSON с полями id, service_account_id, private_key.
        IAM-токен получается свежим через JWT при каждом запросе к Wiki API.
        org_id сохраняется только если передан непустой; если не передан — сохраняется старый.
        mode: 'auto' (автопубликация), 'button' (по кнопке), 'off' (выкл) — по умолчанию 'off'.
-       folder: slug раздела Wiki, куда публиковать страницы (например, 'hr_meetings')."""
+       folder: slug раздела Wiki, куда публиковать страницы (например, 'hr_meetings').
+       collab_id: ID организации Яндекс 360 для заголовка X-Collab-Org-Id (обязателен для API).
+       oauth_token: OAuth-токен пользователя (y0_...) — рабочий способ авторизации, если
+       сервисный аккаунт не привязан к организации Вики."""
     users = _load_users()
     key = str(user_id)
     if key not in users:
@@ -306,12 +309,13 @@ def save_wiki_config(user_id: int, authorized_key: str, org_id: str = "", mode: 
         "org_id": org_id or existing_org_id,
         "mode": mode or old_wiki.get("mode", "off"),
         "folder": folder or old_wiki.get("folder", ""),
+        "collab_id": collab_id or old_wiki.get("collab_id", ""),
+        "oauth_token": oauth_token or old_wiki.get("oauth_token", ""),
     }
     # Очищаем старые поля, если были
     users[key]["wiki"].pop("api_key", None)
     users[key]["wiki"].pop("client_id", None)
     users[key]["wiki"].pop("client_secret", None)
-    users[key]["wiki"].pop("oauth_token", None)
     _save_users(users)
 
 
@@ -362,9 +366,15 @@ def get_db_config(user_id: int) -> dict | None:
 
 async def _get_wiki_token(wiki_config: dict) -> str | None:
     """Получает токен для Wiki API из конфига.
-       Если есть authorized_key — создаёт JWT и получает IAM-токен.
-       Если есть client_id/client_secret (старый формат) — получает OAuth-токен (fallback).
+       Приоритет: oauth_token пользователя (y0_...) → authorized_key (JWT → IAM-токен)
+       → client_id/client_secret (устаревший OAuth-флоу, fallback).
        Возвращает токен (str) или None."""
+    # OAuth-токен пользователя — рабочий способ, когда сервисный аккаунт
+    # не привязан к организации Вики (hasCloudOrg=false)
+    oauth_token = wiki_config.get("oauth_token")
+    if oauth_token:
+        return oauth_token
+
     auth_key = wiki_config.get("authorized_key")
     if auth_key:
         # Пробуем распарсить как JSON и создать JWT
@@ -886,13 +896,16 @@ async def _test_wiki_connection(iam_token: str, org_id: str = "") -> str:
     Возвращает отформатированный отчёт с результатами проверки.
     Если проверка не удалась — возвращает строку с ❌.
     """
+    # OAuth-токен пользователя (y0_...) передаётся в формате OAuth,
+    # IAM-токен — в формате Bearer.
+    auth_scheme = "OAuth" if iam_token.startswith("y0_") else "Bearer"
     headers = {
-        "Authorization": f"Bearer {iam_token}",
+        "Authorization": f"{auth_scheme} {iam_token}",
         "Content-Type": "application/json",
     }
-    # Если указана организация — добавляем заголовок
+    # Если указан collab_id организации — добавляем заголовок (обязателен для API)
     if org_id:
-        headers["X-Org-ID"] = org_id
+        headers["X-Collab-Org-Id"] = org_id
 
     report_parts = []
     all_ok = True
@@ -979,6 +992,29 @@ async def _test_wiki_connection(iam_token: str, org_id: str = "") -> str:
     return title + "\n".join(report_parts)
 
 
+def _slugify(title: str, max_len: int = 60) -> str:
+    """Транслитерирует заголовок в slug для Яндекс Вики (латиница, дефисы)."""
+    translit = {
+        'а': 'a', 'б': 'b', 'в': 'v', 'г': 'g', 'д': 'd', 'е': 'e', 'ё': 'e',
+        'ж': 'zh', 'з': 'z', 'и': 'i', 'й': 'y', 'к': 'k', 'л': 'l', 'м': 'm',
+        'н': 'n', 'о': 'o', 'п': 'p', 'р': 'r', 'с': 's', 'т': 't', 'у': 'u',
+        'ф': 'f', 'х': 'h', 'ц': 'ts', 'ч': 'ch', 'ш': 'sh', 'щ': 'sch',
+        'ъ': '', 'ы': 'y', 'ь': '', 'э': 'e', 'ю': 'yu', 'я': 'ya',
+    }
+    out = []
+    for ch in title.lower():
+        if ch in translit:
+            out.append(translit[ch])
+        elif ch.isalnum():
+            out.append(ch)
+        elif out and out[-1] != '-':
+            out.append('-')
+    slug = ''.join(out).strip('-')
+    while '--' in slug:
+        slug = slug.replace('--', '-')
+    return slug[:max_len].strip('-') or f"page-{int(datetime.now().timestamp())}"
+
+
 async def publish_to_wiki(title: str, content: str, wiki_config: dict) -> tuple[bool, str]:
     """
     Публикует страницу в Яндекс Вики.
@@ -1001,24 +1037,32 @@ async def publish_to_wiki(title: str, content: str, wiki_config: dict) -> tuple[
     """
     token = await _get_wiki_token(wiki_config)
     if not token:
-        return False, "❌ Не удалось получить IAM-токен для Яндекс Вики."
+        return False, "❌ Не удалось получить токен для Яндекс Вики."
 
+    # OAuth-токен пользователя (y0_...) передаётся в формате OAuth,
+    # IAM-токен — в формате Bearer.
+    auth_scheme = "OAuth" if token.startswith("y0_") else "Bearer"
     headers = {
-        "Authorization": f"Bearer {token}",
+        "Authorization": f"{auth_scheme} {token}",
         "Content-Type": "application/json",
     }
-    org_id = wiki_config.get("org_id", "")
-    if org_id:
-        headers["X-Org-ID"] = org_id
+    # Для API обязателен заголовок X-Collab-Org-Id (ID организации Яндекс 360).
+    # org_id (dir_id) используется только в ссылке на страницу.
+    collab_id = wiki_config.get("collab_id", "")
+    if collab_id:
+        headers["X-Collab-Org-Id"] = collab_id
 
     payload = {
         "title": title,
+        "slug": f"{_slugify(title)}-{datetime.now().strftime('%Y%m%d-%H%M')}",
         "content": content,
     }
     # Если указана папка (slug родительского раздела) — добавляем parent
     folder = wiki_config.get("folder", "")
     if folder:
         payload["parent"] = folder
+    # org_id (dir_id) — для ссылки на страницу в браузере
+    org_id = wiki_config.get("org_id", "")
 
     try:
         async with httpx.AsyncClient(timeout=30) as client:
@@ -6162,6 +6206,36 @@ async def main():
                                         "Не удалось отправить уведомление user %s: %s",
                                         uid_str, e,
                                     )
+                            # ── Автопубликация в Яндекс Вики ──────────────
+                            # Бизнес-правило: если у пользователя настроена
+                            # интеграция (authorized_key) и режим 'auto' —
+                            # найденный конспект сразу загружается в корпоративную
+                            # Яндекс Вики, результат отправляется ПОД сообщением
+                            # о найденном конспекте.
+                            wiki_config = get_wiki_config(user_id)
+                            if wiki_config and wiki_config.get("authorized_key") and get_wiki_mode(user_id) == "auto":
+                                for item in new_notifications:
+                                    _dt, display, txt_content = item[0], item[1], item[2]
+                                    if not txt_content:
+                                        continue
+                                    try:
+                                        page_title = display
+                                        success, msg = await publish_to_wiki(page_title, txt_content, wiki_config)
+                                        await bot.send_message(
+                                            chat_id=user_id,
+                                            text=msg,
+                                            parse_mode=ParseMode.MARKDOWN,
+                                        )
+                                        if success:
+                                            logger.info(
+                                                "✅ Конспект «%s» опубликован в Wiki (user %s)",
+                                                page_title, uid_str,
+                                            )
+                                    except Exception as e:
+                                        logger.error(
+                                            "Ошибка автопубликации в Wiki (user %s): %s",
+                                            uid_str, e,
+                                        )
                             # Сохраняем в кеш для кнопки Саммари
                             notified_ids = [f"{item[0].timestamp()}:{item[1]}" for item in new_notifications]
                             _mark_notified(user_id, notified_ids)
