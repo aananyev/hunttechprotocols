@@ -1064,6 +1064,16 @@ def _slugify(title: str, max_len: int = 60) -> str:
     return slug[:max_len].strip('-') or f"page-{int(datetime.now().timestamp())}"
 
 
+def _wiki_page_url(wiki_config: dict, slug: str) -> str:
+    """Собирает ссылку на страницу Яндекс Вики (с orgId для браузера).
+       Единая точка — используется и при публикации, и в подтверждениях."""
+    url = f"https://wiki.yandex.ru/{slug}"
+    org_id = (wiki_config or {}).get("org_id", "")
+    if org_id:
+        url += f"?orgId={org_id}"
+    return url
+
+
 async def publish_to_wiki(title: str, content: str, wiki_config: dict, page_slug: str = "") -> tuple[bool, str]:
     """
     Публикует страницу в Яндекс Вики.
@@ -1137,9 +1147,7 @@ async def publish_to_wiki(title: str, content: str, wiki_config: dict, page_slug
             if resp.status_code in (200, 201):
                 data = resp.json()
                 page_slug = data.get("slug", "?")
-                page_url = f"https://wiki.yandex.ru/{page_slug}"
-                if org_id:
-                    page_url += f"?orgId={org_id}"
+                page_url = _wiki_page_url(wiki_config, page_slug)
                 logger.info("[WIKI-PUB] Страница создана: id=%s slug=%s", data.get("id"), page_slug)
                 return True, f"✅ Страница опубликована: {page_url}"
             elif resp.status_code == 401:
@@ -1342,7 +1350,7 @@ class WikiProgress:
             logger.error("[PROGRESS] user=%s: не удалось обновить статус: %s", self.user_id, e)
 
 
-async def process_conspect_to_wiki(user_id: int, item, progress: WikiProgress | None = None) -> tuple[bool, str, str]:
+async def process_conspect_to_wiki(user_id: int, item, progress: WikiProgress | None = None) -> tuple[bool, str, str, str]:
     """Полный флоу обработки конспекта для Вики (вызывается по кнопке):
        1) классифицируем конспект по префиксу темы → подраздел (wiki.routing);
        2) строим путь: {подраздел}/Конспекты/{год}/{месяц} и {подраздел}/Протоколы/{год}/{месяц};
@@ -1351,18 +1359,19 @@ async def process_conspect_to_wiki(user_id: int, item, progress: WikiProgress | 
        5) расшифровываем конспект через нейросеть (call_ai);
        6) размещаем протокол в папке протоколов.
        Страницы именуются «{год}.{месяц}.{день}».
-       Возвращает (ok: bool, сообщение для пользователя, текст саммари)."""
+       Возвращает (ok: bool, сообщение для пользователя, текст саммари,
+       ссылка на протокол в Вики)."""
     dt, display, txt_content = item[0], item[1], item[2]
     logger.info("[WIKI-FLOW] user=%s начал обработку: display=%r dt=%s txt_len=%d",
                 user_id, display[:80], dt, len(txt_content or ""))
     if not txt_content:
         logger.warning("[WIKI-FLOW] user=%s: пустой txt в конспекте %r", user_id, display[:80])
-        return False, "❌ В письме не найден текст конспекта (txt-вложение).", ""
+        return False, "❌ В письме не найден текст конспекта (txt-вложение).", "", ""
 
     wiki = get_wiki_config(user_id)
     if not wiki or not wiki.get("oauth_token"):
         logger.warning("[WIKI-FLOW] user=%s: вики не настроена (oauth_token отсутствует)", user_id)
-        return False, "❌ Яндекс Вики не настроена.", ""
+        return False, "❌ Яндекс Вики не настроена.", "", ""
 
     # 1) Подраздел (классификация по префиксу темы)
     if progress:
@@ -1371,7 +1380,7 @@ async def process_conspect_to_wiki(user_id: int, item, progress: WikiProgress | 
     if not folder:
         if progress:
             await progress.fail()
-        return False, f"⚠️ Для «{_md(display)}» не задан подраздел Вики (проверьте wiki.routing).", ""
+        return False, f"⚠️ Для «{_md(display)}» не задан подраздел Вики (проверьте wiki.routing).", "", ""
     if progress:
         await progress.done()
 
@@ -1400,7 +1409,7 @@ async def process_conspect_to_wiki(user_id: int, item, progress: WikiProgress | 
             logger.error("[WIKI-FLOW] user=%s: не удалось создать папку %s", user_id, dir_path)
             if progress:
                 await progress.fail()
-            return False, f"❌ Не удалось создать папку {dir_path} в Вики.", ""
+            return False, f"❌ Не удалось создать папку {dir_path} в Вики.", "", ""
     if progress:
         await progress.done()
 
@@ -1409,7 +1418,7 @@ async def process_conspect_to_wiki(user_id: int, item, progress: WikiProgress | 
         await progress.start("Сохранение оригинала конспекта")
     conspect_slug = f"{conspects_dir}/{page_name}"
     if await wiki_page_exists(wiki, conspect_slug):
-        ok1, msg1 = True, "✅ Конспект уже был сохранён ранее"
+        ok1, msg1 = True, f"✅ Конспект уже был сохранён ранее: {_wiki_page_url(wiki, conspect_slug)}"
         logger.info("[WIKI-FLOW] user=%s: конспект уже существует: %s", user_id, conspect_slug)
     else:
         logger.info("[WIKI-FLOW] user=%s: сохраняю оригинал конспекта → %s", user_id, conspect_slug)
@@ -1417,7 +1426,7 @@ async def process_conspect_to_wiki(user_id: int, item, progress: WikiProgress | 
     if not ok1:
         if progress:
             await progress.fail()
-        return False, msg1, ""
+        return False, msg1, "", ""
     if progress:
         await progress.done()
 
@@ -1435,7 +1444,7 @@ async def process_conspect_to_wiki(user_id: int, item, progress: WikiProgress | 
         logger.error("[WIKI-FLOW] user=%s: промпт не найден (folder=%s prompt_slug=%r)", user_id, folder, prompt_slug)
         if progress:
             await progress.fail()
-        return False, f"⚠️ Промпт не найден в папке {folder}.", ""
+        return False, f"⚠️ Промпт не найден в папке {folder}.", "", ""
     if progress:
         await progress.done()
     logger.info("[WIKI-FLOW] user=%s: промпт получен (%d символов), запускаю AI...", user_id, len(prompt_text))
@@ -1456,7 +1465,7 @@ async def process_conspect_to_wiki(user_id: int, item, progress: WikiProgress | 
         logger.error("[WIKI-FLOW] user=%s: AI не вернул протокол: %r", user_id, (result or "")[:200])
         if progress:
             await progress.fail()
-        return False, result or "❌ Нейросеть не вернула протокол.", ""
+        return False, result or "❌ Нейросеть не вернула протокол.", "", ""
     if progress:
         await progress.done()
 
@@ -1465,7 +1474,7 @@ async def process_conspect_to_wiki(user_id: int, item, progress: WikiProgress | 
         await progress.start("Публикация протокола в Вики")
     protocol_slug = f"{protocols_dir}/{page_name}"
     if await wiki_page_exists(wiki, protocol_slug):
-        ok2, msg2 = True, "✅ Протокол уже был размещён ранее"
+        ok2, msg2 = True, f"✅ Протокол уже был размещён ранее: {_wiki_page_url(wiki, protocol_slug)}"
         logger.info("[WIKI-FLOW] user=%s: протокол уже существует: %s", user_id, protocol_slug)
     else:
         logger.info("[WIKI-FLOW] user=%s: публикую протокол → %s", user_id, protocol_slug)
@@ -1473,7 +1482,7 @@ async def process_conspect_to_wiki(user_id: int, item, progress: WikiProgress | 
     if not ok2:
         if progress:
             await progress.fail()
-        return False, msg2, ""
+        return False, msg2, "", ""
     if progress:
         await progress.done()
 
@@ -1491,7 +1500,7 @@ async def process_conspect_to_wiki(user_id: int, item, progress: WikiProgress | 
                      _label_published("Конспект", msg1),
                      _label_published("Протокол", msg2),
                      "", f"🗂 {page_name}"]
-    return True, "\n".join(summary_parts), result
+    return True, "\n".join(summary_parts), result, _wiki_page_url(wiki, protocol_slug)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -2671,12 +2680,12 @@ async def wiki_proc_callback(callback: CallbackQuery, state: FSMContext):
     )
     try:
         progress = WikiProgress(status_msg, user_id, item[1])
-        ok, msg, summary = await process_conspect_to_wiki(user_id, item, progress)
+        ok, msg, summary, protocol_url = await process_conspect_to_wiki(user_id, item, progress)
         logger.info("[WIKI-BTN] user=%s результат: ok=%s msg=%r", user_id, ok, (msg or "")[:150])
         final = f"{progress.render()}\n\n{msg}"
         if ok:
             key = _short_uid(f"{item[0].timestamp()}:{item[1]}")
-            _save_summary_cache(user_id, key, item[1], summary)
+            _save_summary_cache(user_id, key, item[1], summary, wiki_url=protocol_url)
             kb = _after_publish_keyboard(key)
             await status_msg.edit_text(final, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
             await _ask_trash_after_publish(callback, user_id, item)
@@ -2725,12 +2734,12 @@ async def wiki_process_callback(callback: CallbackQuery, state: FSMContext):
     )
     try:
         progress = WikiProgress(status_msg, user_id, display)
-        ok, msg, summary = await process_conspect_to_wiki(user_id, item, progress)
+        ok, msg, summary, protocol_url = await process_conspect_to_wiki(user_id, item, progress)
         final = f"{progress.render()}\n\n{msg}"
         if ok:
             _remove_wiki_pending(user_id, uid)
             logger.info("[WIKI-BTN] user=%s: конспект «%s» обработан в wiki", user_id, display[:70])
-            _save_summary_cache(user_id, uid, display, summary)
+            _save_summary_cache(user_id, uid, display, summary, wiki_url=protocol_url)
             kb = _after_publish_keyboard(uid)
             await status_msg.edit_text(final, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
             await _ask_trash_after_publish(callback, user_id, item)
@@ -2835,11 +2844,11 @@ async def publish_wiki_callback(callback: CallbackQuery, state: FSMContext):
     )
     try:
         progress = WikiProgress(status_msg, user_id, item[1])
-        ok, msg, summary = await process_conspect_to_wiki(user_id, item, progress)
+        ok, msg, summary, protocol_url = await process_conspect_to_wiki(user_id, item, progress)
         final = f"{progress.render()}\n\n{msg}"
         if ok:
             key = _short_uid(f"{item[0].timestamp()}:{item[1]}")
-            _save_summary_cache(user_id, key, item[1], summary)
+            _save_summary_cache(user_id, key, item[1], summary, wiki_url=protocol_url)
             kb = _after_publish_keyboard(key)
             await status_msg.edit_text(final, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
             await _ask_trash_after_publish(callback, user_id, item)
@@ -2962,6 +2971,9 @@ async def publish_group_callback(callback: CallbackQuery, state: FSMContext):
             return
         header = f"📋 {_md(display)}\n\n"
         full = header + digest
+        wiki_url = entry.get("wiki_url", "")
+        if wiki_url:
+            full += f"\n\n🔗 Полный протокол: {wiki_url}"
         try:
             await bot.send_message(
                 chat_id=target["chat_id"], text=full,
@@ -6393,8 +6405,9 @@ def _remove_wiki_pending(user_id: int, uid: str) -> None:
 # его в кэш и показываем только по нажатию кнопки.
 
 
-def _save_summary_cache(user_id: int, uid: str, display: str, summary: str) -> None:
-    """Сохраняет текст саммари в кэш (последние 20 на пользователя)."""
+def _save_summary_cache(user_id: int, uid: str, display: str, summary: str, wiki_url: str = "") -> None:
+    """Сохраняет текст саммари в кэш (последние 20 на пользователя).
+       wiki_url — ссылка на протокол в Вики (для кнопки «📢 Опубликовать в группе»)."""
     cache = {}
     if SUMMARY_CACHE_FILE.exists():
         try:
@@ -6402,7 +6415,7 @@ def _save_summary_cache(user_id: int, uid: str, display: str, summary: str) -> N
         except Exception:
             cache = {}
     per_user = cache.setdefault(str(user_id), {})
-    per_user[uid] = {"display": display, "summary": summary, "ts": time.time()}
+    per_user[uid] = {"display": display, "summary": summary, "wiki_url": wiki_url, "ts": time.time()}
     while len(per_user) > 20:
         oldest = min(per_user, key=lambda k: per_user[k].get("ts", 0))
         del per_user[oldest]
