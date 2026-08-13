@@ -12,6 +12,7 @@
 """
 
 import asyncio
+import hashlib
 import imaplib
 import email
 import logging
@@ -1219,6 +1220,13 @@ def _month_name(month: int) -> str:
     return ""
 
 
+def _short_uid(uid: str) -> str:
+    """Короткий ключ (16 hex) для callback_data.
+       ВАЖНО: Telegram ограничивает callback_data 64 байтами — полный
+       uid с кириллическим display не помещается (BUTTON_DATA_INVALID)."""
+    return hashlib.md5(uid.encode("utf-8")).hexdigest()[:16]
+
+
 async def wiki_page_exists(wiki_config: dict, slug: str) -> bool:
     """Проверяет, существует ли страница Вики с данным slug."""
     token = await _get_wiki_token(wiki_config)
@@ -1257,7 +1265,47 @@ async def _ensure_wiki_folder(wiki_config: dict, slug: str, title: str) -> bool:
     return ok
 
 
-async def process_conspect_to_wiki(user_id: int, item) -> tuple[bool, str, str]:
+class WikiProgress:
+    """Живой список действий при расшифровке: ⏳ текущий → ✅ выполнен / ❌ ошибка."""
+
+    def __init__(self, status_msg, user_id: int):
+        self.status_msg = status_msg
+        self.user_id = user_id
+        self.steps: list[tuple[str, str]] = []  # (label, running|done|error)
+
+    async def start(self, label: str) -> None:
+        self.steps.append((label, "running"))
+        await self._flush()
+
+    async def done(self) -> None:
+        if self.steps:
+            self.steps[-1] = (self.steps[-1][0], "done")
+        await self._flush()
+
+    async def fail(self) -> None:
+        if self.steps:
+            self.steps[-1] = (self.steps[-1][0], "error")
+        await self._flush()
+
+    def render(self) -> str:
+        lines = ["⚙️ **Обработка конспекта:**", ""]
+        for label, status in self.steps:
+            if status == "done":
+                lines.append(f"✅ {label}")
+            elif status == "error":
+                lines.append(f"❌ {label}")
+            else:
+                lines.append(f"⏳ {label}…")
+        return "\n".join(lines)
+
+    async def _flush(self) -> None:
+        try:
+            await self.status_msg.edit_text(self.render(), parse_mode=ParseMode.MARKDOWN)
+        except Exception as e:
+            logger.error("[PROGRESS] user=%s: не удалось обновить статус: %s", self.user_id, e)
+
+
+async def process_conspect_to_wiki(user_id: int, item, progress: WikiProgress | None = None) -> tuple[bool, str, str]:
     """Полный флоу обработки конспекта для Вики (вызывается по кнопке):
        1) классифицируем конспект по префиксу темы → подраздел (wiki.routing);
        2) строим путь: {подраздел}/Конспекты/{год}/{месяц} и {подраздел}/Протоколы/{год}/{месяц};
@@ -1280,9 +1328,15 @@ async def process_conspect_to_wiki(user_id: int, item) -> tuple[bool, str, str]:
         return False, "❌ Яндекс Вики не настроена.", ""
 
     # 1) Подраздел (классификация по префиксу темы)
+    if progress:
+        await progress.start("Классификация конспекта по типу совещания")
     folder = wiki_route_section(user_id, display)
     if not folder:
+        if progress:
+            await progress.fail()
         return False, f"⚠️ Для «{_md(display)}» не задан подраздел Вики (проверьте wiki.routing).", ""
+    if progress:
+        await progress.done()
 
     # 2) Структура папок: {год} / {номер месяца название}
     year = dt.strftime("%Y")
@@ -1295,6 +1349,8 @@ async def process_conspect_to_wiki(user_id: int, item) -> tuple[bool, str, str]:
 
     # Материализуем папки: вики не создаёт промежуточные страницы
     # автоматически — без них год/месяц «пропадают» из дерева
+    if progress:
+        await progress.start("Создание папок года/месяца в Вики")
     for dir_path, dir_title in (
         (f"{folder}/Конспекты", "Конспекты"),
         (f"{folder}/Конспекты/{year}", year),
@@ -1305,9 +1361,15 @@ async def process_conspect_to_wiki(user_id: int, item) -> tuple[bool, str, str]:
     ):
         if not await _ensure_wiki_folder(wiki, dir_path, dir_title):
             logger.error("[WIKI-FLOW] user=%s: не удалось создать папку %s", user_id, dir_path)
+            if progress:
+                await progress.fail()
             return False, f"❌ Не удалось создать папку {dir_path} в Вики.", ""
+    if progress:
+        await progress.done()
 
     # 3) Оригинал конспекта — без изменений
+    if progress:
+        await progress.start("Сохранение оригинала конспекта")
     conspect_slug = f"{conspects_dir}/{page_name}"
     if await wiki_page_exists(wiki, conspect_slug):
         ok1, msg1 = True, "✅ Конспект уже был сохранён ранее"
@@ -1316,9 +1378,15 @@ async def process_conspect_to_wiki(user_id: int, item) -> tuple[bool, str, str]:
         logger.info("[WIKI-FLOW] user=%s: сохраняю оригинал конспекта → %s", user_id, conspect_slug)
         ok1, msg1 = await publish_to_wiki(page_name, txt_content, wiki, page_slug=conspect_slug)
     if not ok1:
+        if progress:
+            await progress.fail()
         return False, msg1, ""
+    if progress:
+        await progress.done()
 
     # 4) Промпт: корень подраздела → fallback на wiki.prompt_slug
+    if progress:
+        await progress.start("Чтение промпта из Вики")
     prompt_slug = wiki.get("prompt_slug") or ""
     page_content = await wiki_get_page_content(wiki, folder)
     prompt_text = wiki_extract_prompt(page_content)
@@ -1328,10 +1396,16 @@ async def process_conspect_to_wiki(user_id: int, item) -> tuple[bool, str, str]:
         prompt_text = wiki_extract_prompt(page_content)
     if not prompt_text:
         logger.error("[WIKI-FLOW] user=%s: промпт не найден (folder=%s prompt_slug=%r)", user_id, folder, prompt_slug)
+        if progress:
+            await progress.fail()
         return False, f"⚠️ Промпт не найден в папке {folder}.", ""
+    if progress:
+        await progress.done()
     logger.info("[WIKI-FLOW] user=%s: промпт получен (%d символов), запускаю AI...", user_id, len(prompt_text))
 
     # 5) AI-расшифровка по промпту
+    if progress:
+        await progress.start("AI-расшифровка по промпту")
     ai_text = (
         f"Конспект/стенограмма встречи «{display}» "
         f"от {dt.strftime('%d.%m.%Y')}:\n\n{txt_content}"
@@ -1343,9 +1417,15 @@ async def process_conspect_to_wiki(user_id: int, item) -> tuple[bool, str, str]:
                 user_id, ai_elapsed, len(result or ""), (result or "")[:60])
     if not result or result.startswith("❌"):
         logger.error("[WIKI-FLOW] user=%s: AI не вернул протокол: %r", user_id, (result or "")[:200])
+        if progress:
+            await progress.fail()
         return False, result or "❌ Нейросеть не вернула протокол.", ""
+    if progress:
+        await progress.done()
 
     # 6) Протокол — в папку протоколов
+    if progress:
+        await progress.start("Публикация протокола в Вики")
     protocol_slug = f"{protocols_dir}/{page_name}"
     if await wiki_page_exists(wiki, protocol_slug):
         ok2, msg2 = True, "✅ Протокол уже был размещён ранее"
@@ -1354,7 +1434,11 @@ async def process_conspect_to_wiki(user_id: int, item) -> tuple[bool, str, str]:
         logger.info("[WIKI-FLOW] user=%s: публикую протокол → %s", user_id, protocol_slug)
         ok2, msg2 = await publish_to_wiki(page_name, result, wiki, page_slug=protocol_slug)
     if not ok2:
+        if progress:
+            await progress.fail()
         return False, msg2, ""
+    if progress:
+        await progress.done()
 
     logger.info("[WIKI-FLOW] user=%s: УСПЕХ — конспект и протокол размещены (%s)", user_id, page_name)
     return True, (
@@ -2497,18 +2581,20 @@ async def wiki_proc_callback(callback: CallbackQuery, state: FSMContext):
         parse_mode=ParseMode.MARKDOWN,
     )
     try:
-        ok, msg, summary = await process_conspect_to_wiki(user_id, item)
+        progress = WikiProgress(status_msg, user_id)
+        ok, msg, summary = await process_conspect_to_wiki(user_id, item, progress)
         logger.info("[WIKI-BTN] user=%s результат: ok=%s msg=%r", user_id, ok, (msg or "")[:150])
+        final = f"{progress.render()}\n\n{msg}"
         if ok:
-            uid = f"{item[0].timestamp()}:{item[1]}"
-            _save_summary_cache(user_id, uid, item[1], summary)
+            key = _short_uid(f"{item[0].timestamp()}:{item[1]}")
+            _save_summary_cache(user_id, key, item[1], summary)
             kb = InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton(text="📄 Показать саммари", callback_data=f"show_summary:{uid}")
+                InlineKeyboardButton(text="📄 Показать саммари", callback_data=f"show_summary:{key}")
             ]])
-            await status_msg.edit_text(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+            await status_msg.edit_text(final, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
             await _ask_trash_after_publish(callback, user_id, item)
         else:
-            await status_msg.edit_text(msg, parse_mode=ParseMode.MARKDOWN)
+            await status_msg.edit_text(final, parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
         logger.error("[WIKI-BTN] user=%s исключение: %s", user_id, e, exc_info=True)
         try:
@@ -2551,7 +2637,9 @@ async def wiki_process_callback(callback: CallbackQuery, state: FSMContext):
         parse_mode=ParseMode.MARKDOWN,
     )
     try:
-        ok, msg, summary = await process_conspect_to_wiki(user_id, item)
+        progress = WikiProgress(status_msg, user_id)
+        ok, msg, summary = await process_conspect_to_wiki(user_id, item, progress)
+        final = f"{progress.render()}\n\n{msg}"
         if ok:
             _remove_wiki_pending(user_id, uid)
             logger.info("[WIKI-BTN] user=%s: конспект «%s» обработан в wiki", user_id, display[:70])
@@ -2559,11 +2647,11 @@ async def wiki_process_callback(callback: CallbackQuery, state: FSMContext):
             kb = InlineKeyboardMarkup(inline_keyboard=[[
                 InlineKeyboardButton(text="📄 Показать саммари", callback_data=f"show_summary:{uid}")
             ]])
-            await status_msg.edit_text(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+            await status_msg.edit_text(final, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
             await _ask_trash_after_publish(callback, user_id, item)
         else:
             logger.warning("[WIKI-BTN] user=%s: флоу вернул ошибку: %r", user_id, (msg or "")[:150])
-            await status_msg.edit_text(msg, parse_mode=ParseMode.MARKDOWN)
+            await status_msg.edit_text(final, parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
         logger.error("[WIKI-BTN] user=%s исключение: %s", user_id, e, exc_info=True)
         try:
@@ -2638,17 +2726,19 @@ async def publish_wiki_callback(callback: CallbackQuery, state: FSMContext):
         parse_mode=ParseMode.MARKDOWN,
     )
     try:
-        ok, msg, summary = await process_conspect_to_wiki(user_id, item)
+        progress = WikiProgress(status_msg, user_id)
+        ok, msg, summary = await process_conspect_to_wiki(user_id, item, progress)
+        final = f"{progress.render()}\n\n{msg}"
         if ok:
-            uid = f"{item[0].timestamp()}:{item[1]}"
-            _save_summary_cache(user_id, uid, item[1], summary)
+            key = _short_uid(f"{item[0].timestamp()}:{item[1]}")
+            _save_summary_cache(user_id, key, item[1], summary)
             kb = InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton(text="📄 Показать саммари", callback_data=f"show_summary:{uid}")
+                InlineKeyboardButton(text="📄 Показать саммари", callback_data=f"show_summary:{key}")
             ]])
-            await status_msg.edit_text(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+            await status_msg.edit_text(final, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
             await _ask_trash_after_publish(callback, user_id, item)
         else:
-            await status_msg.edit_text(msg, parse_mode=ParseMode.MARKDOWN)
+            await status_msg.edit_text(final, parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
         logger.error("Ошибка publish_wiki для user %s: %s", user_id, e, exc_info=True)
         try:
@@ -5819,17 +5909,18 @@ def _save_wiki_pending(user_id: int, item) -> None:
             cache = {}
     dt, display, txt = item[0], item[1], item[2]
     imap_id = item[5] if len(item) >= 6 else ""
-    uid = f"{dt.timestamp()}:{display}"
+    full_uid = f"{dt.timestamp()}:{display}"
+    key = _short_uid(full_uid)
     per_user = cache.setdefault(str(user_id), {})
-    per_user[uid] = {
+    per_user[key] = {
         "dt": dt.isoformat(),
         "display": display,
         "txt": txt,
         "imap_id": imap_id,
     }
     WIKI_PENDING_FILE.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
-    logger.info("[WIKI-PENDING] Сохранён конспект user=%s uid=%r (всего у пользователя: %d)",
-                user_id, uid[:60], len(per_user))
+    logger.info("[WIKI-PENDING] Сохранён конспект user=%s key=%r (всего у пользователя: %d)",
+                user_id, key, len(per_user))
 
 
 def _load_wiki_pending(user_id: int) -> dict:
@@ -6838,14 +6929,14 @@ async def main():
                                     wiki_config = get_wiki_config(user_id)
                                     reply_markup = None
                                     if wiki_config and wiki_config.get("oauth_token") and get_wiki_mode(user_id) != "off":
-                                        uid = f"{dt.timestamp()}:{display}"
+                                        key = _short_uid(f"{dt.timestamp()}:{display}")
                                         _save_wiki_pending(user_id, item)
-                                        logger.info("[NOTIFY] user=%s: кнопка wiki добавлена к уведомлению (uid=%r)",
-                                                    user_id, uid[:60])
+                                        logger.info("[NOTIFY] user=%s: кнопка wiki добавлена к уведомлению (key=%r)",
+                                                    user_id, key)
                                         reply_markup = InlineKeyboardMarkup(inline_keyboard=[[
                                             InlineKeyboardButton(
-                                                "📝 Расшифровать и разместить в wiki",
-                                                callback_data=f"wiki_process:{uid}",
+                                                text="📝 Расшифровать и разместить в wiki",
+                                                callback_data=f"wiki_process:{key}",
                                             )
                                         ]])
                                     await bot.send_message(
