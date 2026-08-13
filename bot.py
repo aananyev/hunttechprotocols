@@ -2137,19 +2137,35 @@ def _get_item_button(idx: int, display: str) -> InlineKeyboardMarkup | None:
             break
 
     if matched_prompt:
-        return InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(
-                text=f"🟢 Саммари #{idx}",
-                callback_data=f"summary:{idx}:{matched_prompt}"
-            )
-        ]])
+        return InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=f"🟢 Саммари #{idx}",
+                    callback_data=f"summary:{idx}:{matched_prompt}"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text=f"📝 Расшифровать и разместить в wiki #{idx}",
+                    callback_data=f"wiki_proc:{idx}"
+                )
+            ],
+        ])
     else:
-        return InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(
-                text=f"🟡 Выбрать промпт #{idx}",
-                callback_data=f"choose_prompt:{idx}"
-            )
-        ]])
+        return InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=f"🟡 Выбрать промпт #{idx}",
+                    callback_data=f"choose_prompt:{idx}"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text=f"📝 Расшифровать и разместить в wiki #{idx}",
+                    callback_data=f"wiki_proc:{idx}"
+                )
+            ],
+        ])
 
 
 # ── Callback-хендлер для кнопки Саммари ─────────────────────
@@ -2256,32 +2272,61 @@ async def summary_callback(callback: CallbackQuery, state: FSMContext):
         for i in range(0, len(result), 3500):
             await callback.message.answer(result[i:i + 3500])
 
-    # ── Авто-публикация в Wiki или кнопка ─────────────────────
+    # ── Кнопка «Расшифровать и разместить в wiki» ─────────────
     wiki_config = get_wiki_config(user_id)
-    if wiki_config and wiki_config.get("authorized_key"):
-        wiki_mode = get_wiki_mode(user_id)
-        if wiki_mode == "auto":
-            # Автоматическая публикация в Wiki
-            page_title = f"{prompt_topic} {datetime.now().strftime('%Y-%m-%d')}"
-            success, msg = await publish_to_wiki(page_title, result, wiki_config)
-            await callback.message.answer(msg, parse_mode=ParseMode.MARKDOWN)
-        elif wiki_mode == "button":
-            # Кнопка «Опубликовать в Wiki»
-            kb = InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton(
-                    text="📤 Опубликовать в Wiki",
-                    callback_data=f"publish_wiki:{idx_str}:{prompt_topic}"
-                )
-            ]])
-            await callback.message.answer(
-                "📚 Хотите опубликовать это саммари в Яндекс Вики?",
-                reply_markup=kb,
+    if wiki_config and wiki_config.get("oauth_token"):
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(
+                text=f"📝 Расшифровать и разместить в wiki #{idx}",
+                callback_data=f"wiki_proc:{idx}"
             )
+        ]])
+        await callback.message.answer(
+            "📚 Разместить конспект и саммари в Яндекс Вики?",
+            reply_markup=kb,
+        )
 
-    # ── Помечаем письмо прочитанным ───────────────────────────
-    # Если AI успешно сгенерировал саммари — письмо уходит из /list
-    if not result.startswith("❌") and imap_id:
-        _set_email_read(user_id, imap_id)
+    # Письмо НЕ помечаем прочитанным (бизнес-правило:
+    # «запрещается менять письма и помечать их как прочитанные»)
+
+
+# ── Callback-хендлер: «📝 Расшифровать и разместить в wiki» из списка ──
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("wiki_proc:"))
+async def wiki_proc_callback(callback: CallbackQuery, state: FSMContext):
+    """Кнопка «Расшифровать и разместить в wiki» под конспектом в /list:
+       полный флоу — классификация, оригинал в «Конспекты», промпт из Вики,
+       AI-расшифровка, протокол в «Протоколы»."""
+    await callback.answer()
+    user_id = callback.from_user.id
+    try:
+        idx = int(callback.data.split(":", 1)[1])
+    except ValueError:
+        await callback.message.answer("❌ Некорректные данные кнопки.")
+        return
+
+    items = _load_notes_cache(user_id)
+    if idx < 0 or idx >= len(items):
+        await callback.message.answer("❌ Конспект устарел. Запросите /list заново.")
+        return
+    item = items[idx]
+    if not item[2]:
+        await callback.message.answer("❌ В письме не найден текст конспекта (txt-вложение).")
+        return
+
+    status_msg = await callback.message.answer(
+        f"⏳ Расшифровываю «{escape_md_simple(item[1])}» и размещаю в wiki...",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    try:
+        ok, msg = await process_conspect_to_wiki(user_id, item)
+        await status_msg.edit_text(msg, parse_mode=ParseMode.MARKDOWN)
+    except Exception as e:
+        logger.error("Ошибка wiki_proc для user %s: %s", user_id, e)
+        try:
+            await status_msg.edit_text(f"❌ Ошибка: {e}")
+        except Exception:
+            pass
 
 
 @dp.callback_query(lambda c: c.data and c.data.startswith("wiki_process:"))
@@ -2362,101 +2407,44 @@ async def choose_prompt_callback(callback: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(lambda c: c.data and c.data.startswith("publish_wiki:"))
 async def publish_wiki_callback(callback: CallbackQuery, state: FSMContext):
-    """
-    Когда пользователь нажимает «📤 Опубликовать в Wiki»:
-    - Достаём саммари из кеша (повторно генерируем через AI)
-    - Публикуем в Яндекс Вики
-    - Показываем результат
-    
-    Формат callback_data: publish_wiki:IDX:PROMPT_TOPIC
-    """
+    """Кнопка «📤 Опубликовать в Wiki» (обратная совместимость).
+       Теперь ведёт на полный флоу process_conspect_to_wiki:
+       классификация → оригинал в «Конспекты» → промпт из Вики →
+       AI-расшифровка → протокол в «Протоколы»."""
     parts = callback.data.split(":", 2)
-    if len(parts) < 3:
+    if len(parts) < 2:
         await callback.answer("❌ Ошибка данных", show_alert=True)
         return
-    _, idx_str, prompt_topic = parts
-    idx = int(idx_str) - 1
+    try:
+        idx = int(parts[1]) - 1
+    except ValueError:
+        await callback.answer("❌ Ошибка данных", show_alert=True)
+        return
     await callback.answer()
 
     user_id = callback.from_user.id
-
-    # Проверяем настройки Wiki
-    wiki_config = get_wiki_config(user_id)
-    if not wiki_config or not wiki_config.get("authorized_key"):
-        await callback.message.answer(
-            "❌ **Яндекс Вики не настроен.**\n"
-            "Настройте через `/setup wiki`.",
-            parse_mode=ParseMode.MARKDOWN,
-        )
-        return
-
-    # Загружаем конспект и промпт из кеша
     items = _load_notes_cache(user_id)
     if idx < 0 or idx >= len(items):
         await callback.message.answer("❌ Конспект устарел. Запросите /list заново.")
         return
-
-    _dt, display, txt_content = items[idx]
-    imap_id = items[idx][5] if len(items[idx]) >= 6 else ""
-    prompts = _load_prompts()
-    prompt_text = prompts.get(prompt_topic, "")
-    if not prompt_text or not txt_content:
-        await callback.message.answer("❌ Данные конспекта или промпта не найдены.")
+    item = items[idx]
+    if not item[2]:
+        await callback.message.answer("❌ В письме не найден текст конспекта (txt-вложение).")
         return
 
-    # Повторно генерируем саммари (или можно было кешировать, но проще перегенерировать)
     status_msg = await callback.message.answer(
-        f"⏳ Генерирую саммари для «{escape_md_simple(display)}»...",
+        f"⏳ Расшифровываю «{escape_md_simple(item[1])}» и размещаю в wiki...",
         parse_mode=ParseMode.MARKDOWN,
     )
-
-    system_prompt = prompt_text
-    user_text = f"Конспект встречи: «{display}»\n\n{txt_content}"
-    result = await call_ai(user_id, system_prompt, user_text)
-
-    # ── Сохраняем в PostgreSQL ───────────────────────────────
-    if db.DB_POOL and not result.startswith("❌"):
-        ai_config = get_ai_config(user_id)
-        ai_model = (ai_config or {}).get("model", "unknown")
-        try:
-            meeting_id = await db.get_meeting_by_msg_id(prompt_topic)
-            if not meeting_id:
-                meeting_id = await db.save_meeting(
-                    f"manual:{prompt_topic}:{datetime.now().isoformat()}",
-                    user_id, "", f"{SUBJECT_FILTER}: {display}",
-                    datetime.now(), txt_content,
-                )
-            if meeting_id:
-                wiki_url = f"https://wiki.yandex.ru/?orgId={wiki_config.get('org_id', '')}" if wiki_config.get("org_id") else ""
-                await db.save_summary(
-                    meeting_id=meeting_id,
-                    user_id=user_id,
-                    prompt_topic=prompt_topic,
-                    ai_model=ai_model,
-                    summary_text=result,
-                    wiki_published=True,
-                    wiki_url=wiki_url,
-                )
-        except Exception as e:
-            logger.error("❌ Ошибка сохранения саммари (wiki) в БД: %s", e)
-
     try:
-        await status_msg.delete()
-    except Exception:
-        pass
-
-    if result.startswith("❌"):
-        await callback.message.answer(result)
-        return
-
-    # Публикуем в Wiki
-    page_title = f"{prompt_topic} {datetime.now().strftime('%Y-%m-%d')}"
-    success, msg = await publish_to_wiki(page_title, result, wiki_config)
-    await callback.message.answer(msg, parse_mode=ParseMode.MARKDOWN)
-
-    # Помечаем письмо прочитанным — саммари опубликовано в Wiki
-    if imap_id:
-        _set_email_read(user_id, imap_id)
+        ok, msg = await process_conspect_to_wiki(user_id, item)
+        await status_msg.edit_text(msg, parse_mode=ParseMode.MARKDOWN)
+    except Exception as e:
+        logger.error("Ошибка publish_wiki для user %s: %s", user_id, e)
+        try:
+            await status_msg.edit_text(f"❌ Ошибка: {e}")
+        except Exception:
+            pass
 
 
 # ═══════════════════════════════════════════════════════════════════
