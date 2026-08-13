@@ -1174,12 +1174,49 @@ def wiki_route_section(user_id: int, display: str) -> str:
     return ""
 
 
+_MONTHS_RU = [
+    "январь", "февраль", "март", "апрель", "май", "июнь",
+    "июль", "август", "сентябрь", "октябрь", "ноябрь", "декабрь",
+]
+
+
+def _month_name(month: int) -> str:
+    """Возвращает название месяца в именительном падеже (1..12)."""
+    if 1 <= month <= 12:
+        return _MONTHS_RU[month - 1]
+    return ""
+
+
+async def wiki_page_exists(wiki_config: dict, slug: str) -> bool:
+    """Проверяет, существует ли страница Вики с данным slug."""
+    token = await _get_wiki_token(wiki_config)
+    if not token:
+        return False
+    auth_scheme = "OAuth" if token.startswith("y0_") else "Bearer"
+    headers = {"Authorization": f"{auth_scheme} {token}", "Content-Type": "application/json"}
+    collab_id = wiki_config.get("collab_id", "")
+    if collab_id:
+        headers["X-Collab-Org-Id"] = collab_id
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            resp = await client.get(
+                f"{WIKI_API_BASE}/pages", headers=headers, params={"slug": slug},
+            )
+            return resp.status_code == 200
+    except Exception as e:
+        logger.error("Ошибка проверки страницы Вики %s: %s", slug, e)
+    return False
+
+
 async def process_conspect_to_wiki(user_id: int, item) -> tuple[bool, str]:
-    """Полный флоу обработки найденного конспекта для Вики:
-       1) определяем подраздел по префиксу темы (wiki.routing);
-       2) читаем промпт из страницы Вики (wiki.prompt_slug);
-       3) генерируем протокол через нейросеть (call_ai);
-       4) публикуем страницу протокола в подраздел.
+    """Полный флоу обработки конспекта для Вики (вызывается по кнопке):
+       1) классифицируем конспект по префиксу темы → подраздел (wiki.routing);
+       2) строим путь: {подраздел}/Конспекты/{год}/{месяц} и {подраздел}/Протоколы/{год}/{месяц};
+       3) сохраняем ОРИГИНАЛ конспекта без изменений в папку конспектов;
+       4) читаем промпт из корня подраздела (fallback: wiki.prompt_slug);
+       5) расшифровываем конспект через нейросеть (call_ai);
+       6) размещаем протокол в папке протоколов.
+       Страницы именуются «{год}.{месяц}.{день}».
        Возвращает (ok: bool, сообщение для пользователя)."""
     dt, display, txt_content = item[0], item[1], item[2]
     if not txt_content:
@@ -1189,25 +1226,38 @@ async def process_conspect_to_wiki(user_id: int, item) -> tuple[bool, str]:
     if not wiki or not wiki.get("oauth_token"):
         return False, "❌ Яндекс Вики не настроена."
 
-    # 1) Подраздел
+    # 1) Подраздел (классификация по префиксу темы)
     folder = wiki_route_section(user_id, display)
     if not folder:
         return False, f"⚠️ Для «{escape_md_simple(display)}» не задан подраздел Вики (проверьте wiki.routing)."
 
-    # 2) Промпт из Вики: сначала из prompt_slug (корень раздела),
-    #    если там пусто — fallback на промпт внутри самого подраздела
+    # 2) Структура папок: {год} / {номер месяца название}
+    year = dt.strftime("%Y")
+    month = f"{dt.strftime('%m')} {_month_name(dt.month)}"
+    page_name = dt.strftime("%Y.%m.%d")  # «2026.08.13»
+    conspects_dir = f"{folder}/Конспекты/{year}/{month}"
+    protocols_dir = f"{folder}/Протоколы/{year}/{month}"
+
+    # 3) Оригинал конспекта — без изменений
+    conspect_slug = f"{conspects_dir}/{page_name}"
+    if await wiki_page_exists(wiki, conspect_slug):
+        ok1, msg1 = True, "✅ Конспект уже был сохранён ранее"
+    else:
+        ok1, msg1 = await publish_to_wiki(page_name, txt_content, wiki, page_slug=conspect_slug)
+    if not ok1:
+        return False, msg1
+
+    # 4) Промпт: корень подраздела → fallback на wiki.prompt_slug
     prompt_slug = wiki.get("prompt_slug") or ""
-    if not prompt_slug:
-        return False, "⚠️ Не задана страница промпта (wiki.prompt_slug)."
-    page_content = await wiki_get_page_content(wiki, prompt_slug)
+    page_content = await wiki_get_page_content(wiki, folder)
     prompt_text = wiki_extract_prompt(page_content)
-    if not prompt_text:
-        page_content = await wiki_get_page_content(wiki, folder)
+    if not prompt_text and prompt_slug and prompt_slug != folder:
+        page_content = await wiki_get_page_content(wiki, prompt_slug)
         prompt_text = wiki_extract_prompt(page_content)
     if not prompt_text:
-        return False, f"⚠️ Промпт не найден ни на {prompt_slug}, ни в подразделе {folder}."
+        return False, f"⚠️ Промпт не найден в папке {folder}."
 
-    # 3) AI-обработка: промпт (system) + конспект (user)
+    # 5) AI-расшифровка по промпту
     ai_text = (
         f"Конспект/стенограмма встречи «{display}» "
         f"от {dt.strftime('%d.%m.%Y')}:\n\n{txt_content}"
@@ -1216,11 +1266,20 @@ async def process_conspect_to_wiki(user_id: int, item) -> tuple[bool, str]:
     if not result or result.startswith("❌"):
         return False, result or "❌ Нейросеть не вернула протокол."
 
-    # 4) Публикация протокола в подраздел
-    page_title = display
-    page_slug = f"{folder}/{_slugify(display)}-{dt.strftime('%Y%m%d-%H%M')}"
-    success, msg = await publish_to_wiki(page_title, result, wiki, page_slug=page_slug)
-    return success, msg
+    # 6) Протокол — в папку протоколов
+    protocol_slug = f"{protocols_dir}/{page_name}"
+    if await wiki_page_exists(wiki, protocol_slug):
+        ok2, msg2 = True, "✅ Протокол уже был размещён ранее"
+    else:
+        ok2, msg2 = await publish_to_wiki(page_name, result, wiki, page_slug=protocol_slug)
+    if not ok2:
+        return False, msg2
+
+    return True, (
+        f"📄 {escape_md_simple(display)}\n\n"
+        f"{msg1}\n{msg2}\n\n"
+        f"🗂 {page_name}"
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -2199,6 +2258,48 @@ async def summary_callback(callback: CallbackQuery, state: FSMContext):
     # Если AI успешно сгенерировал саммари — письмо уходит из /list
     if not result.startswith("❌") and imap_id:
         _set_email_read(user_id, imap_id)
+
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("wiki_process:"))
+async def wiki_process_callback(callback: CallbackQuery, state: FSMContext):
+    """
+    Кнопка «📝 Расшифровать и разместить в wiki» под уведомлением
+    о новом конспекте. Запускает полный флоу:
+    классификация → сохранение оригинала → промпт из Вики → AI → протокол.
+
+    Формат callback_data: wiki_process:{uid}
+    uid = "{dt.timestamp()}:{display}" — конспект берётся из wiki_pending.json.
+    """
+    await callback.answer()
+    user_id = callback.from_user.id
+    parts = callback.data.split(":", 1)
+    uid = parts[1] if len(parts) > 1 else ""
+
+    pending = _load_wiki_pending(user_id)
+    item = pending.get(uid)
+    if not item:
+        await callback.message.answer(
+            "❌ Конспект уже обработан или устарел. Дождитесь нового уведомления."
+        )
+        return
+
+    display = item[1]
+    status_msg = await callback.message.answer(
+        f"⏳ Расшифровываю «{escape_md_simple(display)}» и размещаю в wiki...",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    try:
+        ok, msg = await process_conspect_to_wiki(user_id, item)
+        if ok:
+            _remove_wiki_pending(user_id, uid)
+            logger.info("✅ Конспект «%s» обработан в wiki (user %s)", display, user_id)
+        await status_msg.edit_text(msg, parse_mode=ParseMode.MARKDOWN)
+    except Exception as e:
+        logger.error("Ошибка wiki_process для user %s: %s", user_id, e)
+        try:
+            await status_msg.edit_text(f"❌ Ошибка обработки: {e}")
+        except Exception:
+            pass
 
 
 @dp.callback_query(lambda c: c.data and c.data.startswith("choose_prompt:"))
@@ -5436,6 +5537,71 @@ def _load_notes_cache(user_id: int) -> list:
 
 
 # ═══════════════════════════════════════════════════════════════════
+# КЭШ КОНСПЕКТОВ ДЛЯ КНОПКИ «Расшифровать и разместить в wiki»
+# ═══════════════════════════════════════════════════════════════════
+# При уведомлении о новом конспекте бот сохраняет его сюда (по uid),
+# чтобы по нажатию кнопки достать полный текст без повторного IMAP-запроса.
+
+WIKI_PENDING_FILE = Path(__file__).parent / "wiki_pending.json"
+
+
+def _save_wiki_pending(user_id: int, item) -> None:
+    """Сохраняет конспект в кэш ожидающих wiki-обработки."""
+    cache = {}
+    if WIKI_PENDING_FILE.exists():
+        try:
+            cache = json.loads(WIKI_PENDING_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            cache = {}
+    dt, display, txt = item[0], item[1], item[2]
+    uid = f"{dt.timestamp()}:{display}"
+    per_user = cache.setdefault(str(user_id), {})
+    per_user[uid] = {
+        "dt": dt.isoformat(),
+        "display": display,
+        "txt": txt,
+    }
+    WIKI_PENDING_FILE.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _load_wiki_pending(user_id: int) -> dict:
+    """Загружает кэш конспектов, ожидающих wiki-обработки (uid → item)."""
+    if not WIKI_PENDING_FILE.exists():
+        return {}
+    try:
+        cache = json.loads(WIKI_PENDING_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    per_user = cache.get(str(user_id), {})
+    items = {}
+    for uid, entry in per_user.items():
+        try:
+            dt = datetime.fromisoformat(entry["dt"])
+        except Exception:
+            continue
+        items[uid] = (dt, entry["display"], entry["txt"], "", "", "")
+    return items
+
+
+def _remove_wiki_pending(user_id: int, uid: str) -> None:
+    """Удаляет конспект из кэша ожидающих wiki-обработки."""
+    if not WIKI_PENDING_FILE.exists():
+        return
+    try:
+        cache = json.loads(WIKI_PENDING_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return
+    per_user = cache.get(str(user_id), {})
+    if uid in per_user:
+        del per_user[uid]
+        if per_user:
+            cache[str(user_id)] = per_user
+        else:
+            cache.pop(str(user_id), None)
+        WIKI_PENDING_FILE.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+# ═══════════════════════════════════════════════════════════════════
 # ФУНКЦИЯ ВЫЗОВА НЕЙРОСЕТИ (call_ai)
 # ═══════════════════════════════════════════════════════════════════
 # Универсальный вызов любого OpenAI-совместимого API.
@@ -6326,43 +6492,30 @@ async def main():
                                     f"📅 {date_str}"
                                 )
                                 try:
+                                    # Если настроена Яндекс Вики — под уведомлением
+                                    # кнопка «Расшифровать и разместить в wiki».
+                                    wiki_config = get_wiki_config(user_id)
+                                    reply_markup = None
+                                    if wiki_config and wiki_config.get("oauth_token") and get_wiki_mode(user_id) != "off":
+                                        uid = f"{dt.timestamp()}:{display}"
+                                        _save_wiki_pending(user_id, item)
+                                        reply_markup = InlineKeyboardMarkup(inline_keyboard=[[
+                                            InlineKeyboardButton(
+                                                "📝 Расшифровать и разместить в wiki",
+                                                callback_data=f"wiki_process:{uid}",
+                                            )
+                                        ]])
                                     await bot.send_message(
                                         chat_id=user_id,
                                         text=text,
                                         parse_mode=ParseMode.MARKDOWN,
+                                        reply_markup=reply_markup,
                                     )
                                 except Exception as e:
                                     logger.error(
                                         "Не удалось отправить уведомление user %s: %s",
                                         uid_str, e,
                                     )
-                            # ── Автопубликация в Яндекс Вики ──────────────
-                            # Бизнес-правило: если у пользователя настроена
-                            # интеграция (oauth_token) и режим 'auto' —
-                            # найденный конспект обрабатывается по промпту из
-                            # Вики через нейросеть, протокол публикуется в
-                            # подраздел, результат отправляется ПОД сообщением
-                            # о найденном конспекте.
-                            wiki_config = get_wiki_config(user_id)
-                            if wiki_config and wiki_config.get("oauth_token") and get_wiki_mode(user_id) == "auto":
-                                for item in new_notifications:
-                                    try:
-                                        success, msg = await process_conspect_to_wiki(user_id, item)
-                                        await bot.send_message(
-                                            chat_id=user_id,
-                                            text=msg,
-                                            parse_mode=ParseMode.MARKDOWN,
-                                        )
-                                        if success:
-                                            logger.info(
-                                                "✅ Протокол «%s» опубликован в Wiki (user %s)",
-                                                item[1], uid_str,
-                                            )
-                                    except Exception as e:
-                                        logger.error(
-                                            "Ошибка автопубликации в Wiki (user %s): %s",
-                                            uid_str, e,
-                                        )
                             # Сохраняем в кеш для кнопки Саммари
                             notified_ids = [f"{item[0].timestamp()}:{item[1]}" for item in new_notifications]
                             _mark_notified(user_id, notified_ids)
