@@ -1487,8 +1487,8 @@ async def _ask_trash_after_publish(callback: CallbackQuery, user_id: int, item) 
         return
     _set_email_read(user_id, imap_id)
     kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton("🗑 Да, в корзину", callback_data=f"trash_yes:{imap_id}"),
-        InlineKeyboardButton("Нет, оставить", callback_data=f"trash_no:{imap_id}"),
+        InlineKeyboardButton(text="🗑 Да, в корзину", callback_data=f"trash_yes:{imap_id}"),
+        InlineKeyboardButton(text="Нет, оставить", callback_data=f"trash_no:{imap_id}"),
     ]])
     await callback.message.answer(
         "📬 Письмо помечено прочитанным.\n\n"
@@ -2503,7 +2503,7 @@ async def wiki_proc_callback(callback: CallbackQuery, state: FSMContext):
             uid = f"{item[0].timestamp()}:{item[1]}"
             _save_summary_cache(user_id, uid, item[1], summary)
             kb = InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton("📄 Показать саммари", callback_data=f"show_summary:{uid}")
+                InlineKeyboardButton(text="📄 Показать саммари", callback_data=f"show_summary:{uid}")
             ]])
             await status_msg.edit_text(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
             await _ask_trash_after_publish(callback, user_id, item)
@@ -2557,7 +2557,7 @@ async def wiki_process_callback(callback: CallbackQuery, state: FSMContext):
             logger.info("[WIKI-BTN] user=%s: конспект «%s» обработан в wiki", user_id, display[:70])
             _save_summary_cache(user_id, uid, display, summary)
             kb = InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton("📄 Показать саммари", callback_data=f"show_summary:{uid}")
+                InlineKeyboardButton(text="📄 Показать саммари", callback_data=f"show_summary:{uid}")
             ]])
             await status_msg.edit_text(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
             await _ask_trash_after_publish(callback, user_id, item)
@@ -2643,7 +2643,7 @@ async def publish_wiki_callback(callback: CallbackQuery, state: FSMContext):
             uid = f"{item[0].timestamp()}:{item[1]}"
             _save_summary_cache(user_id, uid, item[1], summary)
             kb = InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton("📄 Показать саммари", callback_data=f"show_summary:{uid}")
+                InlineKeyboardButton(text="📄 Показать саммари", callback_data=f"show_summary:{uid}")
             ]])
             await status_msg.edit_text(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
             await _ask_trash_after_publish(callback, user_id, item)
