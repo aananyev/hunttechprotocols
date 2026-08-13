@@ -1268,9 +1268,10 @@ async def _ensure_wiki_folder(wiki_config: dict, slug: str, title: str) -> bool:
 class WikiProgress:
     """Живой список действий при расшифровке: ⏳ текущий → ✅ выполнен / ❌ ошибка."""
 
-    def __init__(self, status_msg, user_id: int):
+    def __init__(self, status_msg, user_id: int, display: str = ""):
         self.status_msg = status_msg
         self.user_id = user_id
+        self.display = display
         self.steps: list[tuple[str, str]] = []  # (label, running|done|error)
 
     async def start(self, label: str) -> None:
@@ -1289,6 +1290,9 @@ class WikiProgress:
 
     def render(self) -> str:
         lines = ["⚙️ **Обработка конспекта:**", ""]
+        if self.display:
+            lines.append(f"📄 {_md(self.display)}")
+            lines.append("")
         for label, status in self.steps:
             if status == "done":
                 lines.append(f"✅ {label}")
@@ -2581,7 +2585,7 @@ async def wiki_proc_callback(callback: CallbackQuery, state: FSMContext):
         parse_mode=ParseMode.MARKDOWN,
     )
     try:
-        progress = WikiProgress(status_msg, user_id)
+        progress = WikiProgress(status_msg, user_id, item[1])
         ok, msg, summary = await process_conspect_to_wiki(user_id, item, progress)
         logger.info("[WIKI-BTN] user=%s результат: ok=%s msg=%r", user_id, ok, (msg or "")[:150])
         final = f"{progress.render()}\n\n{msg}"
@@ -2637,7 +2641,7 @@ async def wiki_process_callback(callback: CallbackQuery, state: FSMContext):
         parse_mode=ParseMode.MARKDOWN,
     )
     try:
-        progress = WikiProgress(status_msg, user_id)
+        progress = WikiProgress(status_msg, user_id, display)
         ok, msg, summary = await process_conspect_to_wiki(user_id, item, progress)
         final = f"{progress.render()}\n\n{msg}"
         if ok:
@@ -2726,7 +2730,7 @@ async def publish_wiki_callback(callback: CallbackQuery, state: FSMContext):
         parse_mode=ParseMode.MARKDOWN,
     )
     try:
-        progress = WikiProgress(status_msg, user_id)
+        progress = WikiProgress(status_msg, user_id, item[1])
         ok, msg, summary = await process_conspect_to_wiki(user_id, item, progress)
         final = f"{progress.render()}\n\n{msg}"
         if ok:
