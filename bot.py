@@ -2370,6 +2370,23 @@ def _ai_provider_keyboard() -> InlineKeyboardMarkup:
 # Если промпт не найден — жёлтая "Выбрать промпт" с предложением создать.
 
 
+def _prompt_known_for(user_id: int | None, display: str) -> bool:
+    """Промпт для расшифровки конспекта определён, если:
+       1) тема промпта совпадает с началом названия конспекта (startswith, без регистра);
+       2) ИЛИ настроена Вики (oauth_token) и для темы есть маршрут wiki.routing
+          (промпт лежит в корне подраздела).
+       Единая точка проверки для кнопок списка и отчёта «Кратко»."""
+    prompts = _load_prompts() or {}
+    for topic in prompts:
+        if display.lower().startswith(topic.lower()):
+            return True
+    if user_id:
+        wiki = get_wiki_config(user_id)
+        if wiki and wiki.get("oauth_token") and wiki_route_section(user_id, display):
+            return True
+    return False
+
+
 def _get_item_button(idx: int, display: str, user_id: int | None = None,
                      list_id: str = "") -> InlineKeyboardMarkup | None:
     """
@@ -2395,21 +2412,7 @@ def _get_item_button(idx: int, display: str, user_id: int | None = None,
     """
     prompts = _load_prompts() or {}
 
-    matched_prompt = None
-    for topic in prompts:
-        if display.lower().startswith(topic.lower()):
-            matched_prompt = topic
-            break
-
-    # Промпт в корневой папке wiki: настроена wiki + есть маршрут
-    # для темы конспекта (промпт лежит в корне подраздела)
-    wiki_known = False
-    if user_id:
-        wiki = get_wiki_config(user_id)
-        if wiki and wiki.get("oauth_token") and wiki_route_section(user_id, display):
-            wiki_known = True
-
-    if matched_prompt or wiki_known:
+    if _prompt_known_for(user_id, display):
         # Промпт известен — кнопка «Саммари» не нужна
         return InlineKeyboardMarkup(inline_keyboard=[
             [
@@ -2594,12 +2597,15 @@ async def wiki_proc_callback(callback: CallbackQuery, state: FSMContext):
     user_id = callback.from_user.id
     parts = callback.data.split(":", 1)[1].split(":")
     # Новый формат: wiki_proc:{list_id}:{idx}; старый: wiki_proc:{idx}
-    if len(parts) == 2 and parts[0] and not parts[0].isdigit():
-        list_id, idx_str = parts[0], parts[1]
-    else:
-        list_id, idx_str = "", parts[0]
     try:
-        idx = int(idx_str)
+        if len(parts) == 2 and parts[0] and not parts[0].isdigit():
+            # Новый формат из списка: idx 1-based (номер конспекта в сообщении)
+            list_id, idx_str = parts[0], parts[1]
+            idx = int(idx_str) - 1
+        else:
+            # Старый формат (кнопка после «Саммари»): idx уже 0-based
+            list_id, idx_str = "", parts[0]
+            idx = int(idx_str)
     except ValueError:
         await callback.message.answer("❌ Некорректные данные кнопки.")
         return
@@ -2726,13 +2732,34 @@ async def choose_prompt_callback(callback: CallbackQuery, state: FSMContext):
         return
 
     _dt, display, _txt = items[idx]
-    await callback.message.answer(
+    await callback.message.answer(_prompt_guidance(display), parse_mode=ParseMode.MARKDOWN)
+
+
+def _prompt_guidance(display: str) -> str:
+    """Подсказка, как задать промпт для конспекта (кнопка «🟡 Задать промпт»)."""
+    topic = display.split()[0] if display.split() else display
+    return (
         f"📝 Для конспекта «{_md(display)}» не найден подходящий промпт.\n\n"
         f"Создайте промпт с названием, которое совпадает с началом строки:\n"
-        f"📌 `/add_prompt` → тема: `{display.split()[0] if display.split() else display}` → текст промпта\n\n"
-        f"Или используйте `/prompt` для управления промптами.",
-        parse_mode=ParseMode.MARKDOWN,
+        f"📌 `/add_prompt` → тема: `{topic}` → текст промпта\n\n"
+        f"Или используйте `/prompt` для управления промптами."
     )
+
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("choose_prompt_pending:"))
+async def choose_prompt_pending_callback(callback: CallbackQuery, state: FSMContext):
+    """Кнопка «🟡 Задать промпт» под отчётом «📌 Кратко» на уведомлении
+       о новом конспекте: промпт не определён — показываем, как его создать."""
+    user_id = callback.from_user.id
+    key = callback.data.split(":", 1)[1]
+    pending = _load_wiki_pending(user_id)
+    item = pending.get(key)
+    if not item:
+        await callback.answer("❌ Конспект устарел или уже обработан.", show_alert=True)
+        return
+    display = item[1]
+    await callback.answer()
+    await callback.message.answer(_prompt_guidance(display), parse_mode=ParseMode.MARKDOWN)
 
 
 # ── Callback-хендлер для кнопки «📤 Опубликовать в Wiki» ────
@@ -2832,6 +2859,46 @@ async def show_summary_callback(callback: CallbackQuery, state: FSMContext):
 
 # ── Кнопка «📌 Кратко» ────────────────────────────────────────
 
+def _brief_action_keyboard(user_id: int, display: str, list_id: str, idx: int) -> InlineKeyboardMarkup:
+    """Кнопки под отчётом «📌 Кратко» из списка конспектов:
+       промпт определён → «📝 Расшифровать и разместить в wiki» (полный флоу);
+       промпт не определён → «🟡 Задать промпт» (подсказка /add_prompt).
+       idx — 0-based; в callback_data кладём 1-based (как номер в списке)."""
+    n = idx + 1
+    if _prompt_known_for(user_id, display):
+        return InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(
+                text=f"📝 Расшифровать и разместить в wiki #{n}",
+                callback_data=f"wiki_proc:{list_id}:{n}",
+            )
+        ]])
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(
+            text=f"🟡 Задать промпт #{n}",
+            callback_data=f"choose_prompt:{list_id}:{n}",
+        )
+    ]])
+
+
+def _brief_action_keyboard_pending(user_id: int, display: str, key: str) -> InlineKeyboardMarkup:
+    """Кнопки под отчётом «📌 Кратко» на уведомлении о новом конспекте:
+       промпт определён → «📝 Расшифровать и разместить в wiki» (по uid уведомления);
+       промпт не определён → «🟡 Задать промпт»."""
+    if _prompt_known_for(user_id, display):
+        return InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(
+                text="📝 Расшифровать и разместить в wiki",
+                callback_data=f"wiki_process:{key}",
+            )
+        ]])
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(
+            text="🟡 Задать промпт",
+            callback_data=f"choose_prompt_pending:{key}",
+        )
+    ]])
+
+
 BRIEF_PROMPT = (
     "Ты — секретарь IT-компании HUNTTECH. По конспекту/стенограмме встречи "
     "составь КРАТКИЙ КОНТЕКСТ ровно из 3 предложений:\n"
@@ -2880,10 +2947,11 @@ async def brief_callback(callback: CallbackQuery, state: FSMContext):
             return
         header = f"📌 **Кратко: {_md(display)}**\n\n"
         full = header + result
+        kb = _brief_action_keyboard(user_id, display, list_id, idx)
         try:
-            await status.edit_text(full, parse_mode=ParseMode.MARKDOWN)
+            await status.edit_text(full, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
         except Exception:
-            await status.edit_text(full)
+            await status.edit_text(full, reply_markup=kb)
     except Exception as e:
         logger.error("[BRIEF] user=%s исключение: %s", user_id, e, exc_info=True)
         try:
@@ -2919,10 +2987,11 @@ async def brief_pending_callback(callback: CallbackQuery, state: FSMContext):
             return
         header = f"📌 **Кратко: {_md(display)}**\n\n"
         full = header + result
+        kb = _brief_action_keyboard_pending(user_id, display, key)
         try:
-            await status.edit_text(full, parse_mode=ParseMode.MARKDOWN)
+            await status.edit_text(full, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
         except Exception:
-            await status.edit_text(full)
+            await status.edit_text(full, reply_markup=kb)
     except Exception as e:
         logger.error("[BRIEF-PENDING] user=%s исключение: %s", user_id, e, exc_info=True)
         try:
