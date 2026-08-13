@@ -1650,6 +1650,24 @@ async def _ask_trash_after_publish(callback: CallbackQuery, user_id: int, item) 
     )
 
 
+async def _delete_trash_request(message) -> bool:
+    """Удаляет сообщение-запрос «Переместить это письмо в корзину?»
+    вместе с кнопками (да/нет).
+
+    Бизнес-правило (владелец, 08.2026): после успешного перемещения
+    письма в корзину почтового ящика сам запрос и его кнопки больше
+    не нужны — удаляем их, чтобы не засорять чат. При ошибке удаления
+    бот не падает (возвращает False).
+    """
+    try:
+        await message.delete()
+        logger.info("[TRASH-BTN] сообщение-запрос о корзине удалено")
+        return True
+    except Exception as e:
+        logger.warning("[TRASH-BTN] не удалось удалить запрос о корзине: %s", e)
+        return False
+
+
 import json
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
@@ -2923,6 +2941,9 @@ async def trash_callback(callback: CallbackQuery, state: FSMContext):
         if ok:
             await callback.answer("🗑 Перемещено в корзину.")
             await callback.message.answer("🗑 Письмо перемещено в корзину почтового ящика.")
+            # Письмо в корзине — запрос «Переместить в корзину?» и его кнопки
+            # больше не нужны (бизнес-правило владельца, 08.2026).
+            await _delete_trash_request(callback.message)
         else:
             await callback.answer("❌ Не удалось переместить письмо.", show_alert=True)
             await callback.message.answer("❌ Не удалось переместить письмо в корзину.")
