@@ -18,6 +18,7 @@ import logging
 import httpx
 import json
 import re
+import time
 from email.header import decode_header
 from email.utils import parsedate_to_datetime
 from datetime import datetime
@@ -1076,6 +1077,9 @@ async def publish_to_wiki(title: str, content: str, wiki_config: dict, page_slug
     # org_id (dir_id) — для ссылки на страницу в браузере
     org_id = wiki_config.get("org_id", "")
 
+    # ── УСИЛЕННОЕ ЛОГИРОВАНИЕ (этап разработки) ──
+    logger.info("[WIKI-PUB] Публикация страницы: title=%r slug=%r len(content)=%d", title, slug, len(content or ""))
+
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.post(
@@ -1083,16 +1087,23 @@ async def publish_to_wiki(title: str, content: str, wiki_config: dict, page_slug
                 headers=headers,
                 json=payload,
             )
+            # ── УСИЛЕННОЕ ЛОГИРОВАНИЕ: статус и тело ответа ──
+            logger.info("[WIKI-PUB] POST /pages → %s (slug=%s)", resp.status_code, slug)
+            if resp.status_code not in (200, 201):
+                logger.warning("[WIKI-PUB] Тело ответа (до 800 симв.): %s", resp.text[:800])
             if resp.status_code in (200, 201):
                 data = resp.json()
                 page_slug = data.get("slug", "?")
                 page_url = f"https://wiki.yandex.ru/{page_slug}"
                 if org_id:
                     page_url += f"?orgId={org_id}"
+                logger.info("[WIKI-PUB] Страница создана: id=%s slug=%s", data.get("id"), page_slug)
                 return True, f"✅ Страница опубликована: {page_url}"
             elif resp.status_code == 401:
+                logger.error("[WIKI-PUB] 401: токен недействителен (slug=%s)", slug)
                 return False, "❌ Ошибка авторизации (401): IAM-токен недействителен."
             elif resp.status_code == 403:
+                logger.error("[WIKI-PUB] 403: нет прав на создание (slug=%s)", slug)
                 return False, (
                     "❌ Нет прав на создание страниц (403).\n"
                     "Проверьте, что сервисный аккаунт имеет роль `wiki.editor`."
@@ -1100,8 +1111,10 @@ async def publish_to_wiki(title: str, content: str, wiki_config: dict, page_slug
             else:
                 return False, f"❌ Ошибка Wiki API ({resp.status_code}): {resp.text[:300]}"
     except httpx.TimeoutException:
+        logger.error("[WIKI-PUB] Таймаут 30с (slug=%s)", slug)
         return False, "❌ Таймаут: Яндекс Вики не ответил за 30 секунд."
     except Exception as e:
+        logger.error("[WIKI-PUB] Исключение (slug=%s): %s", slug, e, exc_info=True)
         return False, f"❌ Ошибка подключения к Wiki: {e}"
 
 
@@ -1122,6 +1135,7 @@ async def wiki_get_page_content(wiki_config: dict, slug: str) -> str:
        Возвращает пустую строку при ошибке/отсутствии содержимого."""
     token = await _get_wiki_token(wiki_config)
     if not token:
+        logger.warning("[WIKI-READ] Нет токена для чтения страницы %s", slug)
         return ""
     auth_scheme = "OAuth" if token.startswith("y0_") else "Bearer"
     headers = {
@@ -1139,10 +1153,12 @@ async def wiki_get_page_content(wiki_config: dict, slug: str) -> str:
                 params={"slug": slug, "fields": "content"},
             )
             if resp.status_code == 200:
-                return resp.json().get("content", "")
-            logger.warning("Чтение страницы Вики %s: HTTP %s", slug, resp.status_code)
+                content = resp.json().get("content", "")
+                logger.info("[WIKI-READ] GET %s → 200, len(content)=%d", slug, len(content or ""))
+                return content
+            logger.warning("[WIKI-READ] GET %s → HTTP %s (тело: %s)", slug, resp.status_code, resp.text[:300])
     except Exception as e:
-        logger.error("Ошибка чтения страницы Вики %s: %s", slug, e)
+        logger.error("[WIKI-READ] Исключение при чтении %s: %s", slug, e, exc_info=True)
     return ""
 
 
@@ -1151,13 +1167,17 @@ def wiki_extract_prompt(content: str) -> str:
        Убирает макрос {% tree %} и заголовок «Промпт для нейросети»,
        если он есть; иначе возвращает весь текст страницы целиком."""
     if not content:
+        logger.warning("[WIKI-PROMPT] Страница пустая — промпт не извлечён")
         return ""
     text = re.sub(r"\{%\s*tree\s*%\}", "", content)
     marker = re.search(r"Промпт\s+для\s+нейросети", text, re.IGNORECASE)
     if marker:
         text = text[marker.start():]
         text = re.sub(r"^[#*\s]*Промпт\s+для\s+нейросети[:*]*", "", text, flags=re.IGNORECASE)
-    return text.strip()
+    result = text.strip()
+    logger.info("[WIKI-PROMPT] Извлечено %d символов промпта (маркер «Промпт для нейросети»: %s)",
+                len(result), bool(marker))
+    return result
 
 
 def wiki_route_section(user_id: int, display: str) -> str:
@@ -1170,7 +1190,10 @@ def wiki_route_section(user_id: int, display: str) -> str:
     disp_low = display.lower()
     for prefix, slug in routing.items():
         if disp_low.startswith(prefix.lower()):
+            logger.info("[WIKI-ROUTE] user=%s display=%r → подраздел=%s (правило %r)", user_id, display[:60], slug, prefix)
             return slug
+    logger.warning("[WIKI-ROUTE] user=%s display=%r → подраздел НЕ НАЙДЕН (routing=%s)",
+                   user_id, display[:60], routing)
     return ""
 
 
@@ -1202,9 +1225,11 @@ async def wiki_page_exists(wiki_config: dict, slug: str) -> bool:
             resp = await client.get(
                 f"{WIKI_API_BASE}/pages", headers=headers, params={"slug": slug},
             )
-            return resp.status_code == 200
+            exists = resp.status_code == 200
+            logger.info("[WIKI-EXISTS] GET %s → %s (exists=%s)", slug, resp.status_code, exists)
+            return exists
     except Exception as e:
-        logger.error("Ошибка проверки страницы Вики %s: %s", slug, e)
+        logger.error("[WIKI-EXISTS] Исключение при проверке %s: %s", slug, e, exc_info=True)
     return False
 
 
@@ -1214,8 +1239,12 @@ async def _ensure_wiki_folder(wiki_config: dict, slug: str, title: str) -> bool:
        страницы с глубоким slug — без реальных папок страница не видна
        в дереве {% tree %} (папки года/месяца «пропадают»)."""
     if await wiki_page_exists(wiki_config, slug):
+        logger.info("[WIKI-FOLDER] Папка уже существует: %s", slug)
         return True
-    ok, _ = await publish_to_wiki(title, "{% tree %}", wiki_config, page_slug=slug)
+    logger.info("[WIKI-FOLDER] Создаю папку: %s (title=%r)", slug, title)
+    ok, msg = await publish_to_wiki(title, "{% tree %}", wiki_config, page_slug=slug)
+    if not ok:
+        logger.error("[WIKI-FOLDER] Не удалось создать папку %s: %s", slug, msg)
     return ok
 
 
@@ -1230,11 +1259,15 @@ async def process_conspect_to_wiki(user_id: int, item) -> tuple[bool, str]:
        Страницы именуются «{год}.{месяц}.{день}».
        Возвращает (ok: bool, сообщение для пользователя)."""
     dt, display, txt_content = item[0], item[1], item[2]
+    logger.info("[WIKI-FLOW] user=%s начал обработку: display=%r dt=%s txt_len=%d",
+                user_id, display[:80], dt, len(txt_content or ""))
     if not txt_content:
+        logger.warning("[WIKI-FLOW] user=%s: пустой txt в конспекте %r", user_id, display[:80])
         return False, "❌ В письме не найден текст конспекта (txt-вложение)."
 
     wiki = get_wiki_config(user_id)
     if not wiki or not wiki.get("oauth_token"):
+        logger.warning("[WIKI-FLOW] user=%s: вики не настроена (oauth_token отсутствует)", user_id)
         return False, "❌ Яндекс Вики не настроена."
 
     # 1) Подраздел (классификация по префиксу темы)
@@ -1248,6 +1281,8 @@ async def process_conspect_to_wiki(user_id: int, item) -> tuple[bool, str]:
     page_name = dt.strftime("%Y.%m.%d")  # «2026.08.13»
     conspects_dir = f"{folder}/Конспекты/{year}/{month}"
     protocols_dir = f"{folder}/Протоколы/{year}/{month}"
+    logger.info("[WIKI-FLOW] user=%s: folder=%s | year=%s | month=%r | page=%s",
+                user_id, folder, year, month, page_name)
 
     # Материализуем папки: вики не создаёт промежуточные страницы
     # автоматически — без них год/месяц «пропадают» из дерева
@@ -1260,13 +1295,16 @@ async def process_conspect_to_wiki(user_id: int, item) -> tuple[bool, str]:
         (f"{folder}/Протоколы/{year}/{month}", month),
     ):
         if not await _ensure_wiki_folder(wiki, dir_path, dir_title):
+            logger.error("[WIKI-FLOW] user=%s: не удалось создать папку %s", user_id, dir_path)
             return False, f"❌ Не удалось создать папку {dir_path} в Вики."
 
     # 3) Оригинал конспекта — без изменений
     conspect_slug = f"{conspects_dir}/{page_name}"
     if await wiki_page_exists(wiki, conspect_slug):
         ok1, msg1 = True, "✅ Конспект уже был сохранён ранее"
+        logger.info("[WIKI-FLOW] user=%s: конспект уже существует: %s", user_id, conspect_slug)
     else:
+        logger.info("[WIKI-FLOW] user=%s: сохраняю оригинал конспекта → %s", user_id, conspect_slug)
         ok1, msg1 = await publish_to_wiki(page_name, txt_content, wiki, page_slug=conspect_slug)
     if not ok1:
         return False, msg1
@@ -1276,29 +1314,40 @@ async def process_conspect_to_wiki(user_id: int, item) -> tuple[bool, str]:
     page_content = await wiki_get_page_content(wiki, folder)
     prompt_text = wiki_extract_prompt(page_content)
     if not prompt_text and prompt_slug and prompt_slug != folder:
+        logger.info("[WIKI-FLOW] user=%s: промпта нет в %s, пробую fallback %s", user_id, folder, prompt_slug)
         page_content = await wiki_get_page_content(wiki, prompt_slug)
         prompt_text = wiki_extract_prompt(page_content)
     if not prompt_text:
+        logger.error("[WIKI-FLOW] user=%s: промпт не найден (folder=%s prompt_slug=%r)", user_id, folder, prompt_slug)
         return False, f"⚠️ Промпт не найден в папке {folder}."
+    logger.info("[WIKI-FLOW] user=%s: промпт получен (%d символов), запускаю AI...", user_id, len(prompt_text))
 
     # 5) AI-расшифровка по промпту
     ai_text = (
         f"Конспект/стенограмма встречи «{display}» "
         f"от {dt.strftime('%d.%m.%Y')}:\n\n{txt_content}"
     )
+    ai_start = time.monotonic()
     result = await call_ai(user_id, prompt_text, ai_text)
+    ai_elapsed = time.monotonic() - ai_start
+    logger.info("[WIKI-FLOW] user=%s: AI ответил за %.1fс, len(result)=%d, префикс=%r",
+                user_id, ai_elapsed, len(result or ""), (result or "")[:60])
     if not result or result.startswith("❌"):
+        logger.error("[WIKI-FLOW] user=%s: AI не вернул протокол: %r", user_id, (result or "")[:200])
         return False, result or "❌ Нейросеть не вернула протокол."
 
     # 6) Протокол — в папку протоколов
     protocol_slug = f"{protocols_dir}/{page_name}"
     if await wiki_page_exists(wiki, protocol_slug):
         ok2, msg2 = True, "✅ Протокол уже был размещён ранее"
+        logger.info("[WIKI-FLOW] user=%s: протокол уже существует: %s", user_id, protocol_slug)
     else:
+        logger.info("[WIKI-FLOW] user=%s: публикую протокол → %s", user_id, protocol_slug)
         ok2, msg2 = await publish_to_wiki(page_name, result, wiki, page_slug=protocol_slug)
     if not ok2:
         return False, msg2
 
+    logger.info("[WIKI-FLOW] user=%s: УСПЕХ — конспект и протокол размещены (%s)", user_id, page_name)
     return True, (
         f"📄 {escape_md_simple(display)}\n\n"
         f"{msg1}\n{msg2}\n\n"
@@ -2307,6 +2356,7 @@ async def wiki_proc_callback(callback: CallbackQuery, state: FSMContext):
 
     items = _load_notes_cache(user_id)
     if idx < 0 or idx >= len(items):
+        logger.warning("[WIKI-BTN] user=%s idx=%d вне диапазона кэша (len=%d)", user_id, idx, len(items))
         await callback.message.answer("❌ Конспект устарел. Запросите /list заново.")
         return
     item = items[idx]
@@ -2314,15 +2364,18 @@ async def wiki_proc_callback(callback: CallbackQuery, state: FSMContext):
         await callback.message.answer("❌ В письме не найден текст конспекта (txt-вложение).")
         return
 
+    logger.info("[WIKI-BTN] user=%s нажал «Расшифровать в wiki»: idx=%d display=%r txt_len=%d",
+                user_id, idx, item[1][:70], len(item[2]))
     status_msg = await callback.message.answer(
         f"⏳ Расшифровываю «{escape_md_simple(item[1])}» и размещаю в wiki...",
         parse_mode=ParseMode.MARKDOWN,
     )
     try:
         ok, msg = await process_conspect_to_wiki(user_id, item)
+        logger.info("[WIKI-BTN] user=%s результат: ok=%s msg=%r", user_id, ok, (msg or "")[:150])
         await status_msg.edit_text(msg, parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
-        logger.error("Ошибка wiki_proc для user %s: %s", user_id, e)
+        logger.error("[WIKI-BTN] user=%s исключение: %s", user_id, e, exc_info=True)
         try:
             await status_msg.edit_text(f"❌ Ошибка: {e}")
         except Exception:
@@ -2343,16 +2396,21 @@ async def wiki_process_callback(callback: CallbackQuery, state: FSMContext):
     user_id = callback.from_user.id
     parts = callback.data.split(":", 1)
     uid = parts[1] if len(parts) > 1 else ""
+    logger.info("[WIKI-BTN] user=%s нажал кнопку на уведомлении: uid=%r", user_id, uid[:60])
 
     pending = _load_wiki_pending(user_id)
     item = pending.get(uid)
     if not item:
+        logger.warning("[WIKI-BTN] user=%s: конспект uid=%r не найден в pending — уже обработан или устарел",
+                       user_id, uid[:60])
         await callback.message.answer(
             "❌ Конспект уже обработан или устарел. Дождитесь нового уведомления."
         )
         return
 
     display = item[1]
+    logger.info("[WIKI-BTN] user=%s: начинаю обработку из уведомления: display=%r txt_len=%d",
+                user_id, display[:70], len(item[2]))
     status_msg = await callback.message.answer(
         f"⏳ Расшифровываю «{escape_md_simple(display)}» и размещаю в wiki...",
         parse_mode=ParseMode.MARKDOWN,
@@ -2361,10 +2419,12 @@ async def wiki_process_callback(callback: CallbackQuery, state: FSMContext):
         ok, msg = await process_conspect_to_wiki(user_id, item)
         if ok:
             _remove_wiki_pending(user_id, uid)
-            logger.info("✅ Конспект «%s» обработан в wiki (user %s)", display, user_id)
+            logger.info("[WIKI-BTN] user=%s: конспект «%s» обработан в wiki", user_id, display[:70])
+        else:
+            logger.warning("[WIKI-BTN] user=%s: флоу вернул ошибку: %r", user_id, (msg or "")[:150])
         await status_msg.edit_text(msg, parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
-        logger.error("Ошибка wiki_process для user %s: %s", user_id, e)
+        logger.error("[WIKI-BTN] user=%s исключение: %s", user_id, e, exc_info=True)
         try:
             await status_msg.edit_text(f"❌ Ошибка обработки: {e}")
         except Exception:
@@ -5563,7 +5623,8 @@ def _save_wiki_pending(user_id: int, item) -> None:
     if WIKI_PENDING_FILE.exists():
         try:
             cache = json.loads(WIKI_PENDING_FILE.read_text(encoding="utf-8"))
-        except Exception:
+        except Exception as e:
+            logger.warning("[WIKI-PENDING] Файл повреждён (%s), стартуем с пустым кэшем", e)
             cache = {}
     dt, display, txt = item[0], item[1], item[2]
     uid = f"{dt.timestamp()}:{display}"
@@ -5574,24 +5635,30 @@ def _save_wiki_pending(user_id: int, item) -> None:
         "txt": txt,
     }
     WIKI_PENDING_FILE.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
+    logger.info("[WIKI-PENDING] Сохранён конспект user=%s uid=%r (всего у пользователя: %d)",
+                user_id, uid[:60], len(per_user))
 
 
 def _load_wiki_pending(user_id: int) -> dict:
     """Загружает кэш конспектов, ожидающих wiki-обработки (uid → item)."""
     if not WIKI_PENDING_FILE.exists():
+        logger.info("[WIKI-PENDING] Файл кэша отсутствует — пусто (user=%s)", user_id)
         return {}
     try:
         cache = json.loads(WIKI_PENDING_FILE.read_text(encoding="utf-8"))
-    except Exception:
+    except Exception as e:
+        logger.error("[WIKI-PENDING] Ошибка чтения кэша: %s", e)
         return {}
     per_user = cache.get(str(user_id), {})
     items = {}
     for uid, entry in per_user.items():
         try:
             dt = datetime.fromisoformat(entry["dt"])
-        except Exception:
+        except Exception as e:
+            logger.warning("[WIKI-PENDING] Пропускаю битую запись %r: %s", uid[:40], e)
             continue
         items[uid] = (dt, entry["display"], entry["txt"], "", "", "")
+    logger.info("[WIKI-PENDING] Загружено %d ожидающих конспектов (user=%s)", len(items), user_id)
     return items
 
 
@@ -5601,7 +5668,8 @@ def _remove_wiki_pending(user_id: int, uid: str) -> None:
         return
     try:
         cache = json.loads(WIKI_PENDING_FILE.read_text(encoding="utf-8"))
-    except Exception:
+    except Exception as e:
+        logger.error("[WIKI-PENDING] Ошибка чтения кэша при удалении: %s", e)
         return
     per_user = cache.get(str(user_id), {})
     if uid in per_user:
@@ -5611,6 +5679,9 @@ def _remove_wiki_pending(user_id: int, uid: str) -> None:
         else:
             cache.pop(str(user_id), None)
         WIKI_PENDING_FILE.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
+        logger.info("[WIKI-PENDING] Удалён конспект user=%s uid=%r", user_id, uid[:60])
+    else:
+        logger.warning("[WIKI-PENDING] uid=%r не найден в кэше (user=%s) — возможно, уже обработан", uid[:60], user_id)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -6495,6 +6566,13 @@ async def main():
                             if not new_notifications:
                                 continue
 
+                            # ── УСИЛЕННОЕ ЛОГИРОВАНИЕ: найдены новые конспекты ──
+                            logger.info("[NOTIFY] user=%s: найдено новых конспектов: %d",
+                                        user_id, len(new_notifications))
+                            for _item in new_notifications:
+                                logger.info("[NOTIFY]   → %s | %s | txt_len=%d",
+                                            _item[0], _item[1][:70], len(_item[2] or ""))
+
                             for idx, item in enumerate(new_notifications, 1):
                                 dt, display = item[0], item[1]
                                 date_str = dt.strftime("%d.%m.%Y %H:%M")
@@ -6511,6 +6589,8 @@ async def main():
                                     if wiki_config and wiki_config.get("oauth_token") and get_wiki_mode(user_id) != "off":
                                         uid = f"{dt.timestamp()}:{display}"
                                         _save_wiki_pending(user_id, item)
+                                        logger.info("[NOTIFY] user=%s: кнопка wiki добавлена к уведомлению (uid=%r)",
+                                                    user_id, uid[:60])
                                         reply_markup = InlineKeyboardMarkup(inline_keyboard=[[
                                             InlineKeyboardButton(
                                                 "📝 Расшифровать и разместить в wiki",
