@@ -85,6 +85,54 @@ async def main():
     await bot._remove_wiki_proc_button(m)
     check("5.1 edit не вызван", m.edited_kb == "NOT_CALLED")
 
+    # 6. _mark_wiki_proc_busy: нажатая кнопка помечается ⏳, остальные не трогаем
+    m = FakeMessage(kb([
+        [wiki_btn("📝 Расшифровать и разместить в wiki #1", "wiki_proc:abc:1")],
+        [wiki_btn("📌 Кратко #1", "brief:abc:1")],
+    ]))
+    changed = await bot._mark_wiki_proc_busy(m)
+    rows = m.edited_kb.inline_keyboard
+    wbtns = [b for r in rows for b in r if (b.callback_data or "").startswith(("wiki_proc:", "wiki_process:"))]
+    check("6.1 mark: edit вызван", m.edited_kb != "NOT_CALLED")
+    check("6.2 mark: текст с ⏳", len(wbtns) == 1 and wbtns[0].text == "⏳ Расшифровать и разместить в wiki #1",
+          rows)
+    check("6.3 mark: callback_data сохранён", wbtns and wbtns[0].callback_data == "wiki_proc:abc:1")
+    check("6.4 mark: Кратко не тронута",
+          any(b.callback_data == "brief:abc:1" and b.text == "📌 Кратко #1" for r in rows for b in r))
+    check("6.5 mark: возвращён оригинал",
+          changed == [("wiki_proc:abc:1", "📝 Расшифровать и разместить в wiki #1")], changed)
+
+    # 7. _restore_wiki_proc_button: текст возвращается после ошибки
+    await bot._restore_wiki_proc_button(m, changed)
+    rows = m.edited_kb.inline_keyboard
+    wbtns = [b for r in rows for b in r if (b.callback_data or "").startswith("wiki_proc:")]
+    check("7.1 restore: текст восстановлен", wbtns and wbtns[0].text == "📝 Расшифровать и разместить в wiki #1",
+          rows)
+
+    # 8. Кнопка уведомления (wiki_process:) тоже помечается
+    m = FakeMessage(kb([[wiki_btn("📝 Расшифровать и разместить в wiki", "wiki_process:key1")]]))
+    changed = await bot._mark_wiki_proc_busy(m)
+    check("8.1 wiki_process помечена ⏳",
+          changed == [("wiki_process:key1", "📝 Расшифровать и разместить в wiki")], changed)
+
+    # 9. Повторное нажатие (кнопка уже ⏳) — не меняем, changed пуст
+    m = FakeMessage(kb([[wiki_btn("⏳ Расшифровать и разместить в wiki #1", "wiki_proc:abc:1")]]))
+    changed = await bot._mark_wiki_proc_busy(m)
+    check("9.1 повторное нажатие — changed пуст", changed == [], changed)
+    check("9.2 повторное нажатие — edit не вызван", m.edited_kb == "NOT_CALLED")
+
+    # 10. restore с пустым списком — не падаем, edit не вызван
+    m = FakeMessage(kb([[wiki_btn("⏳ Расшифровать и разместить в wiki #1", "wiki_proc:abc:1")]]))
+    await bot._restore_wiki_proc_button(m, [])
+    check("10.1 restore пустой — edit не вызван", m.edited_kb == "NOT_CALLED")
+
+    # 11. Без клавиатуры — mark/restore не падают
+    m = FakeMessage(None)
+    changed = await bot._mark_wiki_proc_busy(m)
+    check("11.1 mark без клавиатуры — changed пуст", changed == [])
+    await bot._restore_wiki_proc_button(m, [("wiki_proc:1", "old")])
+    check("11.2 restore без клавиатуры — не падаем", True)
+
     print(f"\nИтог: {pass_count} passed, {fail_count} failed")
     sys.exit(1 if fail_count else 0)
 

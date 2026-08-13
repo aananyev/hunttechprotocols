@@ -2599,6 +2599,73 @@ def _get_item_button(idx: int, display: str, user_id: int | None = None,
         ])
 
 
+async def _mark_wiki_proc_busy(message) -> list[tuple[str, str]]:
+    """Сразу после нажатия «📝 Расшифровать и разместить в wiki» помечает
+    НАЖАТУЮ кнопку эмодзи ⏳ (песочные часы) — процесс начался.
+
+    Меняется только текст кнопки (callback_data не трогается), остальные
+    кнопки сообщения и другие сообщения не затрагиваются. Возвращает
+    [(callback_data, старый_текст), ...] для восстановления при ошибке флоу.
+    При сбое — [] и бот не падает.
+    """
+    try:
+        markup = message.reply_markup
+        if not markup or not markup.inline_keyboard:
+            return []
+        changed: list[tuple[str, str]] = []
+        rows = []
+        for row in markup.inline_keyboard:
+            new_row = []
+            for b in row:
+                cb = b.callback_data or ""
+                if cb.startswith(("wiki_proc:", "wiki_process:")):
+                    if b.text.startswith("⏳"):
+                        new_row.append(b)  # уже помечена (повторное нажатие)
+                    else:
+                        changed.append((cb, b.text))
+                        new_text = re.sub(r"^\W+", "", b.text).strip()
+                        new_row.append(InlineKeyboardButton(
+                            text=f"⏳ {new_text}" if new_text else f"⏳ {b.text}",
+                            callback_data=cb,
+                        ))
+                else:
+                    new_row.append(b)
+            rows.append(new_row)
+        if changed:
+            await message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+            logger.info("[WIKI-BTN] кнопка «Расшифровать в wiki» помечена ⏳ (%d)", len(changed))
+        return changed
+    except Exception as e:
+        logger.warning("[WIKI-BTN] не удалось пометить кнопку ⏳: %s", e)
+        return []
+
+
+async def _restore_wiki_proc_button(message, originals: list[tuple[str, str]]) -> None:
+    """Возвращает кнопкам «Расшифровать в wiki» исходный текст после ошибки
+    флоу (снимает пометку ⏳). При пустом списке или сбое — бот не падает."""
+    if not originals:
+        return
+    try:
+        markup = message.reply_markup
+        if not markup or not markup.inline_keyboard:
+            return
+        orig = dict(originals)
+        rows = []
+        for row in markup.inline_keyboard:
+            new_row = []
+            for b in row:
+                cb = b.callback_data or ""
+                if cb in orig:
+                    new_row.append(InlineKeyboardButton(text=orig[cb], callback_data=cb))
+                else:
+                    new_row.append(b)
+            rows.append(new_row)
+        await message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+        logger.info("[WIKI-BTN] кнопка «Расшифровать в wiki» восстановлена после ошибки")
+    except Exception as e:
+        logger.warning("[WIKI-BTN] не удалось восстановить кнопку: %s", e)
+
+
 async def _remove_wiki_proc_button(message) -> None:
     """После успешного прохождения сценария «Расшифровать и разместить
     в wiki» убирает эту кнопку у ТОГО сообщения, с которого она нажата.
@@ -2799,6 +2866,9 @@ async def wiki_proc_callback(callback: CallbackQuery, state: FSMContext):
 
     logger.info("[WIKI-BTN] user=%s нажал «Расшифровать в wiki»: idx=%d display=%r txt_len=%d",
                 user_id, idx, item[1][:70], len(item[2]))
+    # Сразу помечаем нажатую кнопку ⏳ — процесс начался
+    # (бизнес-правило владельца, 08.2026).
+    marked = await _mark_wiki_proc_busy(callback.message)
     status_msg = await callback.message.answer(
         f"⏳ Расшифровываю «{_md(item[1])}» и размещаю в wiki...",
         parse_mode=ParseMode.MARKDOWN,
@@ -2819,12 +2889,15 @@ async def wiki_proc_callback(callback: CallbackQuery, state: FSMContext):
             await _remove_wiki_proc_button(callback.message)
         else:
             await status_msg.edit_text(final, parse_mode=ParseMode.MARKDOWN)
+            # Ошибка — снимаем пометку ⏳, чтобы кнопку можно было нажать снова.
+            await _restore_wiki_proc_button(callback.message, marked)
     except Exception as e:
         logger.error("[WIKI-BTN] user=%s исключение: %s", user_id, e, exc_info=True)
         try:
             await status_msg.edit_text(f"❌ Ошибка: {e}")
         except Exception:
             pass
+        await _restore_wiki_proc_button(callback.message, marked)
 
 
 @dp.callback_query(lambda c: c.data and c.data.startswith("wiki_process:"))
@@ -2856,6 +2929,9 @@ async def wiki_process_callback(callback: CallbackQuery, state: FSMContext):
     display = item[1]
     logger.info("[WIKI-BTN] user=%s: начинаю обработку из уведомления: display=%r txt_len=%d",
                 user_id, display[:70], len(item[2]))
+    # Сразу помечаем нажатую кнопку ⏳ — процесс начался
+    # (бизнес-правило владельца, 08.2026).
+    marked = await _mark_wiki_proc_busy(callback.message)
     status_msg = await callback.message.answer(
         f"⏳ Расшифровываю «{_md(display)}» и размещаю в wiki...",
         parse_mode=ParseMode.MARKDOWN,
@@ -2874,12 +2950,15 @@ async def wiki_process_callback(callback: CallbackQuery, state: FSMContext):
         else:
             logger.warning("[WIKI-BTN] user=%s: флоу вернул ошибку: %r", user_id, (msg or "")[:150])
             await status_msg.edit_text(final, parse_mode=ParseMode.MARKDOWN)
+            # Ошибка — снимаем пометку ⏳, чтобы кнопку можно было нажать снова.
+            await _restore_wiki_proc_button(callback.message, marked)
     except Exception as e:
         logger.error("[WIKI-BTN] user=%s исключение: %s", user_id, e, exc_info=True)
         try:
             await status_msg.edit_text(f"❌ Ошибка обработки: {e}")
         except Exception:
             pass
+        await _restore_wiki_proc_button(callback.message, marked)
 
 
 @dp.callback_query(lambda c: c.data and c.data.startswith("choose_prompt:"))
