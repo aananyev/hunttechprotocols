@@ -2406,12 +2406,20 @@ def _get_item_button(idx: int, display: str, user_id: int | None = None) -> Inli
 
     if matched_prompt or wiki_known:
         # Промпт известен — кнопка «Саммари» не нужна
-        return InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(
-                text=f"📝 Расшифровать и разместить в wiki #{idx}",
-                callback_data=f"wiki_proc:{idx}"
-            )
-        ]])
+        return InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=f"📝 Расшифровать и разместить в wiki #{idx}",
+                    callback_data=f"wiki_proc:{idx}"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text=f"📌 Кратко #{idx}",
+                    callback_data=f"brief:{idx}"
+                )
+            ],
+        ])
     else:
         if not prompts:
             return None
@@ -2426,6 +2434,12 @@ def _get_item_button(idx: int, display: str, user_id: int | None = None) -> Inli
                 InlineKeyboardButton(
                     text=f"📝 Расшифровать и разместить в wiki #{idx}",
                     callback_data=f"wiki_proc:{idx}"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text=f"📌 Кратко #{idx}",
+                    callback_data=f"brief:{idx}"
                 )
             ],
         ])
@@ -2789,6 +2803,101 @@ async def show_summary_callback(callback: CallbackQuery, state: FSMContext):
     logger.info("[SHOW-SUMMARY] user=%s: показывает саммари «%s» (%d симв.)",
                 user_id, (entry.get("display") or "")[:60], len(entry.get("summary") or ""))
     await _send_summary(callback.message, entry.get("display", ""), entry.get("summary", ""))
+
+
+# ── Кнопка «📌 Кратко» ────────────────────────────────────────
+
+BRIEF_PROMPT = (
+    "Ты — секретарь IT-компании HUNTTECH. По конспекту/стенограмме встречи "
+    "составь КРАТКИЙ КОНТЕКСТ ровно из 3 предложений:\n"
+    "1) о чём была встреча;\n"
+    "2) список участников;\n"
+    "3) самое важное решение или событие встречи.\n"
+    "Без заголовков, без нумерации, просто 3 коротких предложения."
+)
+
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("brief:"))
+async def brief_callback(callback: CallbackQuery, state: FSMContext):
+    """Кнопка «📌 Кратко» под конспектом: AI делает краткий контекст встречи."""
+    user_id = callback.from_user.id
+    try:
+        idx = int(callback.data.split(":", 1)[1])
+    except ValueError:
+        await callback.answer("❌ Некорректные данные", show_alert=True)
+        return
+    items = _load_notes_cache(user_id)
+    if idx < 0 or idx >= len(items):
+        await callback.answer("❌ Конспект устарел. Запросите /list заново.", show_alert=True)
+        return
+    item = items[idx]
+    dt, display, txt_content = item[0], item[1], item[2]
+    if not txt_content:
+        await callback.message.answer("❌ В письме не найден текст конспекта (txt-вложение).")
+        return
+    await callback.answer()
+    logger.info("[BRIEF] user=%s: запрашиваю краткий контекст «%s»", user_id, display[:70])
+    status = await callback.message.answer(
+        f"⏳ Составляю краткий контекст «{_md(display)}»...",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    try:
+        result = await call_ai(user_id, BRIEF_PROMPT, txt_content)
+        logger.info("[BRIEF] user=%s: результат %d симв.: %r", user_id, len(result or ""), (result or "")[:60])
+        if not result or result.startswith("❌"):
+            await status.edit_text(result or "❌ Нейросеть не ответила.", parse_mode=ParseMode.MARKDOWN)
+            return
+        header = f"📌 **Кратко: {_md(display)}**\n\n"
+        full = header + result
+        try:
+            await status.edit_text(full, parse_mode=ParseMode.MARKDOWN)
+        except Exception:
+            await status.edit_text(full)
+    except Exception as e:
+        logger.error("[BRIEF] user=%s исключение: %s", user_id, e, exc_info=True)
+        try:
+            await status.edit_text(f"❌ Ошибка: {e}")
+        except Exception:
+            pass
+
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("brief_pending:"))
+async def brief_pending_callback(callback: CallbackQuery, state: FSMContext):
+    """Кнопка «📌 Кратко» на уведомлении о новом конспекте."""
+    user_id = callback.from_user.id
+    key = callback.data.split(":", 1)[1]
+    pending = _load_wiki_pending(user_id)
+    item = pending.get(key)
+    if not item:
+        await callback.answer("❌ Конспект устарел или уже обработан.", show_alert=True)
+        return
+    display, txt_content = item[1], item[2]
+    if not txt_content:
+        await callback.message.answer("❌ В письме не найден текст конспекта (txt-вложение).")
+        return
+    await callback.answer()
+    logger.info("[BRIEF-PENDING] user=%s: краткий контекст «%s» (key=%r)", user_id, display[:70], key)
+    status = await callback.message.answer(
+        f"⏳ Составляю краткий контекст «{_md(display)}»...",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    try:
+        result = await call_ai(user_id, BRIEF_PROMPT, txt_content)
+        if not result or result.startswith("❌"):
+            await status.edit_text(result or "❌ Нейросеть не ответила.", parse_mode=ParseMode.MARKDOWN)
+            return
+        header = f"📌 **Кратко: {_md(display)}**\n\n"
+        full = header + result
+        try:
+            await status.edit_text(full, parse_mode=ParseMode.MARKDOWN)
+        except Exception:
+            await status.edit_text(full)
+    except Exception as e:
+        logger.error("[BRIEF-PENDING] user=%s исключение: %s", user_id, e, exc_info=True)
+        try:
+            await status.edit_text(f"❌ Ошибка: {e}")
+        except Exception:
+            pass
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -6941,6 +7050,11 @@ async def main():
                                             InlineKeyboardButton(
                                                 text="📝 Расшифровать и разместить в wiki",
                                                 callback_data=f"wiki_process:{key}",
+                                            )
+                                        ], [
+                                            InlineKeyboardButton(
+                                                text="📌 Кратко",
+                                                callback_data=f"brief_pending:{key}",
                                             )
                                         ]])
                                     await bot.send_message(
