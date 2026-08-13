@@ -2273,18 +2273,25 @@ def _ai_provider_keyboard() -> InlineKeyboardMarkup:
 # Если промпт не найден — жёлтая "Выбрать промпт" с предложением создать.
 
 
-def _get_item_button(idx: int, display: str) -> InlineKeyboardMarkup | None:
+def _get_item_button(idx: int, display: str, user_id: int | None = None) -> InlineKeyboardMarkup | None:
     """
-    Создаёт кнопку под конспектом: 🟢 Саммари (если есть подходящий промпт)
-    или 🟡 Выбрать промпт (если нет).
-    
+    Создаёт кнопку под конспектом в списке.
+
+    Бизнес-правило (владелец, 08.2026): если бот ЗНАЕТ промпт для
+    расшифровки этого конспекта — промпт загружен в настройках
+    (по префиксу темы) ИЛИ лежит в корневой папке wiki подраздела
+    (маршрут wiki.routing + настроенная wiki) — кнопку «Саммари»
+    НЕ выводим, остаётся только полный флоу «📝 Расшифровать и
+    разместить в wiki».
+
+    Если промпт неизвестен — показываем «🟡 Выбрать промпт»
+    (и кнопку расшифровки, как раньше).
+
     Бизнес-правило сопоставления: название конспекта должно начинаться
     с темы промпта (без учёта регистра). Например, промпт "План развития"
     подойдёт к конспекту "План развития на Q2".
     """
-    prompts = _load_prompts()
-    if not prompts:
-        return None
+    prompts = _load_prompts() or {}
 
     matched_prompt = None
     for topic in prompts:
@@ -2292,22 +2299,25 @@ def _get_item_button(idx: int, display: str) -> InlineKeyboardMarkup | None:
             matched_prompt = topic
             break
 
-    if matched_prompt:
-        return InlineKeyboardMarkup(inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text=f"🟢 Саммари #{idx}",
-                    callback_data=f"summary:{idx}:{matched_prompt}"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text=f"📝 Расшифровать и разместить в wiki #{idx}",
-                    callback_data=f"wiki_proc:{idx}"
-                )
-            ],
-        ])
+    # Промпт в корневой папке wiki: настроена wiki + есть маршрут
+    # для темы конспекта (промпт лежит в корне подраздела)
+    wiki_known = False
+    if user_id:
+        wiki = get_wiki_config(user_id)
+        if wiki and wiki.get("oauth_token") and wiki_route_section(user_id, display):
+            wiki_known = True
+
+    if matched_prompt or wiki_known:
+        # Промпт известен — кнопка «Саммари» не нужна
+        return InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(
+                text=f"📝 Расшифровать и разместить в wiki #{idx}",
+                callback_data=f"wiki_proc:{idx}"
+            )
+        ]])
     else:
+        if not prompts:
+            return None
         return InlineKeyboardMarkup(inline_keyboard=[
             [
                 InlineKeyboardButton(
@@ -4204,7 +4214,7 @@ async def cmd_get_notes(message: Message):
         dt, display = item[0], item[1]
         date_str = dt.strftime("%d.%m.%Y %H:%M")
         text = f"**{idx}.** {escape_md_simple(display)}\n📅 {date_str}"
-        button = _get_item_button(idx, display)
+        button = _get_item_button(idx, display, user.id)
         await message.answer(text, parse_mode=ParseMode.MARKDOWN, reply_markup=button)
 
 
@@ -4256,7 +4266,7 @@ async def cmd_list_new(message: Message):
         dt, display = item[0], item[1]
         date_str = dt.strftime("%d.%m.%Y %H:%M")
         text = f"**{idx}.** {escape_md_simple(display)}\n{date_str}"
-        button = _get_item_button(idx, display)
+        button = _get_item_button(idx, display, user.id)
         await message.answer(text, parse_mode=ParseMode.MARKDOWN, reply_markup=button)
 
 
@@ -4308,7 +4318,7 @@ async def cmd_list_all(message: Message):
         dt, display = item[0], item[1]
         date_str = dt.strftime("%d.%m.%Y %H:%M")
         text = f"**{idx}.** {escape_md_simple(display)}\n📅 {date_str}"
-        button = _get_item_button(idx, display)
+        button = _get_item_button(idx, display, user.id)
         await message.answer(text, parse_mode=ParseMode.MARKDOWN, reply_markup=button)
 
 
