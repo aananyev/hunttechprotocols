@@ -1208,6 +1208,17 @@ async def wiki_page_exists(wiki_config: dict, slug: str) -> bool:
     return False
 
 
+async def _ensure_wiki_folder(wiki_config: dict, slug: str, title: str) -> bool:
+    """Создаёт страницу-папку ({% tree %}), если она ещё не существует.
+       Вики НЕ создаёт промежуточные папки автоматически при создании
+       страницы с глубоким slug — без реальных папок страница не видна
+       в дереве {% tree %} (папки года/месяца «пропадают»)."""
+    if await wiki_page_exists(wiki_config, slug):
+        return True
+    ok, _ = await publish_to_wiki(title, "{% tree %}", wiki_config, page_slug=slug)
+    return ok
+
+
 async def process_conspect_to_wiki(user_id: int, item) -> tuple[bool, str]:
     """Полный флоу обработки конспекта для Вики (вызывается по кнопке):
        1) классифицируем конспект по префиксу темы → подраздел (wiki.routing);
@@ -1237,6 +1248,19 @@ async def process_conspect_to_wiki(user_id: int, item) -> tuple[bool, str]:
     page_name = dt.strftime("%Y.%m.%d")  # «2026.08.13»
     conspects_dir = f"{folder}/Конспекты/{year}/{month}"
     protocols_dir = f"{folder}/Протоколы/{year}/{month}"
+
+    # Материализуем папки: вики не создаёт промежуточные страницы
+    # автоматически — без них год/месяц «пропадают» из дерева
+    for dir_path, dir_title in (
+        (f"{folder}/Конспекты", "Конспекты"),
+        (f"{folder}/Конспекты/{year}", year),
+        (f"{folder}/Конспекты/{year}/{month}", month),
+        (f"{folder}/Протоколы", "Протоколы"),
+        (f"{folder}/Протоколы/{year}", year),
+        (f"{folder}/Протоколы/{year}/{month}", month),
+    ):
+        if not await _ensure_wiki_folder(wiki, dir_path, dir_title):
+            return False, f"❌ Не удалось создать папку {dir_path} в Вики."
 
     # 3) Оригинал конспекта — без изменений
     conspect_slug = f"{conspects_dir}/{page_name}"
