@@ -17,6 +17,7 @@ import email
 import logging
 import httpx
 import json
+import re
 from email.header import decode_header
 from email.utils import parsedate_to_datetime
 from datetime import datetime
@@ -288,7 +289,7 @@ def get_ai_config(user_id: int) -> dict | None:
 # API endpoint: https://api.wiki.yandex.net/v1/
 
 
-def save_wiki_config(user_id: int, authorized_key: str, org_id: str = "", mode: str = "", folder: str = "", collab_id: str = "", oauth_token: str = ""):
+def save_wiki_config(user_id: int, authorized_key: str, org_id: str = "", mode: str = "", folder: str = "", collab_id: str = "", oauth_token: str = "", prompt_slug: str = "", routing: dict | None = None):
     """Сохраняет настройки Яндекс Вики: авторизованный ключ сервисного аккаунта и ID организации.
        Бизнес-правило: authorized_key — это JSON с полями id, service_account_id, private_key.
        IAM-токен получается свежим через JWT при каждом запросе к Wiki API.
@@ -297,7 +298,9 @@ def save_wiki_config(user_id: int, authorized_key: str, org_id: str = "", mode: 
        folder: slug раздела Wiki, куда публиковать страницы (например, 'hr_meetings').
        collab_id: ID организации Яндекс 360 для заголовка X-Collab-Org-Id (обязателен для API).
        oauth_token: OAuth-токен пользователя (y0_...) — рабочий способ авторизации, если
-       сервисный аккаунт не привязан к организации Вики."""
+       сервисный аккаунт не привязан к организации Вики.
+       prompt_slug: slug страницы с промптом для AI-расшифровки конспектов.
+       routing: маппинг «префикс темы письма → slug подраздела Вики» для автопубликации."""
     users = _load_users()
     key = str(user_id)
     if key not in users:
@@ -311,6 +314,8 @@ def save_wiki_config(user_id: int, authorized_key: str, org_id: str = "", mode: 
         "folder": folder or old_wiki.get("folder", ""),
         "collab_id": collab_id or old_wiki.get("collab_id", ""),
         "oauth_token": oauth_token or old_wiki.get("oauth_token", ""),
+        "prompt_slug": prompt_slug or old_wiki.get("prompt_slug", ""),
+        "routing": routing if routing is not None else old_wiki.get("routing", {}),
     }
     # Очищаем старые поля, если были
     users[key]["wiki"].pop("api_key", None)
@@ -1015,7 +1020,7 @@ def _slugify(title: str, max_len: int = 60) -> str:
     return slug[:max_len].strip('-') or f"page-{int(datetime.now().timestamp())}"
 
 
-async def publish_to_wiki(title: str, content: str, wiki_config: dict) -> tuple[bool, str]:
+async def publish_to_wiki(title: str, content: str, wiki_config: dict, page_slug: str = "") -> tuple[bool, str]:
     """
     Публикует страницу в Яндекс Вики.
     
@@ -1052,14 +1057,21 @@ async def publish_to_wiki(title: str, content: str, wiki_config: dict) -> tuple[
     if collab_id:
         headers["X-Collab-Org-Id"] = collab_id
 
+    if page_slug:
+        # Готовый slug с путём подраздела (например, "раздел/имя-протокола")
+        slug = page_slug
+    else:
+        # Авто-генерация: транслитерация заголовка + дата-время
+        slug = f"{_slugify(title)}-{datetime.now().strftime('%Y%m%d-%H%M')}"
     payload = {
         "title": title,
-        "slug": f"{_slugify(title)}-{datetime.now().strftime('%Y%m%d-%H%M')}",
+        "slug": slug,
         "content": content,
     }
-    # Если указана папка (slug родительского раздела) — добавляем parent
+    # Если указана папка (slug родительского раздела) — добавляем parent.
+    # Только для простых slug-ов без "/" (вложенность задаётся путём в page_slug).
     folder = wiki_config.get("folder", "")
-    if folder:
+    if folder and "/" not in folder:
         payload["parent"] = folder
     # org_id (dir_id) — для ссылки на страницу в браузере
     org_id = wiki_config.get("org_id", "")
@@ -1091,6 +1103,120 @@ async def publish_to_wiki(title: str, content: str, wiki_config: dict) -> tuple[
         return False, "❌ Таймаут: Яндекс Вики не ответил за 30 секунд."
     except Exception as e:
         return False, f"❌ Ошибка подключения к Wiki: {e}"
+
+
+# ═══════════════════════════════════════════════════════════════════
+# ФЛОУ: КОНСПЕКТ → ПРОМПТ ИЗ ВИКИ → AI → ПРОТОКОЛ В ПОДРАЗДЕЛ ВИКИ
+# ═══════════════════════════════════════════════════════════════════
+# Бизнес-правило (владелец, 08.2026):
+# - В корне раздела «Совещания» лежит страница-промпт для расшифровки.
+# - Бот читает промпт из Вики, отдаёт его в нейросеть вместе с текстом
+#   конспекта и получает структурированный протокол.
+# - Протокол публикуется в подраздел (определяется по префиксу темы
+#   письма через маппинг wiki.routing).
+# - Письма НИКОГДА не помечаются прочитанными (BODY.PEEK + снятие флага).
+
+
+async def wiki_get_page_content(wiki_config: dict, slug: str) -> str:
+    """Читает содержимое страницы Вики (поле content) через API.
+       Возвращает пустую строку при ошибке/отсутствии содержимого."""
+    token = await _get_wiki_token(wiki_config)
+    if not token:
+        return ""
+    auth_scheme = "OAuth" if token.startswith("y0_") else "Bearer"
+    headers = {
+        "Authorization": f"{auth_scheme} {token}",
+        "Content-Type": "application/json",
+    }
+    collab_id = wiki_config.get("collab_id", "")
+    if collab_id:
+        headers["X-Collab-Org-Id"] = collab_id
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            resp = await client.get(
+                f"{WIKI_API_BASE}/pages",
+                headers=headers,
+                params={"slug": slug, "fields": "content"},
+            )
+            if resp.status_code == 200:
+                return resp.json().get("content", "")
+            logger.warning("Чтение страницы Вики %s: HTTP %s", slug, resp.status_code)
+    except Exception as e:
+        logger.error("Ошибка чтения страницы Вики %s: %s", slug, e)
+    return ""
+
+
+def wiki_extract_prompt(content: str) -> str:
+    """Извлекает текст промпта из страницы Вики.
+       Убирает макрос {% tree %} и заголовок «Промпт для нейросети»,
+       если он есть; иначе возвращает весь текст страницы целиком."""
+    if not content:
+        return ""
+    text = re.sub(r"\{%\s*tree\s*%\}", "", content)
+    marker = re.search(r"Промпт\s+для\s+нейросети", text, re.IGNORECASE)
+    if marker:
+        text = text[marker.start():]
+        text = re.sub(r"^[#*\s]*Промпт\s+для\s+нейросети[:*]*", "", text, flags=re.IGNORECASE)
+    return text.strip()
+
+
+def wiki_route_section(user_id: int, display: str) -> str:
+    """Определяет подраздел Вики по префиксу темы письма.
+       Правила — маппинг в конфиге wiki.routing:
+       {«префикс темы»: «slug подраздела»} (проверка по startswith, без учёта регистра).
+       Возвращает пустую строку, если подраздел не найден."""
+    wiki = get_wiki_config(user_id) or {}
+    routing = wiki.get("routing") or {}
+    disp_low = display.lower()
+    for prefix, slug in routing.items():
+        if disp_low.startswith(prefix.lower()):
+            return slug
+    return ""
+
+
+async def process_conspect_to_wiki(user_id: int, item) -> tuple[bool, str]:
+    """Полный флоу обработки найденного конспекта для Вики:
+       1) определяем подраздел по префиксу темы (wiki.routing);
+       2) читаем промпт из страницы Вики (wiki.prompt_slug);
+       3) генерируем протокол через нейросеть (call_ai);
+       4) публикуем страницу протокола в подраздел.
+       Возвращает (ok: bool, сообщение для пользователя)."""
+    dt, display, txt_content = item[0], item[1], item[2]
+    if not txt_content:
+        return False, "❌ В письме не найден текст конспекта (txt-вложение)."
+
+    wiki = get_wiki_config(user_id)
+    if not wiki or not wiki.get("oauth_token"):
+        return False, "❌ Яндекс Вики не настроена."
+
+    # 1) Подраздел
+    folder = wiki_route_section(user_id, display)
+    if not folder:
+        return False, f"⚠️ Для «{escape_md_simple(display)}» не задан подраздел Вики (проверьте wiki.routing)."
+
+    # 2) Промпт из Вики
+    prompt_slug = wiki.get("prompt_slug") or ""
+    if not prompt_slug:
+        return False, "⚠️ Не задана страница промпта (wiki.prompt_slug)."
+    page_content = await wiki_get_page_content(wiki, prompt_slug)
+    prompt_text = wiki_extract_prompt(page_content)
+    if not prompt_text:
+        return False, f"⚠️ Промпт не найден на странице {prompt_slug}."
+
+    # 3) AI-обработка: промпт (system) + конспект (user)
+    ai_text = (
+        f"Конспект/стенограмма встречи «{display}» "
+        f"от {dt.strftime('%d.%m.%Y')}:\n\n{txt_content}"
+    )
+    result = await call_ai(user_id, prompt_text, ai_text)
+    if not result or result.startswith("❌"):
+        return False, result or "❌ Нейросеть не вернула протокол."
+
+    # 4) Публикация протокола в подраздел
+    page_title = display
+    page_slug = f"{folder}/{_slugify(display)}-{dt.strftime('%Y%m%d-%H%M')}"
+    success, msg = await publish_to_wiki(page_title, result, wiki, page_slug=page_slug)
+    return success, msg
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -6208,19 +6334,16 @@ async def main():
                                     )
                             # ── Автопубликация в Яндекс Вики ──────────────
                             # Бизнес-правило: если у пользователя настроена
-                            # интеграция (authorized_key) и режим 'auto' —
-                            # найденный конспект сразу загружается в корпоративную
-                            # Яндекс Вики, результат отправляется ПОД сообщением
+                            # интеграция (oauth_token) и режим 'auto' —
+                            # найденный конспект обрабатывается по промпту из
+                            # Вики через нейросеть, протокол публикуется в
+                            # подраздел, результат отправляется ПОД сообщением
                             # о найденном конспекте.
                             wiki_config = get_wiki_config(user_id)
-                            if wiki_config and wiki_config.get("authorized_key") and get_wiki_mode(user_id) == "auto":
+                            if wiki_config and wiki_config.get("oauth_token") and get_wiki_mode(user_id) == "auto":
                                 for item in new_notifications:
-                                    _dt, display, txt_content = item[0], item[1], item[2]
-                                    if not txt_content:
-                                        continue
                                     try:
-                                        page_title = display
-                                        success, msg = await publish_to_wiki(page_title, txt_content, wiki_config)
+                                        success, msg = await process_conspect_to_wiki(user_id, item)
                                         await bot.send_message(
                                             chat_id=user_id,
                                             text=msg,
@@ -6228,8 +6351,8 @@ async def main():
                                         )
                                         if success:
                                             logger.info(
-                                                "✅ Конспект «%s» опубликован в Wiki (user %s)",
-                                                page_title, uid_str,
+                                                "✅ Протокол «%s» опубликован в Wiki (user %s)",
+                                                item[1], uid_str,
                                             )
                                     except Exception as e:
                                         logger.error(
