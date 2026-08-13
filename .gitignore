@@ -24,3 +24,4 @@ data/bot.log
 # Runtime notification tracking
 notified_comms.json
 wiki_pending.json
+summary_cache.json
