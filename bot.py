@@ -1537,15 +1537,21 @@ async def process_conspect_to_wiki(user_id: int, item, progress: WikiProgress | 
 # ═══════════════════════════════════════════════════════════════════
 
 
-def _set_email_read(user_id: int, imap_msg_id: str) -> bool:
+def _set_email_read(user_id: int, imap_msg_id: str) -> str:
     """Помечает письмо по UID как прочитанное (флаг \\Seen).
        После успешной цепочки AI→Wiki→БД — письмо уходит из /list.
+
+       Возвращает статус-строку:
+         "ok"            — письмо помечено прочитанным;
+         "not_available" — письмо не найдено в INBOX или не протокол Телемоста
+                           (чаще всего: уже перемещено в корзину ранее);
+         "error"         — неполная настройка почты / ошибка IMAP.
 
        UID вместо seq-номера: seq сдвигается при изменении ящика и
        пометка ушла бы чужому письму (08.2026)."""
     config = get_user_config(user_id)
     if _email_config_error(config):
-        return False
+        return "error"
     assert config is not None
     try:
         server = _connect_imap(config)
@@ -1557,16 +1563,16 @@ def _set_email_read(user_id: int, imap_msg_id: str) -> bool:
             if not ok_t:
                 logger.warning("[GUARD] user=%s: НЕ помечаю прочитанным письмо %s — не протокол Телемоста",
                                user_id, imap_msg_id)
-                return False
+                return "not_available"
             server.uid("STORE", imap_msg_id, "+FLAGS", "(\\Seen)")
             logger.info("📩 Письмо %s помечено прочитанным (%s)", imap_msg_id, user_id)
-            return True
+            return "ok"
         finally:
             server.close()
             server.logout()
     except Exception as e:
         logger.error("❌ Пометка письма %s: %s", imap_msg_id, e)
-        return False
+        return "error"
 
 
 # ── Перемещение письма в корзину почтового ящика ────────────
@@ -1694,18 +1700,29 @@ def _fetch_email_brief(user_id: int, imap_msg_id: str) -> str:
         return imap_msg_id
 
 
-def _move_email_to_trash(user_id: int, imap_msg_id: str) -> tuple[bool, str]:
+def _move_email_to_trash(user_id: int, imap_msg_id: str) -> tuple[bool, str, str]:
     r"""Перемещает письмо (по UID IMAP) в корзину почтового ящика.
        Сначала UID MOVE (RFC 6851), при неудаче — COPY + \Deleted + EXPUNGE.
 
-       Возвращает (ok, brief), где brief — «тема» от отправителя (или imap_msg_id),
-       чтобы бот мог написать, какое именно письмо переместил/не переместил.
+       Возвращает (ok, reason, brief):
+         ok     — True, если письмо перемещено;
+         reason — причина результата:
+                  "moved"        — письмо перемещено в корзину;
+                  "already_gone" — письма уже нет в INBOX (уже в корзине ранее);
+                  "not_telemost" — письмо в INBOX, но не протокол Телемоста;
+                  "error"        — настройка почты / IMAP / папка корзины.
+         brief  — «тема» от отправителя (или imap_msg_id), чтобы бот мог
+                  написать, какое именно письмо переместил/не переместил.
+
+       Различие already_gone / not_telemost нужно, чтобы нажатие на устаревшую
+       кнопку «Да, в корзину» не выглядело ошибкой (жалоба владельца, 08.2026):
+       письмо уже в корзине — это штатная ситуация, а не сбой.
 
        UID вместо seq-номера: seq сдвигается при изменении ящика и в корзину
        ушло бы ДРУГОЕ письмо (08.2026: CDEK-документы и рассылка Яндекса)."""
     config = get_user_config(user_id)
     if _email_config_error(config):
-        return False, imap_msg_id
+        return False, "error", imap_msg_id
     assert config is not None
     try:
         server = _connect_imap(config)
@@ -1713,7 +1730,7 @@ def _move_email_to_trash(user_id: int, imap_msg_id: str) -> tuple[bool, str]:
             typ, _ = server.select("INBOX")
             if typ != "OK":
                 logger.error("Не удалось выбрать INBOX (user=%s)", user_id)
-                return False, imap_msg_id
+                return False, "error", imap_msg_id
             # Описание/проверка письма ДО перемещения (после MOVE/EXPUNGE
             # письма в INBOX уже не будет).
             # Проверяем, что письмо с таким UID ещё в INBOX: UID MOVE на
@@ -1729,22 +1746,22 @@ def _move_email_to_trash(user_id: int, imap_msg_id: str) -> tuple[bool, str]:
             if not exists:
                 logger.warning("[TRASH] user=%s: письмо %s уже не в INBOX — не трогаю",
                                user_id, imap_msg_id)
-                return False, brief
+                return False, "already_gone", brief
             if not ok_t:
                 logger.warning("[GUARD] user=%s: отказ перемещать письмо %s — не протокол Телемоста (%s)",
                                user_id, imap_msg_id, brief)
-                return False, brief
+                return False, "not_telemost", brief
             trash = _find_trash_folder(server)
             if not trash:
                 logger.error("Папка корзины не найдена (user=%s)", user_id)
-                return False, brief
+                return False, "error", brief
             logger.info("[TRASH] user=%s: перемещаю письмо %s → %s", user_id, imap_msg_id, trash)
 
             # 1) Пробуем UID MOVE (RFC 6851) — надёжно, без EXPUNGE
             typ_m, _ = server.uid("MOVE", str(imap_msg_id), trash)
             if typ_m == "OK":
                 logger.info("[TRASH] user=%s: UID MOVE ok (письмо %s → %s)", user_id, imap_msg_id, trash)
-                return True, brief
+                return True, "moved", brief
             logger.warning("[TRASH] user=%s: UID MOVE не удался (%s), fallback COPY+DELETE", user_id, typ_m)
 
             # 2) Fallback: COPY + \Deleted + EXPUNGE
@@ -1752,17 +1769,17 @@ def _move_email_to_trash(user_id: int, imap_msg_id: str) -> tuple[bool, str]:
             if typ_c != "OK":
                 logger.error("[TRASH] user=%s: COPY письма %s в %s не удался (%s)",
                              user_id, imap_msg_id, trash, typ_c)
-                return False, brief
+                return False, "error", brief
             server.uid("STORE", str(imap_msg_id), "+FLAGS", "(\\Deleted)")
             server.expunge()
             logger.info("[TRASH] user=%s: письмо %s перемещено в %s (COPY+EXPUNGE)", user_id, imap_msg_id, trash)
-            return True, brief
+            return True, "moved", brief
         finally:
             server.close()
             server.logout()
     except Exception as e:
         logger.error("[TRASH] Исключение для user %s, письмо %s: %s", user_id, imap_msg_id, e, exc_info=True)
-        return False, imap_msg_id
+        return False, "error", imap_msg_id
 
 
 async def _ask_trash_after_publish(callback: CallbackQuery, user_id: int, item) -> None:
@@ -1772,11 +1789,6 @@ async def _ask_trash_after_publish(callback: CallbackQuery, user_id: int, item) 
     if not imap_id:
         logger.info("[TRASH] user=%s: imap_id отсутствует — пометка/корзина пропущены", user_id)
         return
-    await asyncio.to_thread(_set_email_read, user_id, imap_id)
-    kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="🗑 Да, в корзину", callback_data=f"trash_yes:{imap_id}"),
-        InlineKeyboardButton(text="Нет, оставить", callback_data=f"trash_no:{imap_id}"),
-    ]])
     # Бизнес-правило (владелец, 08.2026): в вопросе о корзине пишем,
     # КАКОЕ письмо можно удалить (тема + отправитель).
     subject = item[1] if len(item) > 1 else ""
@@ -1784,6 +1796,26 @@ async def _ask_trash_after_publish(callback: CallbackQuery, user_id: int, item) 
     brief = " ".join(
         p for p in (f"«{subject}»" if subject else "", f"от {frm}" if frm else "") if p
     ) or imap_id
+    read_status = await asyncio.to_thread(_set_email_read, user_id, imap_id)
+    if read_status != "ok":
+        # Письмо недоступно в INBOX (чаще всего — уже перемещено в корзину
+        # ранее при повторной обработке конспекта из списка) либо страж не
+        # пропустил его. Вопрос «Переместить в корзину?» не задаём: кнопка
+        # «Да, в корзину» для отсутствующего письма вела бы к ложной ошибке
+        # «Не удалось переместить письмо в корзину» (жалоба владельца, 08.2026).
+        logger.info("[TRASH] user=%s: письмо %s недоступно (status=%s) — вопрос о корзине пропущен",
+                    user_id, imap_id, read_status)
+        if read_status == "error":
+            await callback.message.answer(
+                f"❌ Не удалось пометить письмо прочитанным: {brief}. Вопрос о корзине пропущен.")
+        else:
+            await callback.message.answer(
+                f"ℹ️ Письмо {brief} уже недоступно в почте (вероятно, перемещено в корзину ранее) — вопрос о корзине пропущен.")
+        return
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="🗑 Да, в корзину", callback_data=f"trash_yes:{imap_id}"),
+        InlineKeyboardButton(text="Нет, оставить", callback_data=f"trash_no:{imap_id}"),
+    ]])
     await callback.message.answer(
         f"📬 Письмо помечено прочитанным.\n\n"
         f"🗑 Можно удалить письмо: {brief}.\n\n"
@@ -3158,7 +3190,7 @@ async def trash_callback(callback: CallbackQuery, state: FSMContext):
     if callback.data.startswith("trash_yes:"):
         logger.info("[TRASH-BTN] user=%s: пользователь согласился переместить письмо %s в корзину",
                     user_id, imap_id)
-        ok, brief = await asyncio.to_thread(_move_email_to_trash, user_id, imap_id)
+        ok, reason, brief = await asyncio.to_thread(_move_email_to_trash, user_id, imap_id)
         if ok:
             await callback.answer("🗑 Перемещено в корзину.")
             # Бизнес-правило (владелец, 08.2026): после удаления пишем,
@@ -3166,6 +3198,21 @@ async def trash_callback(callback: CallbackQuery, state: FSMContext):
             await callback.message.answer(f"🗑 Удалил письмо в корзину почтового ящика: {brief}.")
             # Письмо в корзине — запрос «Переместить в корзину?» и его кнопки
             # больше не нужны (бизнес-правило владельца, 08.2026).
+            await _delete_trash_request(callback.message)
+        elif reason in ("already_gone", "not_telemost"):
+            # Не ошибка, а штатная ситуация (жалоба владельца, 08.2026):
+            # письма уже нет в INBOX (повторное нажатие устаревшей кнопки,
+            # письмо уже в корзине) либо страж запретил трогать чужое письмо.
+            # Сообщаем информативно и убираем кнопки, чтобы их нельзя было
+            # нажимать повторно.
+            if reason == "already_gone":
+                await callback.answer("ℹ️ Письмо уже в корзине.", show_alert=True)
+                await callback.message.answer(
+                    f"ℹ️ Письмо уже перемещено в корзину ранее: {brief}.")
+            else:
+                await callback.answer("⛔️ Не протокол Телемоста.", show_alert=True)
+                await callback.message.answer(
+                    f"⛔️ Не перемещаю в корзину: это не протокол Телемоста ({brief}).")
             await _delete_trash_request(callback.message)
         else:
             await callback.answer("❌ Не удалось переместить письмо.", show_alert=True)

@@ -79,6 +79,57 @@ class FakeFilterServer:
         return "OK", None
 
 
+class TrashServer:
+    """Имитирует IMAP-сервер для _move_email_to_trash / _set_email_read:
+    uid_exists=False — письма нет в INBOX (уже в корзине);
+    telemost=False — письмо в INBOX, но не протокол Телемоста;
+    fail=True — IMAP-ошибка; move_ok=False — UID MOVE падает."""
+
+    def __init__(self, uid_exists=True, telemost=True, move_ok=True, fail=False):
+        self.uid_exists = uid_exists
+        self.telemost = telemost
+        self.move_ok = move_ok
+        self.fail = fail
+        self.calls = []
+
+    def select(self, folder):
+        return "OK", []
+
+    def list(self):
+        return "OK", [b'(\\HasNoChildren \\Trash) "/" "Trash"']
+
+    def uid(self, cmd, *args):
+        self.calls.append((cmd, args))
+        if self.fail:
+            raise RuntimeError("boom")
+        if cmd == "FETCH":
+            if not self.uid_exists:
+                return "OK", []
+            if self.telemost:
+                hdr = (
+                    f"Subject: {mime_word('Конспект встречи: Планёрка')}\r\n"
+                    "From: Хранитель встреч Телемоста <keeper@telemost.yandex.ru>\r\n\r\n"
+                ).encode()
+            else:
+                hdr = (
+                    "Subject: Пакет документов СВЯ-0427778 на оплату\r\n"
+                    "From: noreply-oplata@cdek.ru\r\n\r\n"
+                ).encode()
+            return "OK", [(b"1 (UID 42 BODY[HEADER.FIELDS (SUBJECT FROM)] {100}", hdr)]
+        if cmd == "MOVE":
+            return ("OK", None) if self.move_ok else ("NO", [b"some error"])
+        return "OK", None
+
+    def expunge(self):
+        return "OK", None
+
+    def close(self):
+        pass
+
+    def logout(self):
+        pass
+
+
 def mime_word(text):
     return f"=?UTF-8?B?{base64.b64encode(text.encode()).decode()}?="
 
@@ -177,6 +228,64 @@ async def main():
     # 8.7 пустые заголовки → False (fail-closed)
     ok, brief = bot._verify_telemost_email(FakeServer(b""), "42")
     check("8.7 пустые заголовки → (False, '42')", ok is False and brief == "42", brief)
+
+    # ── 9. _move_email_to_trash: (ok, reason, brief) ──────────────────────
+    orig_connect = bot._connect_imap
+    orig_guc = bot.get_user_config
+    bot.get_user_config = lambda uid: {"email": "a@hunttech.ru", "server": "imap",
+                                       "login": "a@hunttech.ru", "password": "x"}
+
+    # 9.1 Письма нет в INBOX (уже в корзине) — это НЕ ошибка: reason=already_gone
+    bot._connect_imap = lambda config: TrashServer(uid_exists=False)
+    ok, reason, brief = bot._move_email_to_trash(1, "42")
+    check("9.1 нет в INBOX → ok=False", ok is False)
+    check("9.2 reason=already_gone", reason == "already_gone", reason)
+
+    # 9.3 Письмо в INBOX и это Телемост → перемещено
+    bot._connect_imap = lambda config: TrashServer(uid_exists=True, telemost=True)
+    ok, reason, brief = bot._move_email_to_trash(1, "42")
+    check("9.3 телемост → ok=True", ok is True)
+    check("9.4 reason=moved", reason == "moved", reason)
+    check("9.5 brief с темой письма", "«Конспект встречи: Планёрка»" in brief, brief)
+
+    # 9.6 Чужое письмо в INBOX — страж: reason=not_telemost, ящик не тронут
+    srv = TrashServer(uid_exists=True, telemost=False)
+    bot._connect_imap = lambda config: srv
+    ok, reason, brief = bot._move_email_to_trash(1, "42")
+    check("9.6 не телемост → ok=False", ok is False)
+    check("9.7 reason=not_telemost", reason == "not_telemost", reason)
+    check("9.8 не телемост: MOVE не вызывался",
+          not any(cmd == "MOVE" for cmd, _ in srv.calls))
+
+    # 9.9 IMAP-ошибка → reason=error
+    bot._connect_imap = lambda config: TrashServer(fail=True)
+    ok, reason, _ = bot._move_email_to_trash(1, "42")
+    check("9.9 ошибка IMAP → ok=False, reason=error", ok is False and reason == "error", reason)
+
+    # ── 10. _set_email_read: статус-строки ────────────────────────────────
+    bot._connect_imap = lambda config: TrashServer(uid_exists=True, telemost=True)
+    st = bot._set_email_read(1, "42")
+    check("10.1 телемост → 'ok'", st == "ok", st)
+
+    bot._connect_imap = lambda config: TrashServer(uid_exists=False)
+    st = bot._set_email_read(1, "42")
+    check("10.2 нет в INBOX → 'not_available'", st == "not_available", st)
+
+    # Ошибка чтения заголовков внутри проверки тоже fail-closed → not_available
+    bot._connect_imap = lambda config: TrashServer(fail=True)
+    st = bot._set_email_read(1, "42")
+    check("10.3 сбой FETCH → 'not_available' (fail-closed)", st == "not_available", st)
+
+    # Реальный сбой подключения → 'error'
+    def boom_connect(config):
+        raise RuntimeError("connect boom")
+    bot._connect_imap = boom_connect
+    st = bot._set_email_read(1, "42")
+    check("10.4 ошибка подключения → 'error'", st == "error", st)
+
+    # восстановить моки, чтобы не влиять на другие тесты
+    bot._connect_imap = orig_connect
+    bot.get_user_config = orig_guc
 
     print(f"\nИтог: {pass_count} passed, {fail_count} failed")
     sys.exit(1 if fail_count else 0)
