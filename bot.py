@@ -83,7 +83,7 @@ logger = logging.getLogger("bot")
 
 from aiogram import Bot, Dispatcher
 from aiogram.filters import Command, CommandObject
-from aiogram.types import BotCommand, Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, ChatMemberUpdated
+from aiogram.types import BotCommand, BotCommandScopeChat, Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, ChatMemberUpdated
 from aiogram.enums import ParseMode
 
 import os
@@ -7851,6 +7851,18 @@ async def main():
         ]
         await bot.set_my_commands(commands=cmds)
         logger.info("✅ Нижнее меню команд установлено (%d команд)", len(cmds))
+        # Администратору — боковое меню + /usage (scope chat, эталон docs).
+        try:
+            admin_cmds = cmds + [
+                BotCommand(command="usage", description="💰 Расходы на нейросеть"),
+            ]
+            await bot.set_my_commands(
+                commands=admin_cmds,
+                scope=BotCommandScopeChat(chat_id=_master_admin_id),
+            )
+            logger.info("✅ Меню администратора установлено (%d команд)", len(admin_cmds))
+        except Exception as e:
+            logger.warning("⚠️ Не удалось установить меню администратора: %s", e)
     except Exception as e:
         logger.warning("⚠️ Не удалось установить меню команд: %s", e)
 
