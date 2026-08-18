@@ -33,6 +33,8 @@ import xml.etree.ElementTree as ET
 # ── Access control (из hunttech-bot-common) ───────────────
 from hunttech_bot_common.users import AccessManager
 from hunttech_bot_common.users.ptb import get_bot_access_path
+from hunttech_bot_common.ai import UsageTracker
+from hunttech_bot_common.ai.usage import UsageRecord, estimate_cost
 from hunttech_bot_common.telegram import escape_md_simple as _escape_md_v2  # noqa: F401
 
 
@@ -1486,7 +1488,7 @@ async def process_conspect_to_wiki(user_id: int, item, progress: WikiProgress | 
         f"от {dt.strftime('%d.%m.%Y')}:\n\n{txt_content}"
     )
     ai_start = time.monotonic()
-    result = await call_ai(user_id, prompt_text, ai_text)
+    result = await call_ai(user_id, prompt_text, ai_text, task="wiki_ai_expand")
     ai_elapsed = time.monotonic() - ai_start
     logger.info("[WIKI-FLOW] user=%s: AI ответил за %.1fс, len(result)=%d, префикс=%r",
                 user_id, ai_elapsed, len(result or ""), (result or "")[:60])
@@ -1911,6 +1913,10 @@ access_manager = AccessManager(
     master_admin_id=_master_admin_id,
     bot_name="HuntTech Protocols",
 )
+
+# Учёт обращений к нейросети: общий реестр всех HuntTech-ботов
+# (~/.hermes/hunttech_bots/ai_usage.json), отчёт — команда /usage.
+_usage_tracker = UsageTracker()
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -2873,7 +2879,7 @@ async def summary_callback(callback: CallbackQuery, state: FSMContext):
     # Вызываем AI: system_prompt = текст промпта, user_text = конспект
     system_prompt = prompt_text
     user_text = f"Конспект встречи: «{display}»\n\n{txt_content}"
-    result = await call_ai(user_id, system_prompt, user_text)
+    result = await call_ai(user_id, system_prompt, user_text, task="summarize_protocol")
 
     # ── Сохраняем в PostgreSQL ───────────────────────────────
     if db.DB_POOL and not result.startswith("❌"):
@@ -3305,7 +3311,7 @@ async def publish_group_callback(callback: CallbackQuery, state: FSMContext):
         parse_mode=ParseMode.MARKDOWN,
     )
     try:
-        digest = await call_ai(user_id, GROUP_DIGEST_PROMPT, protocol)
+        digest = await call_ai(user_id, GROUP_DIGEST_PROMPT, protocol, task="group_digest")
         if not digest or digest.startswith("❌"):
             await status.edit_text(digest or "❌ Нейросеть не ответила.", parse_mode=ParseMode.MARKDOWN)
             return
@@ -3454,7 +3460,7 @@ async def brief_callback(callback: CallbackQuery, state: FSMContext):
         parse_mode=ParseMode.MARKDOWN,
     )
     try:
-        result = await call_ai(user_id, BRIEF_PROMPT, txt_content)
+        result = await call_ai(user_id, BRIEF_PROMPT, txt_content, task="brief")
         logger.info("[BRIEF] user=%s: результат %d симв.: %r", user_id, len(result or ""), (result or "")[:60])
         if not result or result.startswith("❌"):
             await status.edit_text(result or "❌ Нейросеть не ответила.", parse_mode=ParseMode.MARKDOWN)
@@ -3495,7 +3501,7 @@ async def brief_pending_callback(callback: CallbackQuery, state: FSMContext):
         parse_mode=ParseMode.MARKDOWN,
     )
     try:
-        result = await call_ai(user_id, BRIEF_PROMPT, txt_content)
+        result = await call_ai(user_id, BRIEF_PROMPT, txt_content, task="brief")
         if not result or result.startswith("❌"):
             await status.edit_text(result or "❌ Нейросеть не ответила.", parse_mode=ParseMode.MARKDOWN)
             return
@@ -6805,7 +6811,7 @@ async def _send_summary(target, display: str, summary: str) -> None:
 # Универсальный вызов любого OpenAI-совместимого API.
 # Поддерживает OpenRouter, OpenAI, DeepSeek, vLLM и т.д.
 
-async def call_ai(user_id: int, system_prompt: str, user_text: str) -> str:
+async def call_ai(user_id: int, system_prompt: str, user_text: str, task: str = "call_ai") -> str:
     """
     Вызывает нейросеть через OpenAI-совместимый API.
     Настройки (endpoint, api_key, model) берутся из users.json для user_id.
@@ -6815,9 +6821,13 @@ async def call_ai(user_id: int, system_prompt: str, user_text: str) -> str:
     - Таймаут 120 секунд — длинные конспекты требуют времени
     - Для OpenRouter отправляет HTTP-Referer (требование их ToS)
     
+    Учёт расходов: каждое обращение пишется в общий реестр
+    (~/.hermes/hunttech_bots/ai_usage.json) — токены/стоимость из ответа API.
+    
     Returns:
         str — ответ нейросети или сообщение об ошибке, начинающееся с ❌
     """
+    import time
     ai_config = get_ai_config(user_id)
     if not ai_config:
         return "❌ AI не настроен. Используйте `/setup_ai`"
@@ -6847,6 +6857,10 @@ async def call_ai(user_id: int, system_prompt: str, user_text: str) -> str:
         ],
     }
 
+    from urllib.parse import urlparse
+    provider = urlparse(endpoint).netloc or endpoint
+
+    started = time.monotonic()
     try:
         async with httpx.AsyncClient(timeout=120) as client:
             response = await client.post(
@@ -6855,13 +6869,49 @@ async def call_ai(user_id: int, system_prompt: str, user_text: str) -> str:
                 json=payload,
             )
             if response.status_code != 200:
+                _track_usage(user_id, provider, model, task, "error", None, 0.0)
                 return f"❌ Ошибка API ({response.status_code}): {response.text[:500]}"
             result = response.json()
+            duration = (time.monotonic() - started) * 1000
+            usage = result.get("usage") or {}
+            _track_usage(
+                user_id, provider, model, task, "ok", usage, duration,
+            )
             return result["choices"][0]["message"]["content"]
     except httpx.TimeoutException:
+        _track_usage(user_id, provider, model, task, "error", None, 0.0)
         return "❌ Таймаут: нейросеть не ответила за 120 секунд"
     except Exception as e:
+        _track_usage(user_id, provider, model, task, "error", None, 0.0)
         return f"❌ Ошибка: {e}"
+
+
+def _track_usage(user_id: int, provider: str, model: str, task: str,
+                 status: str, usage: dict | None, duration_ms: float) -> None:
+    """Запись обращения к нейросети в общий реестр расходов."""
+    try:
+        u = usage or {}
+        input_tokens = int(u.get("prompt_tokens") or 0)
+        output_tokens = int(u.get("completion_tokens") or 0)
+        total = int(u.get("total_tokens") or 0)
+        cost = estimate_cost(model, input_tokens, output_tokens)
+        _usage_tracker.append(UsageRecord(
+            bot_name="protocols",
+            user_id=user_id,
+            username="",
+            provider=provider,
+            model=model,
+            task=task,
+            status=status,
+            prompt_tokens=input_tokens,
+            completion_tokens=output_tokens,
+            total_tokens=total,
+            duration_ms=duration_ms,
+            cost_usd=cost,
+            source="личные",
+        ))
+    except Exception as exc:
+        logger.warning("usage track failed: %s", exc)
 
 
 # ── Тестирование AI-подключения ──────────────────────────
@@ -6886,6 +6936,9 @@ async def _test_ai_connection(endpoint: str, api_key: str, model: str) -> str:
         "max_tokens": 10,
     }
 
+    from urllib.parse import urlparse
+    _test_provider = urlparse(endpoint).netloc or endpoint
+
     try:
         async with httpx.AsyncClient(timeout=15) as client:
             response = await client.post(
@@ -6895,20 +6948,57 @@ async def _test_ai_connection(endpoint: str, api_key: str, model: str) -> str:
             )
             if response.status_code == 200:
                 result = response.json()
+                _track_usage(0, _test_provider, model,
+                             "test_connection", "ok", result.get("usage"), 0.0)
                 reply = result["choices"][0]["message"]["content"]
                 return f"✅ Подключение успешно!\nОтвет модели: «{_md(reply.strip())}»"
             elif response.status_code == 401:
+                _track_usage(0, _test_provider, model,
+                             "test_connection", "error", None, 0.0)
                 return "❌ Ошибка авторизации (401). Проверьте API-ключ."
             elif response.status_code == 404:
+                _track_usage(0, _test_provider, model,
+                             "test_connection", "error", None, 0.0)
                 return "❌ Модель не найдена (404). Проверьте название модели."
             else:
+                _track_usage(0, _test_provider, model,
+                             "test_connection", "error", None, 0.0)
                 return f"❌ Ошибка API ({response.status_code}): {response.text[:300]}"
     except httpx.TimeoutException:
+        _track_usage(0, _test_provider, model,
+                     "test_connection", "error", None, 0.0)
         return "❌ Таймаут: сервер не ответил за 15 секунд. Проверьте endpoint."
     except httpx.ConnectError:
+        _track_usage(0, _test_provider, model,
+                     "test_connection", "error", None, 0.0)
         return "❌ Не удалось подключиться к серверу. Проверьте endpoint."
     except Exception as e:
+        _track_usage(0, _test_provider, model,
+                     "test_connection", "error", None, 0.0)
         return f"❌ Ошибка: {e}"
+
+
+# ═══════════════════════════════════════════════════════════════════
+# КОМАНДА /usage — РАСХОДЫ НА НЕЙРОСЕТЬ (только администратор)
+# ═══════════════════════════════════════════════════════════════════
+
+@dp.message(Command("usage"))
+async def cmd_usage(message: Message, command: CommandObject | None = None):
+    """Отчёт по расходам на нейросеть (общий реестр всех HuntTech-ботов).
+
+    Периоды: /usage — сегодня; week/month/all/N — 7/30/всё время/N дней.
+    """
+    user_id = message.from_user.id
+    if not access_manager.is_admin(user_id):
+        await message.answer("🚫 Только администратор может смотреть расходы.",
+                             parse_mode=ParseMode.MARKDOWN)
+        return
+    from hunttech_bot_common.ai import format_usage_report, usage_period_from_args
+    args = (command.args or "").split() if command else []
+    period = usage_period_from_args(args)
+    text = format_usage_report(_usage_tracker, period=period, bot_name="Protocols")
+    for i in range(0, len(text), 4000):
+        await message.answer(text[i:i + 4000], parse_mode=ParseMode.MARKDOWN)
 
 
 # ═══════════════════════════════════════════════════════════════════
