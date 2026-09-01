@@ -1907,7 +1907,7 @@ async def _hide_reply_keyboard(chat_id: int) -> None:
     """
     from aiogram.types import ReplyKeyboardRemove
     try:
-        await bot.send_message(chat_id, " ", reply_markup=ReplyKeyboardRemove(, parse_mode=ParseMode.MARKDOWN, hide_reply_keyboard=True))
+        await bot.send_message(chat_id, " ", reply_markup=ReplyKeyboardRemove())
     except Exception as e:
         logger.debug("Failed to hide reply keyboard: %s", e)
 
@@ -2044,9 +2044,10 @@ async def prompt_buttons_callback(callback: CallbackQuery, state: FSMContext):
         # Показываем список доступных промптов и предлагаем выбрать
         prompts = _load_prompts()
         if not prompts:
+            await _hide_reply_keyboard(message.chat.id)
             await message.answer(
                 "📭 Промптов нет. Добавить первый?", 
-                reply_markup=_first_prompt_keyboard(, parse_mode=ParseMode.MARKDOWN, hide_reply_keyboard=True),
+                reply_markup=_first_prompt_keyboard(),
             )
             return
         topics = "\n".join(f"• {_md(t)}" for t in sorted(prompts.keys()))
@@ -2062,9 +2063,10 @@ async def prompt_buttons_callback(callback: CallbackQuery, state: FSMContext):
         # Показываем список и предлагаем выбрать промпт для просмотра
         prompts = _load_prompts()
         if not prompts:
+            await _hide_reply_keyboard(message.chat.id)
             await message.answer(
                 "📭 Промптов нет. Добавить первый?", 
-                reply_markup=_first_prompt_keyboard(, parse_mode=ParseMode.MARKDOWN, hide_reply_keyboard=True),
+                reply_markup=_first_prompt_keyboard(),
             )
             return
         topics = "\n".join(f"• {_md(t)}" for t in sorted(prompts.keys()))
@@ -2079,9 +2081,10 @@ async def prompt_buttons_callback(callback: CallbackQuery, state: FSMContext):
         # Показываем список и предлагаем выбрать промпт для удаления
         prompts = _load_prompts()
         if not prompts:
+            await _hide_reply_keyboard(message.chat.id)
             await message.answer(
                 "📭 Промптов нет. Добавить первый?", 
-                reply_markup=_first_prompt_keyboard(, parse_mode=ParseMode.MARKDOWN, hide_reply_keyboard=True),
+                reply_markup=_first_prompt_keyboard(),
             )
             return
         topics = "\n".join(f"• {_md(t)}" for t in sorted(prompts.keys()))
@@ -3346,9 +3349,8 @@ async def publish_group_callback(callback: CallbackQuery, state: FSMContext):
             # ИИ мог выдать невалидную Markdown-разметку — отправляем без разметки
             logger.warning("[GROUP-PUB] user=%s: markdown упал (%s), шлю без разметки", user_id, e)
             await bot.send_message(
-                chat_id=target["chat_id"], text=full,
-                disable_web_page_preview=True,
-            , parse_mode=ParseMode.MARKDOWN)
+                chat_id=target["chat_id"], text=full, disable_web_page_preview=True
+            )
         await status.edit_text(
             f"✅ Опубликовано в группе «{_md(target.get('title') or target['chat_id'])}».",
             parse_mode=ParseMode.MARKDOWN,
@@ -3383,7 +3385,8 @@ async def on_my_chat_member(update: ChatMemberUpdated):
                     chat_id=actor_id,
                     text=f"✅ Бот назначен администратором группы «{title}».\n"
                          f"Теперь протоколы можно публиковать туда кнопкой «📢 Опубликовать в группе».",
-                , parse_mode=ParseMode.MARKDOWN)
+                    parse_mode=ParseMode.MARKDOWN,
+                )
             except Exception as e:
                 logger.warning("[GROUP-TARGET] не удалось уведомить user=%s: %s", actor_id, e)
         elif new_status in ("kicked", "left", "member", "restricted"):
@@ -3690,7 +3693,7 @@ async def cmd_list_prompts(message: Message, state: FSMContext, command: Command
                 await message.answer(
                     "📭 Промптов пока нет. Добавить первый?",
                     parse_mode=ParseMode.MARKDOWN,
-                    reply_markup=_first_prompt_keyboard(, hide_reply_keyboard=True),
+                    reply_markup=_first_prompt_keyboard(),
                 )
                 await state.set_state(AskAddFirstPrompt.waiting)
                 return
@@ -3710,7 +3713,7 @@ async def cmd_list_prompts(message: Message, state: FSMContext, command: Command
                 await message.answer(
                     "📭 Промптов пока нет. Добавить первый?",
                     parse_mode=ParseMode.MARKDOWN,
-                    reply_markup=_first_prompt_keyboard(, hide_reply_keyboard=True),
+                    reply_markup=_first_prompt_keyboard(),
                 )
                 await state.set_state(AskAddFirstPrompt.waiting)
                 return
@@ -3729,7 +3732,7 @@ async def cmd_list_prompts(message: Message, state: FSMContext, command: Command
                 await message.answer(
                     "📭 Промптов пока нет. Добавить первый?",
                     parse_mode=ParseMode.MARKDOWN,
-                    reply_markup=_first_prompt_keyboard(, hide_reply_keyboard=True),
+                    reply_markup=_first_prompt_keyboard(),
                 )
                 await state.set_state(AskAddFirstPrompt.waiting)
                 return
@@ -3749,13 +3752,13 @@ async def cmd_list_prompts(message: Message, state: FSMContext, command: Command
         await message.answer(
             "📭 Промптов пока нет. Добавить первый?",
             parse_mode=ParseMode.MARKDOWN,
-            reply_markup=_first_prompt_keyboard(, hide_reply_keyboard=True),
+            reply_markup=_first_prompt_keyboard(),
         )
         await state.set_state(AskAddFirstPrompt.waiting)
         return
     text = _format_prompt_list()
     await _hide_reply_keyboard(message.chat.id)
-    await message.answer(text, parse_mode=ParseMode.MARKDOWN, reply_markup=_prompt_keyboard(, hide_reply_keyboard=True))
+    await message.answer(text, parse_mode=ParseMode.MARKDOWN, reply_markup=_prompt_keyboard())
 
 
 # ── Команда /add_prompt ──────────────────────────────────────
@@ -3901,7 +3904,7 @@ async def add_prompt_text(message: Message, state: FSMContext):
 
     # Автоматически показываем обновлённый список
     list_text = _format_prompt_list()
-    await message.answer(list_text, parse_mode=ParseMode.MARKDOWN, reply_markup=_prompt_keyboard(, hide_reply_keyboard=True))
+    await message.answer(list_text, parse_mode=ParseMode.MARKDOWN, reply_markup=_prompt_keyboard())
 
 # ── Обработчик для ручного ввода темы после загрузки файла ──
 
@@ -3941,7 +3944,7 @@ async def add_prompt_topic_from_file(message: Message, state: FSMContext):
         )
         await state.clear()
         list_text = _format_prompt_list()
-        await message.answer(list_text, parse_mode=ParseMode.MARKDOWN, reply_markup=_prompt_keyboard(, hide_reply_keyboard=True))
+        await message.answer(list_text, parse_mode=ParseMode.MARKDOWN, reply_markup=_prompt_keyboard())
     else:
         await message.answer(
             f"✅ Тема «{_md(topic)}» принята.\n\n"
@@ -3966,7 +3969,7 @@ async def cmd_text_prompt_start(message: Message, state: FSMContext):
         await message.answer(
             "📭 Промптов пока нет. Добавить первый?",
             parse_mode=ParseMode.MARKDOWN,
-            reply_markup=_first_prompt_keyboard(, hide_reply_keyboard=True),
+            reply_markup=_first_prompt_keyboard(),
         )
         await state.set_state(AskAddFirstPrompt.waiting)
         return
@@ -4091,7 +4094,7 @@ async def cmd_delete_prompt_start(message: Message, state: FSMContext):
         await message.answer(
             "📭 Промптов пока нет. Добавить первый?",
             parse_mode=ParseMode.MARKDOWN,
-            reply_markup=_first_prompt_keyboard(, hide_reply_keyboard=True),
+            reply_markup=_first_prompt_keyboard(),
         )
         await state.set_state(AskAddFirstPrompt.waiting)
         return
@@ -4189,7 +4192,7 @@ async def delete_prompt_confirm(message: Message, state: FSMContext):
     # Автоматически показываем обновлённый список
     text = _format_prompt_list()
     await _hide_reply_keyboard(message.chat.id)
-    await message.answer(text, parse_mode=ParseMode.MARKDOWN, reply_markup=_prompt_keyboard(, hide_reply_keyboard=True))
+    await message.answer(text, parse_mode=ParseMode.MARKDOWN, reply_markup=_prompt_keyboard())
 
 
 # ── Команда /edit_prompt ─────────────────────────────────────
@@ -4208,7 +4211,7 @@ async def cmd_edit_prompt_start(message: Message, state: FSMContext):
         await message.answer(
             "📭 Промптов пока нет. Добавить первый?",
             parse_mode=ParseMode.MARKDOWN,
-            reply_markup=_first_prompt_keyboard(, hide_reply_keyboard=True),
+            reply_markup=_first_prompt_keyboard(),
         )
         await state.set_state(AskAddFirstPrompt.waiting)
         return
@@ -4330,7 +4333,7 @@ async def edit_prompt_text(message: Message, state: FSMContext):
     # Автоматически показываем обновлённый список
     text = _format_prompt_list()
     await _hide_reply_keyboard(message.chat.id)
-    await message.answer(text, parse_mode=ParseMode.MARKDOWN, reply_markup=_prompt_keyboard(, hide_reply_keyboard=True))
+    await message.answer(text, parse_mode=ParseMode.MARKDOWN, reply_markup=_prompt_keyboard())
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -4829,10 +4832,11 @@ async def cmd_start(message: Message, state: FSMContext):
         return
 
     # Настроенный пользователь — приветственное сообщение
-    # (стандарт HuntTech: plain text, parse_mode=None, нижнее меню
+    # (стандарт HuntTech: Markdown для форматирования, нижнее меню
     # актуальной клавиатуры — Telegram кэширует ReplyKeyboard по чату)
     ai_cfg = get_ai_config(user_id)
     ai_model = (ai_cfg or {}).get("model") or "не настроен"
+    await _hide_reply_keyboard(message.chat.id)
     await message.answer(
         "🚀 HuntTech Protocols Bot\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -4852,7 +4856,7 @@ async def cmd_start(message: Message, state: FSMContext):
         "4️⃣ /help — все команды\n"
         "\n"
         "Напиши /help — покажу все команды.",
-        parse_mode=None,
+        parse_mode=ParseMode.MARKDOWN,
         reply_markup=_main_menu_keyboard(),
     )
 
@@ -4972,7 +4976,7 @@ async def cmd_user(message: Message):
                 text=(
                     "🎉 Вам открыт доступ к боту *HuntTech Protocols*!\n\n"
                     "Напишите /start чтобы начать."
-                , parse_mode=ParseMode.MARKDOWN),
+                ),
                 parse_mode=ParseMode.MARKDOWN,
             )
         except Exception as exc:
@@ -5829,7 +5833,7 @@ async def _show_field_step(
         f"{label}\n\n{cur_line}\n\n"
         "Выберите действие:",
         parse_mode=ParseMode.MARKDOWN,
-        reply_markup=_setup_field_nav_keyboard(, hide_reply_keyboard=True),
+        reply_markup=_setup_field_nav_keyboard(),
     )
     await state.set_state(SetupSingleField.value)
 
@@ -5865,7 +5869,7 @@ async def _next_field_step(
         await message.answer(
             "✅ Настройка завершена.",
             parse_mode=ParseMode.MARKDOWN,
-            reply_markup=ReplyKeyboardRemove(, hide_reply_keyboard=True),
+            reply_markup=ReplyKeyboardRemove(),
         )
         await message.answer(
             _setup_section_text(user_id, section),
@@ -5900,7 +5904,7 @@ async def _finish_email_setup_early(message: Message, state: FSMContext) -> None
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=ReplyKeyboardRemove(),
     )
-    await message.answer("🔧 Главное меню:", reply_markup=_main_menu_keyboard(, parse_mode=ParseMode.MARKDOWN, hide_reply_keyboard=True))
+    await message.answer("🔧 Главное меню:", parse_mode=ParseMode.MARKDOWN, reply_markup=_main_menu_keyboard())
 
 
 @dp.message(SetupState.email)
@@ -6210,7 +6214,7 @@ async def setup_single_field(message: Message, state: FSMContext):
                 "нажмите «Редактировать», чтобы ввести его, "
                 "или «Следующий» для перехода дальше.",
                 parse_mode=ParseMode.MARKDOWN,
-                reply_markup=_setup_field_nav_keyboard(, hide_reply_keyboard=True),
+                reply_markup=_setup_field_nav_keyboard(),
             )
             return
         _apply_single_field(user_id, section, field, value, skipped=True)
@@ -6219,7 +6223,7 @@ async def setup_single_field(message: Message, state: FSMContext):
         await message.answer(
             f"✅ **{label}** оставлен: {masked}",
             parse_mode=ParseMode.MARKDOWN,
-            reply_markup=_setup_field_nav_keyboard(, hide_reply_keyboard=True),
+            reply_markup=_setup_field_nav_keyboard(),
         )
         await _next_field_step(message, state, apply_current=False)
         return
@@ -7252,7 +7256,7 @@ async def cmd_setup_ai(message: Message, state: FSMContext):
         "🤖 **Настройка нейросети**\n\n"
         "Выберите провайдера:",
         parse_mode=ParseMode.MARKDOWN,
-        reply_markup=_ai_provider_keyboard(, hide_reply_keyboard=True),
+        reply_markup=_ai_provider_keyboard(),
     )
     await state.set_state(AiSetupState.provider)
 
@@ -8027,7 +8031,7 @@ async def main():
                                         text=text,
                                         parse_mode=ParseMode.MARKDOWN,
                                         reply_markup=reply_markup,
-                                    , hide_reply_keyboard=True)
+                                    )
                                 except Exception as e:
                                     logger.error(
                                         "Не удалось отправить уведомление user %s: %s",
@@ -8104,7 +8108,7 @@ async def main():
                 chat_id=_master_admin_id,
                 text=startup_text,
                 parse_mode=None,
-                reply_markup=_main_menu_keyboard(, hide_reply_keyboard=True),
+                reply_markup=_main_menu_keyboard(),
             )
             logger.info("Startup message sent to admin %s", _master_admin_id)
         except Exception as e:
