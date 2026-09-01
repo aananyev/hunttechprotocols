@@ -7054,7 +7054,7 @@ async def call_ai(user_id: int, system_prompt: str, user_text: str, task: str = 
         # MultiFallbackAIClient сам уже уведомил админа. Просто сообщаем пользователю.
         logger.error("❌ MultiFallbackAIClient call failed completely (user=%s, task=%s): %s", user_id, task, e, exc_info=True)
         logger.warning("MultiFallbackAIClient call failed completely: %s", e)
-        return f"❌ Все модели AI недоступны: {type(e).__name__}: {e}"
+        return f"❌ Все модели AI недоступны. Проверьте ключи и подключение."
 
 
 async def _call_ai_direct(
