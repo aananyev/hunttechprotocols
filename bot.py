@@ -33,7 +33,7 @@ import xml.etree.ElementTree as ET
 # ── Access control (из hunttech-bot-common) ───────────────
 from hunttech_bot_common.users import AccessManager
 from hunttech_bot_common.users.ptb import get_bot_access_path
-from hunttech_bot_common.ai import UsageTracker
+from hunttech_bot_common.ai import UsageTracker, create_fallback_ai_client
 from hunttech_bot_common.ai.usage import UsageRecord, estimate_cost
 from hunttech_bot_common.telegram import escape_md_simple as _escape_md_v2  # noqa: F401
 
@@ -6811,40 +6811,170 @@ async def _send_summary(target, display: str, summary: str) -> None:
 # Универсальный вызов любого OpenAI-совместимого API.
 # Поддерживает OpenRouter, OpenAI, DeepSeek, vLLM и т.д.
 
+def _get_openrouter_key() -> str:
+    """Возвращает OpenRouter API key из users.json._fallback, .env или admin-конфига.
+
+    Приоритет: users.json "_fallback" → .env OPENROUTER_API_KEY → admin-конфиг (если OpenRouter).
+    """
+    try:
+        users = _load_users()
+        fb = users.get("_fallback") or {}
+        if fb.get("api_key"):
+            return fb["api_key"]
+    except Exception:
+        pass
+    env_key = os.getenv("OPENROUTER_API_KEY", "").strip()
+    if env_key:
+        return env_key
+    try:
+        admin_id = 272980897  # ADMIN_USER_ID
+        admin_cfg = get_user_config(admin_id) or {}
+        ai = admin_cfg.get("ai", {}) or {}
+        if "openrouter" in ai.get("endpoint", "").lower() and ai.get("api_key"):
+            return ai["api_key"]
+    except Exception:
+        pass
+    return ""
+
+
+async def _notify_admin(message: str) -> None:
+    """Отправляет уведомление администратору о переключении AI."""
+    admin_id = 272980897  # ADMIN_USER_ID
+    try:
+        await bot.send_message(
+            chat_id=admin_id,
+            text=f"🤖 **AI Fallback**\n{message}",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    except Exception as e:
+        logger.warning("AI fallback notification failed: %s", e)
+
+
+def _build_fallback_ai_client(user_id: int):
+    """Создаёт FallbackAIClient для пользователя: primary (из конфига) → NVIDIA через OpenRouter.
+
+    Возвращает None если primary-конфиг неполон.
+    """
+    ai_config = get_ai_config(user_id)
+    if not ai_config:
+        return None
+
+    primary_endpoint = ai_config.get("endpoint", "").rstrip("/")
+    primary_api_key = ai_config.get("api_key", "")
+    primary_model = ai_config.get("model", "deepseek-v4-flash")
+
+    fallback_endpoint = "https://openrouter.ai/api/v1"
+    fallback_api_key = _get_openrouter_key()
+    fallback_model = os.getenv(
+        "OPENROUTER_FALLBACK_MODEL", "nvidia/nemotron-3-super-120b-a12b:free"
+    )
+
+    if not primary_api_key or not fallback_api_key:
+        return None
+
+    return create_fallback_ai_client(
+        primary_endpoint=primary_endpoint,
+        primary_api_key=primary_api_key,
+        primary_model=primary_model,
+        fallback_endpoint=fallback_endpoint,
+        fallback_api_key=fallback_api_key,
+        fallback_model=fallback_model,
+        user_id=user_id,
+        username="",
+        bot_name="protocols-bot",
+        notify_func=_notify_admin,
+    )
+
+
 async def call_ai(user_id: int, system_prompt: str, user_text: str, task: str = "call_ai") -> str:
     """
-    Вызывает нейросеть через OpenAI-совместимый API.
-    Настройки (endpoint, api_key, model) берутся из users.json для user_id.
-    
+    Вызывает нейросеть через OpenAI-совместимый API с fallback-схемой:
+    primary (из users.json пользователя) → fallback (NVIDIA Nemotron через OpenRouter).
+
+    Стратегия (см. AI_FALLBACK_STRATEGY.md):
+      1. Берёт primary endpoint/api_key/model из users.json (настройки пользователя).
+      2. Если primary не отвечает (любая ошибка) → переключается на OpenRouter + NVIDIA.
+      3. При каждом переключении уведомляет администратора в Telegram.
+      4. Если обе модели упали — возвращает сообщение об ошибке.
+
     Бизнес-правила:
     - Всегда возвращает строку (ответ или ошибку) — никогда не падает
-    - Таймаут 120 секунд — длинные конспекты требуют времени
-    - Для OpenRouter отправляет HTTP-Referer (требование их ToS)
-    
-    Учёт расходов: каждое обращение пишется в общий реестр
-    (~/.hermes/hunttech_bots/ai_usage.json) — токены/стоимость из ответа API.
-    
+    - Учёт расходов: каждое обращение пишется в общий реестр (~/.hermes/hunttech_bots/ai_usage.json)
+    - Для OpenRouter автоматически добавляет HTTP-Referer / X-Title
+
     Returns:
         str — ответ нейросети или сообщение об ошибке, начинающееся с ❌
     """
     import time
+    from urllib.parse import urlparse
+
     ai_config = get_ai_config(user_id)
     if not ai_config:
         return "❌ AI не настроен. Используйте `/setup_ai`"
 
     endpoint = ai_config.get("endpoint", "").rstrip("/")
     api_key = ai_config.get("api_key", "")
-    model = ai_config.get("model", "gpt-4o")
+    model = ai_config.get("model", "deepseek-v4-flash")
 
     if not endpoint or not api_key:
         return "❌ AI настроен не полностью. Проверьте endpoint и API key через `/setup_ai`"
+
+    # Если пользователь сам использует OpenRouter (legacy) — fallback не нужен,
+    # делаем прямой вызов.
+    is_openrouter = "openrouter" in endpoint.lower()
+    fallback_key = _get_openrouter_key()
+
+    if is_openrouter or not fallback_key:
+        # Прямой вызов (legacy путь) — без fallback.
+        return await _call_ai_direct(
+            user_id, endpoint, api_key, model, system_prompt, user_text, task,
+        )
+
+    # Fallback-схема: primary (конфиг пользователя) → NVIDIA через OpenRouter
+    client = _build_fallback_ai_client(user_id)
+    if not client:
+        return await _call_ai_direct(
+            user_id, endpoint, api_key, model, system_prompt, user_text, task,
+        )
+
+    started = time.monotonic()
+    try:
+        resp = await client.complete(
+            system_prompt=system_prompt,
+            user_prompt=user_text,
+            task=task,
+        )
+        duration = (time.monotonic() - started) * 1000
+        content_text = resp.content or ""
+        # Трекинг расходов
+        try:
+            from hunttech_bot_common.ai import AIResponse  # noqa
+            usage = resp.usage or {}
+            provider_name = f"{urlparse(endpoint).netloc or endpoint}→openrouter"
+            _track_usage(
+                user_id, provider_name, model, task, "ok", usage, duration,
+            )
+        except Exception as exc:
+            logger.warning("usage track failed: %s", exc)
+        return content_text
+    except Exception as e:
+        # FallbackAIClient сам уже уведомил админа. Просто сообщаем пользователю.
+        logger.warning("FallbackAIClient call failed completely: %s", e)
+        return f"❌ Обе модели AI недоступны: {type(e).__name__}: {e}"
+
+
+async def _call_ai_direct(
+    user_id: int, endpoint: str, api_key: str, model: str,
+    system_prompt: str, user_text: str, task: str,
+) -> str:
+    """Прямой вызов LLM без fallback (для legacy OpenRouter-конфигов и тестов)."""
+    import time
+    from urllib.parse import urlparse
 
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
-
-    # Для OpenRouter добавляем заголовок с именем приложения
     if "openrouter" in endpoint.lower():
         headers["HTTP-Referer"] = "https://t.me/hunttech_protocols_bot"
         headers["X-Title"] = "HunttechProtocolsBot"
@@ -6856,10 +6986,7 @@ async def call_ai(user_id: int, system_prompt: str, user_text: str, task: str = 
             {"role": "user", "content": user_text},
         ],
     }
-
-    from urllib.parse import urlparse
     provider = urlparse(endpoint).netloc or endpoint
-
     started = time.monotonic()
     try:
         async with httpx.AsyncClient(timeout=120) as client:
@@ -6874,9 +7001,7 @@ async def call_ai(user_id: int, system_prompt: str, user_text: str, task: str = 
             result = response.json()
             duration = (time.monotonic() - started) * 1000
             usage = result.get("usage") or {}
-            _track_usage(
-                user_id, provider, model, task, "ok", usage, duration,
-            )
+            _track_usage(user_id, provider, model, task, "ok", usage, duration)
             return result["choices"][0]["message"]["content"]
     except httpx.TimeoutException:
         _track_usage(user_id, provider, model, task, "error", None, 0.0)
