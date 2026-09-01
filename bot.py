@@ -33,7 +33,12 @@ import xml.etree.ElementTree as ET
 # ── Access control (из hunttech-bot-common) ───────────────
 from hunttech_bot_common.users import AccessManager
 from hunttech_bot_common.users.ptb import get_bot_access_path
-from hunttech_bot_common.ai import UsageTracker, create_fallback_ai_client
+from hunttech_bot_common.ai import (
+    UsageTracker,
+    create_fallback_ai_client,
+    create_multi_fallback_ai_client,
+    OPENROUTER_FREE_MODELS,
+)
 from hunttech_bot_common.ai.usage import UsageRecord, estimate_cost
 from hunttech_bot_common.telegram import escape_md_simple as _escape_md_v2  # noqa: F401
 
@@ -1895,6 +1900,18 @@ async def _send_logo(chat_id: int) -> bool:
     return await send_logo(bot, chat_id)
 
 
+async def _hide_reply_keyboard(chat_id: int) -> None:
+    """Скрывает постоянную нижнюю клавиатуру, чтобы inline-кнопки не уходили за неё.
+
+    Отправляет пустое сообщение с ReplyKeyboardRemove.
+    """
+    from aiogram.types import ReplyKeyboardRemove
+    try:
+        await bot.send_message(chat_id, " ", reply_markup=ReplyKeyboardRemove(, parse_mode=ParseMode.MARKDOWN, hide_reply_keyboard=True))
+    except Exception as e:
+        logger.debug("Failed to hide reply keyboard: %s", e)
+
+
 def _bot_version() -> str:
     """Версия бота (стандарт HuntTech): pyproject.toml → короткий SHA."""
     from hunttech_bot_common.services.startup import bot_version
@@ -2029,7 +2046,7 @@ async def prompt_buttons_callback(callback: CallbackQuery, state: FSMContext):
         if not prompts:
             await message.answer(
                 "📭 Промптов нет. Добавить первый?", 
-                reply_markup=_first_prompt_keyboard(),
+                reply_markup=_first_prompt_keyboard(, parse_mode=ParseMode.MARKDOWN, hide_reply_keyboard=True),
             )
             return
         topics = "\n".join(f"• {_md(t)}" for t in sorted(prompts.keys()))
@@ -2047,7 +2064,7 @@ async def prompt_buttons_callback(callback: CallbackQuery, state: FSMContext):
         if not prompts:
             await message.answer(
                 "📭 Промптов нет. Добавить первый?", 
-                reply_markup=_first_prompt_keyboard(),
+                reply_markup=_first_prompt_keyboard(, parse_mode=ParseMode.MARKDOWN, hide_reply_keyboard=True),
             )
             return
         topics = "\n".join(f"• {_md(t)}" for t in sorted(prompts.keys()))
@@ -2064,7 +2081,7 @@ async def prompt_buttons_callback(callback: CallbackQuery, state: FSMContext):
         if not prompts:
             await message.answer(
                 "📭 Промптов нет. Добавить первый?", 
-                reply_markup=_first_prompt_keyboard(),
+                reply_markup=_first_prompt_keyboard(, parse_mode=ParseMode.MARKDOWN, hide_reply_keyboard=True),
             )
             return
         topics = "\n".join(f"• {_md(t)}" for t in sorted(prompts.keys()))
@@ -3331,7 +3348,7 @@ async def publish_group_callback(callback: CallbackQuery, state: FSMContext):
             await bot.send_message(
                 chat_id=target["chat_id"], text=full,
                 disable_web_page_preview=True,
-            )
+            , parse_mode=ParseMode.MARKDOWN)
         await status.edit_text(
             f"✅ Опубликовано в группе «{_md(target.get('title') or target['chat_id'])}».",
             parse_mode=ParseMode.MARKDOWN,
@@ -3366,7 +3383,7 @@ async def on_my_chat_member(update: ChatMemberUpdated):
                     chat_id=actor_id,
                     text=f"✅ Бот назначен администратором группы «{title}».\n"
                          f"Теперь протоколы можно публиковать туда кнопкой «📢 Опубликовать в группе».",
-                )
+                , parse_mode=ParseMode.MARKDOWN)
             except Exception as e:
                 logger.warning("[GROUP-TARGET] не удалось уведомить user=%s: %s", actor_id, e)
         elif new_status in ("kicked", "left", "member", "restricted"):
@@ -3673,7 +3690,7 @@ async def cmd_list_prompts(message: Message, state: FSMContext, command: Command
                 await message.answer(
                     "📭 Промптов пока нет. Добавить первый?",
                     parse_mode=ParseMode.MARKDOWN,
-                    reply_markup=_first_prompt_keyboard(),
+                    reply_markup=_first_prompt_keyboard(, hide_reply_keyboard=True),
                 )
                 await state.set_state(AskAddFirstPrompt.waiting)
                 return
@@ -3693,7 +3710,7 @@ async def cmd_list_prompts(message: Message, state: FSMContext, command: Command
                 await message.answer(
                     "📭 Промптов пока нет. Добавить первый?",
                     parse_mode=ParseMode.MARKDOWN,
-                    reply_markup=_first_prompt_keyboard(),
+                    reply_markup=_first_prompt_keyboard(, hide_reply_keyboard=True),
                 )
                 await state.set_state(AskAddFirstPrompt.waiting)
                 return
@@ -3712,7 +3729,7 @@ async def cmd_list_prompts(message: Message, state: FSMContext, command: Command
                 await message.answer(
                     "📭 Промптов пока нет. Добавить первый?",
                     parse_mode=ParseMode.MARKDOWN,
-                    reply_markup=_first_prompt_keyboard(),
+                    reply_markup=_first_prompt_keyboard(, hide_reply_keyboard=True),
                 )
                 await state.set_state(AskAddFirstPrompt.waiting)
                 return
@@ -3732,12 +3749,13 @@ async def cmd_list_prompts(message: Message, state: FSMContext, command: Command
         await message.answer(
             "📭 Промптов пока нет. Добавить первый?",
             parse_mode=ParseMode.MARKDOWN,
-            reply_markup=_first_prompt_keyboard(),
+            reply_markup=_first_prompt_keyboard(, hide_reply_keyboard=True),
         )
         await state.set_state(AskAddFirstPrompt.waiting)
         return
     text = _format_prompt_list()
-    await message.answer(text, parse_mode=ParseMode.MARKDOWN, reply_markup=_prompt_keyboard())
+    await _hide_reply_keyboard(message.chat.id)
+    await message.answer(text, parse_mode=ParseMode.MARKDOWN, reply_markup=_prompt_keyboard(, hide_reply_keyboard=True))
 
 
 # ── Команда /add_prompt ──────────────────────────────────────
@@ -3883,7 +3901,7 @@ async def add_prompt_text(message: Message, state: FSMContext):
 
     # Автоматически показываем обновлённый список
     list_text = _format_prompt_list()
-    await message.answer(list_text, parse_mode=ParseMode.MARKDOWN, reply_markup=_prompt_keyboard())
+    await message.answer(list_text, parse_mode=ParseMode.MARKDOWN, reply_markup=_prompt_keyboard(, hide_reply_keyboard=True))
 
 # ── Обработчик для ручного ввода темы после загрузки файла ──
 
@@ -3923,7 +3941,7 @@ async def add_prompt_topic_from_file(message: Message, state: FSMContext):
         )
         await state.clear()
         list_text = _format_prompt_list()
-        await message.answer(list_text, parse_mode=ParseMode.MARKDOWN, reply_markup=_prompt_keyboard())
+        await message.answer(list_text, parse_mode=ParseMode.MARKDOWN, reply_markup=_prompt_keyboard(, hide_reply_keyboard=True))
     else:
         await message.answer(
             f"✅ Тема «{_md(topic)}» принята.\n\n"
@@ -3948,7 +3966,7 @@ async def cmd_text_prompt_start(message: Message, state: FSMContext):
         await message.answer(
             "📭 Промптов пока нет. Добавить первый?",
             parse_mode=ParseMode.MARKDOWN,
-            reply_markup=_first_prompt_keyboard(),
+            reply_markup=_first_prompt_keyboard(, hide_reply_keyboard=True),
         )
         await state.set_state(AskAddFirstPrompt.waiting)
         return
@@ -4073,7 +4091,7 @@ async def cmd_delete_prompt_start(message: Message, state: FSMContext):
         await message.answer(
             "📭 Промптов пока нет. Добавить первый?",
             parse_mode=ParseMode.MARKDOWN,
-            reply_markup=_first_prompt_keyboard(),
+            reply_markup=_first_prompt_keyboard(, hide_reply_keyboard=True),
         )
         await state.set_state(AskAddFirstPrompt.waiting)
         return
@@ -4170,7 +4188,8 @@ async def delete_prompt_confirm(message: Message, state: FSMContext):
 
     # Автоматически показываем обновлённый список
     text = _format_prompt_list()
-    await message.answer(text, parse_mode=ParseMode.MARKDOWN, reply_markup=_prompt_keyboard())
+    await _hide_reply_keyboard(message.chat.id)
+    await message.answer(text, parse_mode=ParseMode.MARKDOWN, reply_markup=_prompt_keyboard(, hide_reply_keyboard=True))
 
 
 # ── Команда /edit_prompt ─────────────────────────────────────
@@ -4189,7 +4208,7 @@ async def cmd_edit_prompt_start(message: Message, state: FSMContext):
         await message.answer(
             "📭 Промптов пока нет. Добавить первый?",
             parse_mode=ParseMode.MARKDOWN,
-            reply_markup=_first_prompt_keyboard(),
+            reply_markup=_first_prompt_keyboard(, hide_reply_keyboard=True),
         )
         await state.set_state(AskAddFirstPrompt.waiting)
         return
@@ -4310,7 +4329,8 @@ async def edit_prompt_text(message: Message, state: FSMContext):
 
     # Автоматически показываем обновлённый список
     text = _format_prompt_list()
-    await message.answer(text, parse_mode=ParseMode.MARKDOWN, reply_markup=_prompt_keyboard())
+    await _hide_reply_keyboard(message.chat.id)
+    await message.answer(text, parse_mode=ParseMode.MARKDOWN, reply_markup=_prompt_keyboard(, hide_reply_keyboard=True))
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -4777,7 +4797,7 @@ async def cmd_start(message: Message, state: FSMContext):
                         chat_id=_master_admin_id,
                         text=(
                             f"🔔 Новый запрос доступа к боту *HuntTech Protocols*\n\n"
-                            f"Пользователь: {_md(display_name)}\n"
+                            f"Пользователь: {_md(display_name, parse_mode=ParseMode.MARKDOWN)}\n"
                             f"ID: `{user_id}`\n"
                             f"Username: @{_md(user.username or '-')}\n\n"
                             f"Разрешить: /user add {user_id}"
@@ -4820,8 +4840,10 @@ async def cmd_start(message: Message, state: FSMContext):
         "✅ Бот готов к работе!\n"
         f"🤖 AI: {ai_model}\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "📋 Назначение: достаю из почты «Конспекты встреч», извлекаю "
-        "текстовые отчёты и генерирую саммари по шаблону через нейросеть.\n"
+        "📋 Назначение: бот для автоматизации конспектов встреч из почты.\n"
+        "Извлекает отчёты из писем IMAP, генерирует саммари через нейросеть, "
+        "сохраняет в базу знаний (Wiki) и присылает уведомления.\n"
+        "Поддерживает несколько AI-моделей с автоматическим fallback (DeepSeek → NVIDIA → OpenRouter free).\n"
         "\n"
         "Как это работает:\n"
         "1️⃣ /list — непрочитанные конспекты встреч\n"
@@ -4871,7 +4893,7 @@ async def cmd_request_access(message: Message):
                 chat_id=_master_admin_id,
                 text=(
                     f"🔔 Новый запрос доступа к боту *HuntTech Protocols*\n\n"
-                    f"Пользователь: {_md(display_name)}\n"
+                    f"Пользователь: {_md(display_name, parse_mode=ParseMode.MARKDOWN)}\n"
                     f"ID: `{user_id}`\n"
                     f"Username: @{_md(user.username or '-')}\n\n"
                     f"Разрешить: /user add {user_id}"
@@ -4950,7 +4972,7 @@ async def cmd_user(message: Message):
                 text=(
                     "🎉 Вам открыт доступ к боту *HuntTech Protocols*!\n\n"
                     "Напишите /start чтобы начать."
-                ),
+                , parse_mode=ParseMode.MARKDOWN),
                 parse_mode=ParseMode.MARKDOWN,
             )
         except Exception as exc:
@@ -5084,7 +5106,7 @@ async def cmd_get_notes(message: Message):
         date_str = dt.strftime("%d.%m.%Y %H:%M")
         text = f"**{idx}.** {_md(display)}\n📅 {date_str}"
         button = _get_item_button(idx, display, user.id, list_id)
-        await message.answer(text, parse_mode=ParseMode.MARKDOWN, reply_markup=button)
+        await message.answer(text, parse_mode=ParseMode.MARKDOWN, reply_markup=button, hide_reply_keyboard=True)
 
 
 # ── Команда /list_all (все за неделю) ────────────────────────
@@ -5129,6 +5151,8 @@ async def cmd_list_new(message: Message):
     list_id = _save_notes_cache(user.id, items)
 
     total = len(items)
+    # Скрываем нижнюю клавиатуру, чтобы кнопки не уходили за неё
+    await _hide_reply_keyboard(message.chat.id)
     await message.answer(f"New conspects: {total} total", parse_mode=ParseMode.MARKDOWN)
 
     for idx, item in enumerate(items, 1):
@@ -5136,7 +5160,7 @@ async def cmd_list_new(message: Message):
         date_str = dt.strftime("%d.%m.%Y %H:%M")
         text = f"**{idx}.** {_md(display)}\n{date_str}"
         button = _get_item_button(idx, display, user.id, list_id)
-        await message.answer(text, parse_mode=ParseMode.MARKDOWN, reply_markup=button)
+        await message.answer(text, parse_mode=ParseMode.MARKDOWN, reply_markup=button, hide_reply_keyboard=True)
 
 
 async def cmd_list_all(message: Message):
@@ -5188,7 +5212,7 @@ async def cmd_list_all(message: Message):
         date_str = dt.strftime("%d.%m.%Y %H:%M")
         text = f"**{idx}.** {_md(display)}\n📅 {date_str}"
         button = _get_item_button(idx, display, user.id, list_id)
-        await message.answer(text, parse_mode=ParseMode.MARKDOWN, reply_markup=button)
+        await message.answer(text, parse_mode=ParseMode.MARKDOWN, reply_markup=button, hide_reply_keyboard=True)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -5805,7 +5829,7 @@ async def _show_field_step(
         f"{label}\n\n{cur_line}\n\n"
         "Выберите действие:",
         parse_mode=ParseMode.MARKDOWN,
-        reply_markup=_setup_field_nav_keyboard(),
+        reply_markup=_setup_field_nav_keyboard(, hide_reply_keyboard=True),
     )
     await state.set_state(SetupSingleField.value)
 
@@ -5841,7 +5865,7 @@ async def _next_field_step(
         await message.answer(
             "✅ Настройка завершена.",
             parse_mode=ParseMode.MARKDOWN,
-            reply_markup=ReplyKeyboardRemove(),
+            reply_markup=ReplyKeyboardRemove(, hide_reply_keyboard=True),
         )
         await message.answer(
             _setup_section_text(user_id, section),
@@ -5876,7 +5900,7 @@ async def _finish_email_setup_early(message: Message, state: FSMContext) -> None
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=ReplyKeyboardRemove(),
     )
-    await message.answer("🔧 Главное меню:", reply_markup=_main_menu_keyboard())
+    await message.answer("🔧 Главное меню:", reply_markup=_main_menu_keyboard(, parse_mode=ParseMode.MARKDOWN, hide_reply_keyboard=True))
 
 
 @dp.message(SetupState.email)
@@ -6135,7 +6159,7 @@ async def setup_password(message: Message, state: FSMContext):
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [
-                InlineKeyboardButton(text="🤖 Да, настроить AI", callback_data="ai_after_setup:yes"),
+                InlineKeyboardButton(text="🤖 Да, настроить AI", callback_data="ai_after_setup:yes", hide_reply_keyboard=True),
                 InlineKeyboardButton(text="🚫 Нет", callback_data="ai_after_setup:no"),
             ]
         ]),
@@ -6186,7 +6210,7 @@ async def setup_single_field(message: Message, state: FSMContext):
                 "нажмите «Редактировать», чтобы ввести его, "
                 "или «Следующий» для перехода дальше.",
                 parse_mode=ParseMode.MARKDOWN,
-                reply_markup=_setup_field_nav_keyboard(),
+                reply_markup=_setup_field_nav_keyboard(, hide_reply_keyboard=True),
             )
             return
         _apply_single_field(user_id, section, field, value, skipped=True)
@@ -6195,7 +6219,7 @@ async def setup_single_field(message: Message, state: FSMContext):
         await message.answer(
             f"✅ **{label}** оставлен: {masked}",
             parse_mode=ParseMode.MARKDOWN,
-            reply_markup=_setup_field_nav_keyboard(),
+            reply_markup=_setup_field_nav_keyboard(, hide_reply_keyboard=True),
         )
         await _next_field_step(message, state, apply_current=False)
         return
@@ -6246,7 +6270,7 @@ async def setup_single_field(message: Message, state: FSMContext):
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [
-                InlineKeyboardButton(text="✅ Подтвердить", callback_data="setup_sf:confirm"),
+                InlineKeyboardButton(text="✅ Подтвердить", callback_data="setup_sf:confirm", hide_reply_keyboard=True),
                 InlineKeyboardButton(text="✏️ Редактировать", callback_data="setup_sf:edit"),
             ],
             [
@@ -6848,6 +6872,69 @@ async def _notify_admin(message: str) -> None:
         )
     except Exception as e:
         logger.warning("AI fallback notification failed: %s", e)
+        logger.error("Failed to notify admin about AI fallback: %s", e, exc_info=True)
+
+
+def _build_multi_fallback_ai_client(user_id: int):
+    """Создаёт MultiFallbackAIClient: primary → fallback1 → OpenRouter free-модели."""
+    # Защита: user_id должен быть числом, не строкой (избегаем ошибки '_fallback')
+    try:
+        user_id = int(user_id)
+    except (ValueError, TypeError):
+        logger.error("Неверный user_id для AI fallback: %r (должен быть int)", user_id)
+        return None
+
+    ai_config = get_ai_config(user_id)
+    if not ai_config:
+        return None
+
+    primary_endpoint = ai_config.get("endpoint", "").rstrip("/")
+    primary_api_key = ai_config.get("api_key", "")
+    primary_model = ai_config.get("model", "deepseek-v4-flash")
+
+    if not primary_api_key:
+        return None
+
+    # Fallback1 — через OpenRouter (NVIDIA Nemotron)
+    fallback1_endpoint = "https://openrouter.ai/api/v1"
+    fallback1_api_key = _get_openrouter_key()
+    fallback1_model = os.getenv(
+        "OPENROUTER_FALLBACK_MODEL", "nvidia/nemotron-3-super-120b-a12b:free"
+    )
+
+    if not fallback1_api_key:
+        # Если нет OpenRouter-ключа, fallback-chain будет пустой
+        # Используем обычный FallbackAIClient (только primary)
+        return create_fallback_ai_client(
+            primary_endpoint=primary_endpoint,
+            primary_api_key=primary_api_key,
+            primary_model=primary_model,
+            fallback_endpoint=fallback1_endpoint,
+            fallback_api_key=fallback1_api_key,
+            fallback_model=fallback1_model,
+            user_id=user_id,
+            username="",
+            bot_name="protocols-bot",
+            notify_func=_notify_admin,
+        )
+
+    # Многоуровневый fallback: primary → fallback1 → список OpenRouter free-моделей
+    return create_multi_fallback_ai_client(
+        primary_endpoint=primary_endpoint,
+        primary_api_key=primary_api_key,
+        primary_model=primary_model,
+        fallback1_endpoint=fallback1_endpoint,
+        fallback1_api_key=fallback1_api_key,
+        fallback1_model=fallback1_model,
+        openrouter_api_key=fallback1_api_key,  # тот же ключ
+        openrouter_endpoint=fallback1_endpoint,
+        openrouter_models=OPENROUTER_FREE_MODELS,  # строго free!
+        user_id=user_id,
+        username="",
+        bot_name="protocols-bot",
+        notify_func=_notify_admin,
+        proxy="http://tWQrfq:YtJRww@209.46.2.183:8000",
+    )
 
 
 def _build_fallback_ai_client(user_id: int):
@@ -6930,8 +7017,9 @@ async def call_ai(user_id: int, system_prompt: str, user_text: str, task: str = 
             user_id, endpoint, api_key, model, system_prompt, user_text, task,
         )
 
-    # Fallback-схема: primary (конфиг пользователя) → NVIDIA через OpenRouter
-    client = _build_fallback_ai_client(user_id)
+    # Многоуровневая fallback-схема (2026-09-01):
+    # primary (конфиг пользователя) → fallback1 (NVIDIA) → OpenRouter free-модели
+    client = _build_multi_fallback_ai_client(user_id)
     if not client:
         return await _call_ai_direct(
             user_id, endpoint, api_key, model, system_prompt, user_text, task,
@@ -6939,6 +7027,7 @@ async def call_ai(user_id: int, system_prompt: str, user_text: str, task: str = 
 
     started = time.monotonic()
     try:
+        logger.info("🤖 AI вызов через MultiFallbackAIClient (user=%s, task=%s)", user_id, task)
         resp = await client.complete(
             system_prompt=system_prompt,
             user_prompt=user_text,
@@ -6950,7 +7039,7 @@ async def call_ai(user_id: int, system_prompt: str, user_text: str, task: str = 
         try:
             from hunttech_bot_common.ai import AIResponse  # noqa
             usage = resp.usage or {}
-            provider_name = f"{urlparse(endpoint).netloc or endpoint}→openrouter"
+            provider_name = f"{urlparse(endpoint).netloc or endpoint}→multi-fallback"
             _track_usage(
                 user_id, provider_name, model, task, "ok", usage, duration,
             )
@@ -6958,9 +7047,10 @@ async def call_ai(user_id: int, system_prompt: str, user_text: str, task: str = 
             logger.warning("usage track failed: %s", exc)
         return content_text
     except Exception as e:
-        # FallbackAIClient сам уже уведомил админа. Просто сообщаем пользователю.
-        logger.warning("FallbackAIClient call failed completely: %s", e)
-        return f"❌ Обе модели AI недоступны: {type(e).__name__}: {e}"
+        # MultiFallbackAIClient сам уже уведомил админа. Просто сообщаем пользователю.
+        logger.error("❌ MultiFallbackAIClient call failed completely (user=%s, task=%s): %s", user_id, task, e, exc_info=True)
+        logger.warning("MultiFallbackAIClient call failed completely: %s", e)
+        return f"❌ Все модели AI недоступны: {type(e).__name__}: {e}"
 
 
 async def _call_ai_direct(
@@ -7162,7 +7252,7 @@ async def cmd_setup_ai(message: Message, state: FSMContext):
         "🤖 **Настройка нейросети**\n\n"
         "Выберите провайдера:",
         parse_mode=ParseMode.MARKDOWN,
-        reply_markup=_ai_provider_keyboard(),
+        reply_markup=_ai_provider_keyboard(, hide_reply_keyboard=True),
     )
     await state.set_state(AiSetupState.provider)
 
@@ -7937,7 +8027,7 @@ async def main():
                                         text=text,
                                         parse_mode=ParseMode.MARKDOWN,
                                         reply_markup=reply_markup,
-                                    )
+                                    , hide_reply_keyboard=True)
                                 except Exception as e:
                                     logger.error(
                                         "Не удалось отправить уведомление user %s: %s",
@@ -8014,7 +8104,7 @@ async def main():
                 chat_id=_master_admin_id,
                 text=startup_text,
                 parse_mode=None,
-                reply_markup=_main_menu_keyboard(),
+                reply_markup=_main_menu_keyboard(, hide_reply_keyboard=True),
             )
             logger.info("Startup message sent to admin %s", _master_admin_id)
         except Exception as e:
