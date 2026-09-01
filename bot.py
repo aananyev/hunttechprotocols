@@ -6880,6 +6880,12 @@ async def _notify_admin(message: str) -> None:
 
 
 def _build_multi_fallback_ai_client(user_id: int):
+    """Создаёт MultiFallbackAIClient. Защита от строковых user_id (например '_fallback')."""
+    try:
+        user_id = int(user_id)
+    except (ValueError, TypeError):
+        logger.warning("Некорректный user_id для AI fallback: %r (тип: %s)", user_id, type(user_id).__name__)
+        return None
     """Создаёт MultiFallbackAIClient: primary → fallback1 → OpenRouter free-модели."""
     # Защита: user_id должен быть числом, не строкой (избегаем ошибки '_fallback')
     try:

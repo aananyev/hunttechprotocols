@@ -1,5 +1,5 @@
 [project]
 name = "hunttechprotocols"
-version = "1.1.9"
+version = "1.1.10"
 description = "HuntTech Protocols Bot — Telegram-бот конспектов встреч и протоколов"
 requires-python = ">=3.11"
