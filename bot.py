@@ -1386,28 +1386,40 @@ class WikiProgress:
             logger.error("[PROGRESS] user=%s: не удалось обновить статус: %s", self.user_id, e)
 
 
-async def process_conspect_to_wiki(user_id: int, item, progress: WikiProgress | None = None) -> tuple[bool, str, str, str]:
+PROMPT_CHOICE_NEEDED = "PROMPT_CHOICE_NEEDED"
+
+
+async def process_conspect_to_wiki(
+    user_id: int,
+    item,
+    progress: WikiProgress | None = None,
+    prompt_topic: str | None = None,
+) -> tuple[bool, str, str, str, list[str] | None]:
     """Полный флоу обработки конспекта для Вики (вызывается по кнопке):
        1) классифицируем конспект по префиксу темы → подраздел (wiki.routing);
        2) строим путь: {подраздел}/Конспекты/{год}/{месяц} и {подраздел}/Протоколы/{год}/{месяц};
        3) сохраняем ОРИГИНАЛ конспекта без изменений в папку конспектов;
-       4) читаем промпт из корня подраздела (fallback: wiki.prompt_slug);
+       4) берём промпт: либо явно (prompt_topic — из prompts.json), либо
+          ищем в корне подраздела (fallback: wiki.prompt_slug);
        5) расшифровываем конспект через нейросеть (call_ai);
        6) размещаем протокол в папке протоколов.
        Страницы именуются «{год}.{месяц}.{день}».
-       Возвращает (ok: bool, сообщение для пользователя, текст саммари,
-       ссылка на протокол в Вики)."""
+       Возвращает (ok: bool, сообщение/сигнал, текст саммари,
+       ссылка на протокол в Вики, список тем промптов для выбора
+       или None). При ok=False и msg == PROMPT_CHOICE_NEEDED — последнее
+       поле содержит список тем доступных промптов, чтобы вызывающий
+       хендлер показал пользователю инлайн-кнопки выбора."""
     dt, display, txt_content = item[0], item[1], item[2]
     logger.info("[WIKI-FLOW] user=%s начал обработку: display=%r dt=%s txt_len=%d",
                 user_id, display[:80], dt, len(txt_content or ""))
     if not txt_content:
         logger.warning("[WIKI-FLOW] user=%s: пустой txt в конспекте %r", user_id, display[:80])
-        return False, "❌ В письме не найден текст конспекта (txt-вложение).", "", ""
+        return False, "❌ В письме не найден текст конспекта (txt-вложение).", "", "", None
 
     wiki = get_wiki_config(user_id)
     if not wiki or not wiki.get("oauth_token"):
         logger.warning("[WIKI-FLOW] user=%s: вики не настроена (oauth_token отсутствует)", user_id)
-        return False, "❌ Яндекс Вики не настроена.", "", ""
+        return False, "❌ Яндекс Вики не настроена.", "", "", None
 
     # 1) Подраздел (классификация по префиксу темы)
     if progress:
@@ -1416,7 +1428,7 @@ async def process_conspect_to_wiki(user_id: int, item, progress: WikiProgress | 
     if not folder:
         if progress:
             await progress.fail()
-        return False, f"⚠️ Для «{_md(display)}» не задан подраздел Вики (проверьте wiki.routing).", "", ""
+        return False, f"⚠️ Для «{_md(display)}» не задан подраздел Вики (проверьте wiki.routing).", "", "", None
     if progress:
         await progress.done()
 
@@ -1445,7 +1457,7 @@ async def process_conspect_to_wiki(user_id: int, item, progress: WikiProgress | 
             logger.error("[WIKI-FLOW] user=%s: не удалось создать папку %s", user_id, dir_path)
             if progress:
                 await progress.fail()
-            return False, f"❌ Не удалось создать папку {dir_path} в Вики.", "", ""
+            return False, f"❌ Не удалось создать папку {dir_path} в Вики.", "", "", None
     if progress:
         await progress.done()
 
@@ -1462,28 +1474,46 @@ async def process_conspect_to_wiki(user_id: int, item, progress: WikiProgress | 
     if not ok1:
         if progress:
             await progress.fail()
-        return False, msg1, "", ""
+        return False, msg1, "", "", None
     if progress:
         await progress.done()
 
-    # 4) Промпт: корень подраздела → fallback на wiki.prompt_slug
-    if progress:
-        await progress.start("Чтение промпта из Вики")
-    prompt_slug = wiki.get("prompt_slug") or ""
-    page_content = await wiki_get_page_content(wiki, folder)
-    prompt_text = wiki_extract_prompt(page_content)
-    if not prompt_text and prompt_slug and prompt_slug != folder:
-        logger.info("[WIKI-FLOW] user=%s: промпта нет в %s, пробую fallback %s", user_id, folder, prompt_slug)
-        page_content = await wiki_get_page_content(wiki, prompt_slug)
-        prompt_text = wiki_extract_prompt(page_content)
-    if not prompt_text:
-        logger.error("[WIKI-FLOW] user=%s: промпт не найден (folder=%s prompt_slug=%r)", user_id, folder, prompt_slug)
+    # 4) Промпт: явно задан → из prompts.json, иначе → корень подраздела → fallback на wiki.prompt_slug
+        prompt_text = None
+        if prompt_topic is not None:
+            # Используем явно заданную тему промпта
+            prompts = _load_prompts()
+            prompt_text = prompts.get(prompt_topic)
+            if prompt_text is None:
+                logger.error("[WIKI-FLOW] user=%s: промпт с темой '%s' не найден в настройках", user_id, prompt_topic)
+                if progress:
+                    await progress.fail()
+                return False, f"⚠️ Промпт с темой «{_md(prompt_topic)}» не найден.", "", "", None
+        else:
+            # Ищем промпт в Вики как раньше
+            if progress:
+                await progress.start("Чтение промпта из Вики")
+            prompt_slug = wiki.get("prompt_slug") or ""
+            page_content = await wiki_get_page_content(wiki, folder)
+            prompt_text = wiki_extract_prompt(page_content)
+            if not prompt_text and prompt_slug and prompt_slug != folder:
+                logger.info("[WIKI-FLOW] user=%s: промпта нет в %s, пробую fallback %s", user_id, folder, prompt_slug)
+                page_content = await wiki_get_page_content(wiki, prompt_slug)
+                prompt_text = wiki_extract_prompt(page_content)
         if progress:
-            await progress.fail()
-        return False, f"⚠️ Промпт не найден в папке {folder}.", "", ""
-    if progress:
-        await progress.done()
-    logger.info("[WIKI-FLOW] user=%s: промпт получен (%d символов), запускаю AI...", user_id, len(prompt_text))
+            await progress.done()
+        if not prompt_text:
+            # Промпт не найден в Вики — проверяем, есть ли промпты в настройках для выбора
+            prompts = _load_prompts()
+            if prompts:
+                logger.info("[WIKI-FLOW] user=%s: промпт не найден в Вики, предлагаем выбрать из настроек", user_id)
+                return False, PROMPT_CHOICE_NEEDED, "", "", list(prompts.keys())
+            else:
+                logger.error("[WIKI-FLOW] user=%s: промпт не найден (folder=%s prompt_slug=%r)", user_id, folder, prompt_slug)
+                if progress:
+                    await progress.fail()
+                return False, f"⚠️ Промпт не найден в папке {folder}.", "", "", None
+        logger.info("[WIKI-FLOW] user=%s: промпт получен (%d символов), запускаю AI...", user_id, len(prompt_text))
 
     # 5) AI-расшифровка по промпту
     if progress:
@@ -1501,7 +1531,7 @@ async def process_conspect_to_wiki(user_id: int, item, progress: WikiProgress | 
         logger.error("[WIKI-FLOW] user=%s: AI не вернул протокол: %r", user_id, (result or "")[:200])
         if progress:
             await progress.fail()
-        return False, result or "❌ Нейросеть не вернула протокол.", "", ""
+        return False, result or "❌ Нейросеть не вернула протокол.", "", "", None
     if progress:
         await progress.done()
 
@@ -1518,7 +1548,7 @@ async def process_conspect_to_wiki(user_id: int, item, progress: WikiProgress | 
     if not ok2:
         if progress:
             await progress.fail()
-        return False, msg2, "", ""
+        return False, msg2, "", "", None
     if progress:
         await progress.done()
 
@@ -1536,7 +1566,7 @@ async def process_conspect_to_wiki(user_id: int, item, progress: WikiProgress | 
                      _label_published("Конспект", msg1),
                      _label_published("Протокол", msg2),
                      "", f"🗂 {page_name}"]
-    return True, "\n".join(summary_parts), result, _wiki_page_url(wiki, protocol_slug)
+    return True, "\\n".join(summary_parts), result, _wiki_page_url(wiki, protocol_slug), None
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -3012,7 +3042,35 @@ async def wiki_proc_callback(callback: CallbackQuery, state: FSMContext):
     )
     try:
         progress = WikiProgress(status_msg, user_id, item[1])
-        ok, msg, summary, protocol_url = await process_conspect_to_wiki(user_id, item, progress)
+        ok, msg, summary, protocol_url, prompt_choices = await process_conspect_to_wiki(user_id, item, progress)
+        if not ok and msg == PROMPT_CHOICE_NEEDED:
+            # Prompt not determined — ask user to choose from available prompts
+            prompts = _load_prompts()
+            if not prompts:
+                await status_msg.edit_text("❌ No prompts available. Please add prompts first.", parse_mode=ParseMode.MARKDOWN)
+                await _restore_wiki_proc_button(callback.message, marked)
+                return
+            # Create keyboard with prompt topics
+            keyboard = []
+            row = []
+            for i, topic in enumerate(sorted(prompts.keys())):
+                row.append(InlineKeyboardButton(
+                    text=f"{_md(topic)}",
+                    callback_data=f"choose_prompt:{list_id}:{idx}:{topic}"
+                ))
+                if len(row) == 2:  # 2 buttons per row
+                    keyboard.append(row)
+                    row = []
+            if row:
+                keyboard.append(row)
+            reply_markup = InlineKeyboardMarkup(inline_keyboard=keyboard)
+            await status_msg.edit_text(
+                "⚠️ Prompt not determined. Please select a prompt for processing:",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=reply_markup
+            )
+            # Don't restore the button yet — wait for user choice
+            return
         logger.info("[WIKI-BTN] user=%s результат: ok=%s msg=%r", user_id, ok, (msg or "")[:150])
         final = f"{progress.render()}\n\n{msg}"
         if ok:
@@ -3075,7 +3133,35 @@ async def wiki_process_callback(callback: CallbackQuery, state: FSMContext):
     )
     try:
         progress = WikiProgress(status_msg, user_id, display)
-        ok, msg, summary, protocol_url = await process_conspect_to_wiki(user_id, item, progress)
+        ok, msg, summary, protocol_url, prompt_choices = await process_conspect_to_wiki(user_id, item, progress)
+        if not ok and msg == PROMPT_CHOICE_NEEDED:
+            # Prompt not determined — ask user to choose from available prompts
+            prompts = _load_prompts()
+            if not prompts:
+                await status_msg.edit_text("❌ No prompts available. Please add prompts first.", parse_mode=ParseMode.MARKDOWN)
+                await _restore_wiki_proc_button(callback.message, marked)
+                return
+            # Create keyboard with prompt topics
+            keyboard = []
+            row = []
+            for i, topic in enumerate(sorted(prompts.keys())):
+                row.append(InlineKeyboardButton(
+                    text=f"{_md(topic)}",
+                    callback_data=f"choose_prompt_for:{uid}:{topic}"
+                ))
+                if len(row) == 2:
+                    keyboard.append(row)
+                    row = []
+            if row:
+                keyboard.append(row)
+            reply_markup = InlineKeyboardMarkup(inline_keyboard=keyboard)
+            await status_msg.edit_text(
+                "⚠️ Prompt not determined. Please select a prompt for processing:",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=reply_markup
+            )
+            # Don't restore the button yet — wait for user choice
+            return
         final = f"{progress.render()}\n\n{msg}"
         if ok:
             _remove_wiki_pending(user_id, uid)
@@ -3108,6 +3194,53 @@ async def choose_prompt_callback(callback: CallbackQuery, state: FSMContext):
     как тему нового промпта.
     """
     parts = callback.data.split(":", 1)[1].split(":")
+    # Selection format: choose_prompt:{list_id}:{idx}:{topic} (4 parts after split with max 1)
+    # Actually after split(":", 1) we have the rest; splitting that by ":" gives:
+    # - Old: [list_id, idx] or [idx] → 1-2 parts
+    # - Selection: [list_id, idx, topic] → 3 parts (topic may contain colons, so join rest)
+    if len(parts) >= 3:
+        # Selection format: user selected a prompt topic for this note
+        list_id, idx_str = parts[0], parts[1]
+        topic = ':'.join(parts[2:])
+        idx = int(idx_str) - 1
+        await callback.answer()
+        user_id = callback.from_user.id
+        items = _load_notes_cache(user_id, list_id)
+        if idx < 0 or idx >= len(items):
+            await callback.message.answer("❌ Конспект устарел. Запросите /list заново.")
+            return
+        item = items[idx]
+        # Re-run the protocol flow with the selected prompt topic
+        from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+        # Show status message and process
+        status_msg = await callback.message.answer(
+            f"⏳ Обрабатываю «{_md(item[1])}» через промпт «{_md(topic)}»...",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        try:
+            progress = WikiProgress(status_msg, user_id, item[1])
+            ok, msg, summary, protocol_url, _ = await process_conspect_to_wiki(
+                user_id, item, progress, prompt_topic=topic
+            )
+            final = f"{progress.render()}\n\n{msg}"
+            if ok:
+                key = _short_uid(f"{item[0].timestamp()}:{item[1]}")
+                _save_summary_cache(user_id, key, item[1], summary, wiki_url=protocol_url)
+                kb = _after_publish_keyboard(key)
+                await status_msg.edit_text(final, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+                await _ask_trash_after_publish(callback, user_id, item)
+                await _remove_wiki_proc_button(callback.message)
+            else:
+                await status_msg.edit_text(final, parse_mode=ParseMode.MARKDOWN)
+                await _restore_wiki_proc_button(callback.message, [])
+        except Exception as e:
+            logger.error("[WIKI-BTN-SELECT] user=%s exception: %s", user_id, e, exc_info=True)
+            try:
+                await status_msg.edit_text(f"❌ Ошибка: {e}")
+            except Exception:
+                pass
+            await _restore_wiki_proc_button(callback.message, [])
+        return
     # Новый формат: choose_prompt:{list_id}:{idx}; старый: choose_prompt:{idx}
     if len(parts) == 2 and parts[0] and not parts[0].isdigit():
         list_id, idx_str = parts[0], parts[1]
@@ -3124,6 +3257,52 @@ async def choose_prompt_callback(callback: CallbackQuery, state: FSMContext):
 
     _dt, display, _txt = items[idx]
     await callback.message.answer(_prompt_guidance(display), parse_mode=ParseMode.MARKDOWN)
+
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("choose_prompt_for:"))
+async def choose_prompt_for_callback(callback: CallbackQuery, state: FSMContext):
+    """When user selects a prompt topic for a notification-based protocol."""
+    await callback.answer()
+    data = callback.data.split(":", 1)[1]
+    parts = data.split(":")
+    if len(parts) < 2:
+        await callback.message.answer("❌ Некорректные данные кнопки.")
+        return
+    uid = parts[0]
+    topic = ':'.join(parts[1:])
+    user_id = callback.from_user.id
+    pending = _load_wiki_pending(user_id)
+    item = pending.get(uid)
+    if not item:
+        await callback.message.answer("❌ Конспект устарел или уже обработан.")
+        return
+    # Re-run protocol flow with selected prompt
+    status_msg = await callback.message.answer(
+        f"⏳ Обрабатываю «{_md(item[1])}» через промпт «{_md(topic)}»...",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    try:
+        progress = WikiProgress(status_msg, user_id, item[1])
+        ok, msg, summary, protocol_url, _ = await process_conspect_to_wiki(
+            user_id, item, progress, prompt_topic=topic
+        )
+        final = f"{progress.render()}\n\n{msg}"
+        if ok:
+            _remove_wiki_pending(user_id, uid)
+            logger.info("[WIKI-BTN] user=%s: конспект «%s» обработан в wiki (выбран промпт)", user_id, item[1][:70])
+            _save_summary_cache(user_id, uid, item[1], summary, wiki_url=protocol_url)
+            kb = _after_publish_keyboard(uid)
+            await status_msg.edit_text(final, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+            await _ask_trash_after_publish(callback, user_id, item)
+        else:
+            logger.warning("[WIKI-BTN] user=%s: флоу вернул ошибку (выбранный промпт): %r", user_id, (msg or "")[:150])
+            await status_msg.edit_text(final, parse_mode=ParseMode.MARKDOWN)
+    except Exception as e:
+        logger.error("[WIKI-BTN-SELECT-UID] user=%s exception: %s", user_id, e, exc_info=True)
+        try:
+            await status_msg.edit_text(f"❌ Ошибка: {e}")
+        except Exception:
+            pass
 
 
 def _prompt_guidance(display: str) -> str:
@@ -3188,7 +3367,35 @@ async def publish_wiki_callback(callback: CallbackQuery, state: FSMContext):
     )
     try:
         progress = WikiProgress(status_msg, user_id, item[1])
-        ok, msg, summary, protocol_url = await process_conspect_to_wiki(user_id, item, progress)
+        ok, msg, summary, protocol_url, prompt_choices = await process_conspect_to_wiki(user_id, item, progress)
+        if not ok and msg == PROMPT_CHOICE_NEEDED:
+            # Prompt not determined — ask user to choose from available prompts
+            prompts = _load_prompts()
+            if not prompts:
+                await status_msg.edit_text("❌ No prompts available. Please add prompts first.", parse_mode=ParseMode.MARKDOWN)
+                await _restore_wiki_proc_button(callback.message, marked)
+                return
+            # Create keyboard with prompt topics
+            keyboard = []
+            row = []
+            for i, topic in enumerate(sorted(prompts.keys())):
+                row.append(InlineKeyboardButton(
+                    text=f"{_md(topic)}",
+                    callback_data=f"choose_prompt_for:{uid}:{topic}"
+                ))
+                if len(row) == 2:
+                    keyboard.append(row)
+                    row = []
+            if row:
+                keyboard.append(row)
+            reply_markup = InlineKeyboardMarkup(inline_keyboard=keyboard)
+            await status_msg.edit_text(
+                "⚠️ Prompt not determined. Please select a prompt for processing:",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=reply_markup
+            )
+            # Don't restore the button yet — wait for user choice
+            return
         final = f"{progress.render()}\n\n{msg}"
         if ok:
             key = _short_uid(f"{item[0].timestamp()}:{item[1]}")
