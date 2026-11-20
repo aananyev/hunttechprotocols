@@ -1,0 +1,80 @@
+services:
+  protocols-bot:
+    image: hunttech-protocols-bot:prod
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: hunttech-protocols-bot
+    restart: unless-stopped
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=32m
+    volumes:
+      - protocols_prod_data:/data
+      - protocols_prod_common_state:/.hermes
+    secrets:
+      - tg_token
+      - vault_client_token
+      - vault_signing_private_key
+      - vault_encryption_private_key
+      - vault_client_certificate
+      - vault_client_private_key
+      - vault_ca_certificate
+    env_file:
+      - ./.secrets/protocols.env
+    environment:
+      BOT_DATA_DIR: /data
+      AI_CREDENTIAL_SOURCE: vault
+      VAULT_URL: https://hr.hunttech.ru:18443
+      VAULT_CLIENT_ID: protocols-bot-prod
+      VAULT_CLIENT_TOKEN: file:/run/secrets/vault_client_token
+      VAULT_JWT_ISSUER: protocols-bot-prod
+      VAULT_SIGNING_KID: protocols_bot-signing-2026
+      VAULT_ENCRYPTION_KID: protocols_bot-encryption-2026
+      VAULT_SIGNING_PRIVATE_KEY: file:/run/secrets/vault_signing_private_key
+      VAULT_ENCRYPTION_PRIVATE_KEY: file:/run/secrets/vault_encryption_private_key
+      VAULT_PRIMARY_PROVIDER: deepseek
+      VAULT_PRIMARY_MODEL: deepseek-chat
+      VAULT_FALLBACK_MODELS: "anymodel=am/nemotron-3-ultra-550b-a55b"
+      VAULT_REQUIRE_MTLS: "true"
+      VAULT_MTLS_CERT: /run/secrets/vault_client_certificate
+      VAULT_MTLS_KEY: /run/secrets/vault_client_private_key
+      VAULT_CA_BUNDLE: /run/secrets/vault_ca_certificate
+      VAULT_ALLOW_INSECURE_TEST: "false"
+      PYTHONUNBUFFERED: "1"
+      TZ: Europe/Saratov
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    mem_limit: 768m
+    cpus: 1.0
+    pids_limit: 256
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+secrets:
+  tg_token:
+    file: ./.secrets/tg_token
+  vault_client_token:
+    file: ./.secrets/vault_client_token
+  vault_signing_private_key:
+    file: ./.secrets/vault_signing_private.pem
+  vault_encryption_private_key:
+    file: ./.secrets/vault_encryption_private.pem
+  vault_client_certificate:
+    file: ./.secrets/vault_client.crt
+  vault_client_private_key:
+    file: ./.secrets/vault_client.key
+  vault_ca_certificate:
+    file: ./.secrets/vault_ca.crt
+
+volumes:
+  protocols_prod_data:
+    name: hunttech-protocols-prod-data
+  protocols_prod_common_state:
+    name: hunttech-protocols-prod-common-state

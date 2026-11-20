@@ -41,6 +41,7 @@ from hunttech_bot_common.ai import (
 )
 from hunttech_bot_common.ai.usage import UsageRecord, estimate_cost
 from hunttech_bot_common.telegram import escape_md_simple as _escape_md_v2  # noqa: F401
+from vault_ai import VaultAIClient
 
 
 def _md(text: str) -> str:
@@ -50,6 +51,98 @@ def _md(text: str) -> str:
     В v1 точки, тире, скобки, ! и т.п. экранировать НЕ нужно — иначе
     даты отображаются как «13\\.08\\.2026» (лишние бэкслеши)."""
     return re.sub(r"([_*\[\]`\\])", r"\\\1", str(text))
+
+
+def _sanitize_ai_md(text: str) -> str:
+    """Убирает/балансирует markdown-разметку в ответе нейросети для безопасной отправки с ParseMode.MARKDOWN.
+
+    Нейросеть может вернуть текст с непарными сущностями (``**bold`` без закрытия,
+    ``*italic`` без закрытия, ```code`` без закрытия), что вызывает ошибку Telegram:
+    "Can't find end of the entity starting at byte offset N".
+
+    Эта функция:
+    1. Удаляет непарные ``**`` и ``__`` (жирный)
+    2. Удаляет непарные ``*`` и ``_`` (курсив) — оставляет только парные
+    3. Удаляет непарные обратные кавычки `` ` `` (код)
+    4. Удаляет markdown-ссылки ``[text](url)`` — оставляет только текст
+    Возвращает безопасный plain-text, который не сломает парсер."""
+    if not text:
+        return ""
+
+    # 1) Удаляем markdown-ссылки [text](url) -> text
+    text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
+
+    # 2) Балансируем ** (bold) — удаляем непарные
+    # Считаем количество **, если нечётное — удаляем последний
+    bold_markers = list(re.finditer(r"\*\*", text))
+    if len(bold_markers) % 2 == 1:
+        # Удаляем последний непарный **
+        last = bold_markers[-1]
+        text = text[:last.start()] + text[last.end():]
+
+    # 3) Балансируем __ (bold) — аналогично
+    bold_markers = list(re.finditer(r"__", text))
+    if len(bold_markers) % 2 == 1:
+        last = bold_markers[-1]
+        text = text[:last.start()] + text[last.end():]
+
+    # 4) Балансируем * (italic) — но не трогаем ** (уже обработаны)
+    # Заменяем ** на плейсхолдер, обрабатываем *, возвращаем **
+    text = text.replace("**", "\u0000BOLD\u0000")
+    italic_markers = list(re.finditer(r"(?<!\*)\*(?!\*)", text))
+    if len(italic_markers) % 2 == 1:
+        last = italic_markers[-1]
+        text = text[:last.start()] + text[last.end():]
+    text = text.replace("\u0000BOLD\u0000", "**")
+
+    # 5) Балансируем _ (italic) — но не трогаем __ (уже обработаны)
+    text = text.replace("__", "\u0000BOLD2\u0000")
+    italic_markers = list(re.finditer(r"(?<!_)_(?!_)", text))
+    if len(italic_markers) % 2 == 1:
+        last = italic_markers[-1]
+        text = text[:last.start()] + text[last.end():]
+    text = text.replace("\u0000BOLD2\u0000", "__")
+
+    # 6) Балансируем обратные кавычки ` (inline code)
+    backtick_markers = list(re.finditer(r"`", text))
+    if len(backtick_markers) % 2 == 1:
+        last = backtick_markers[-1]
+        text = text[:last.start()] + text[last.end():]
+
+    # 7) Удаляем любые непарные скобки [ или ] (могут сломать ссылку или список)
+    # Балансируем [ и ]
+    open_brackets = text.count('[')
+    close_brackets = text.count(']')
+    # Удаляем лишние открывающие или закрывающие скобки
+    if open_brackets > close_brackets:
+        # Удаляем лишние [
+        for _ in range(open_brackets - close_brackets):
+            last_open = text.rfind('[')
+            if last_open != -1:
+                text = text[:last_open] + text[last_open + 1:]
+    elif close_brackets > open_brackets:
+        # Удаляем лишние ]
+        for _ in range(close_brackets - open_brackets):
+            last_close = text.rfind(']')
+            if last_close != -1:
+                text = text[:last_close] + text[last_close + 1:]
+
+    # 8) Удаляем любые оставшиеся непарные символы разметки
+    # Удаляем оставшиеся одиночные * (не в парах)
+    # Убираем одиночные * и _, которые не образуют пары
+    # Убираем одиночные обратные кавычки
+    # Убираем одиночные скобки [ или ]
+    # Убираем любые оставшиеся * или _ или ` или [ или ]
+    # Простое решение: удаляем все одиночные символы разметки
+    # for char in ("*", "_", "`", "[", "]"):
+    #     # Убираем одиночные символы, которые не образуют пары
+    #     text = text.replace(char, "")
+    # Также удаляем любые оставшиеся непарные символы
+    # Удаляем все одиночные * и _ (уже удалены выше, но на всякий случай)
+
+    return text
+
+
 from hunttech_bot_common.email import (
     test_email_connections, format_email_config,
     validate_email, validate_hostname, validate_password,
@@ -87,8 +180,9 @@ logging.basicConfig(
 logger = logging.getLogger("bot")
 
 from aiogram import Bot, Dispatcher
+from aiogram.exceptions import TelegramNetworkError
 from aiogram.filters import Command, CommandObject
-from aiogram.types import BotCommand, BotCommandScopeChat, Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, ChatMemberUpdated
+from aiogram.types import BotCommand, BotCommandScopeChat, Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, ChatMemberUpdated, ReplyParameters
 from aiogram.enums import ParseMode
 
 import os
@@ -97,6 +191,9 @@ from dotenv import load_dotenv
 # ── Конфигурация ──────────────────────────────────────────────
 
 load_dotenv()
+AI_CREDENTIAL_SOURCE = os.getenv("AI_CREDENTIAL_SOURCE", "legacy").strip().lower()
+BOT_DATA_DIR = Path(os.getenv("BOT_DATA_DIR", str(Path(__file__).parent))).expanduser()
+BOT_DATA_DIR.mkdir(parents=True, exist_ok=True)
 # TG_TOKEN — ключ от @BotFather, даёт боту доступ к Telegram API.
 # Хранится в .env (не в git!), чтобы не светить секрет в репозитории.
 TG_TOKEN = os.getenv("TG_TOKEN", "") or exit("❌ TG_TOKEN не задан! Положи токен в .env")
@@ -119,10 +216,10 @@ MAX_MSG_LEN = 3800
 # USERS_FILE — хранилище учётных данных пользователей (email, пароль,
 # AI-ключи). Каждый пользователь бота подключает свою почту.
 # Файл исключён из git — в нём пароли приложений от IMAP и API-ключи.
-USERS_FILE = Path(__file__).parent / "users.json"
+USERS_FILE = BOT_DATA_DIR / "users.json"
 
 # NEW_COMMS_FILE stores conspect IDs already shown via /list new.
-NEW_COMMS_FILE = Path(__file__).parent / "new_comms.json"
+NEW_COMMS_FILE = BOT_DATA_DIR / "new_comms.json"
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -181,7 +278,7 @@ def _get_new_comms_for_user(user_id: int) -> set:
 # ── Трекер отправленных cron-уведомлений ──────────────────
 # Отдельный файл, не влияющий на /list new.
 
-NOTIFIED_FILE = Path(__file__).parent / "notified_comms.json"
+NOTIFIED_FILE = BOT_DATA_DIR / "notified_comms.json"
 
 
 def _load_notified() -> dict:
@@ -250,6 +347,22 @@ def get_user_config(user_id: int) -> dict | None:
     return users.get(str(user_id))
 
 
+def basket_always_enabled(user_id: int) -> bool:
+    """Whether successfully processed mail should automatically go to Trash."""
+    config = get_user_config(user_id) or {}
+    return bool(config.get("basket_always", False))
+
+
+def set_basket_always(user_id: int, enabled: bool) -> None:
+    """Persist the user's auto-Trash preference without replacing mail settings."""
+    users = _load_users()
+    key = str(user_id)
+    if key not in users:
+        users[key] = {}
+    users[key]["basket_always"] = bool(enabled)
+    _save_users(users)
+
+
 def save_user_config(user_id: int, email: str, server: str, login: str, password: str):
     """Сохраняет IMAP-настройки пользователя (email, IMAP-сервер, логин, пароль).
        Вызывается после успешной проверки подключения в /setup."""
@@ -270,6 +383,9 @@ def save_user_config(user_id: int, email: str, server: str, login: str, password
 def save_ai_config(user_id: int, endpoint: str, api_key: str, model: str):
     """Сохраняет AI-настройки пользователя (endpoint, api_key, модель).
        Вызывается после /setup_ai. API-ключ хранится рядом с IMAP-паролем."""
+    if AI_CREDENTIAL_SOURCE == "vault":
+        logger.warning("AI key settings are managed by Vault; local AI configuration was not saved")
+        return
     users = _load_users()
     key = str(user_id)
     if key not in users:
@@ -285,6 +401,12 @@ def save_ai_config(user_id: int, endpoint: str, api_key: str, model: str):
 def get_ai_config(user_id: int) -> dict | None:
     """Возвращает AI-настройки пользователя или None.
        Без AI-конфига кнопка «Саммари» не работает."""
+    if AI_CREDENTIAL_SOURCE == "vault":
+        return {
+            "provider": os.getenv("VAULT_PRIMARY_PROVIDER", "deepseek"),
+            "model": os.getenv("VAULT_PRIMARY_MODEL", "deepseek-chat"),
+            "endpoint": "AI Key Vault",
+        }
     config = get_user_config(user_id)
     if config and "ai" in config:
         return config["ai"]
@@ -556,57 +678,104 @@ def _email_config_error(config: dict | None) -> str | None:
     return None
 
 
-def _connect_imap(config: dict) -> imaplib.IMAP4_SSL:
+def _connect_imap(config: dict, retries: int = 2) -> imaplib.IMAP4_SSL:
     """
     Подключается к IMAP-серверу по настройкам пользователя.
-    Бизнес-правило: логин для IMAP часто совпадает с email, 
+    Бизнес-правило: логин для IMAP часто совпадает с email,
     но бывает отличается (например, логин — часть email до @).
+    Retry-защита: при временных проблемах соединения повторяет попытку.
     """
     imap_login = config.get("login") or config.get("email", "")
-    logger.info("Подключение к IMAP %s (login: %s)...", config.get("server"), imap_login)
-    server = imaplib.IMAP4_SSL(config["server"], config.get("port", 993))
-    server.login(imap_login, config["password"])
-    server.select("INBOX")
-    logger.info("Успешно подключились к IMAP")
-    return server
+    last_exception = None
+    for attempt in range(1, retries + 1):
+        try:
+            logger.info("Подключение к IMAP %s (login: %s)... [попытка %d/%d]",
+                        config.get("server"), imap_login, attempt, retries)
+            server = imaplib.IMAP4_SSL(config["server"], config.get("port", 993))
+            server.login(imap_login, config["password"])
+            server.select("INBOX")
+            logger.info("Успешно подключились к IMAP")
+            return server
+        except imaplib.IMAP4.error as e:
+            last_exception = e
+            error_msg = str(e)
+            logger.warning("IMAP ошибка соединения [попытка %d/%d]: %s", attempt, retries, error_msg)
+            # Если это временная проблема с соединением — повторяем с паузой
+            if "connection" in error_msg.lower() or "problems" in error_msg.lower():
+                import time
+                time.sleep(1.5)
+                continue
+            else:
+                # Для других IMAP-ошибок не повторяем (например, неверный пароль)
+                raise
+    # Все попытки исчерпаны — поднимаем последнюю ошибку
+    raise last_exception if last_exception else imaplib.IMAP4.error("IMAP connection failed after retries")
 
 
 def _filter_and_extract(server, msg_ids: list[bytes]) -> list[tuple]:
     """
     Фильтрует письма по теме SUBJECT_FILTER и извлекает txt-содержимое.
-    
-    Бизнес-правило — КРИТИЧЕСКИ ВАЖНОЕ:
-    Письма НЕ ДОЛЖНЫ помечаться как прочитанные. Используем BODY.PEEK[]
-    вместо RFC822, плюс явно снимаем флаг \\Seen — двойная защита.
-    
-    Возвращает список кортежей:
-        (datetime, display, txt_content, email_msg_id, email_from)
+
+    Использует пакетную загрузку заголовков и тел. BODY.PEEK сохраняет
+    письма непрочитанными; после обработки флаг \\Seen снимается пакетно.
+    Возвращает кортежи (datetime, display, txt_content, email_msg_id, email_from, imap_uid).
     """
     matched: list[tuple] = []
 
+    # Сначала загружаем только заголовки. Один запрос на до 500 писем вместо
+    # сотен последовательных IMAP round-trip.
+    header_by_id: dict[bytes, bytes] = {}
+    header_batch_size = 500
+    for offset in range(0, len(msg_ids), header_batch_size):
+        batch = msg_ids[offset:offset + header_batch_size]
+        typ_h, hdr_data = server.fetch(b",".join(batch), "(BODY.PEEK[HEADER.FIELDS (SUBJECT)])")
+        if typ_h != "OK":
+            raise imaplib.IMAP4.error("Не удалось получить заголовки писем из IMAP")
+        for row in hdr_data or []:
+            if not isinstance(row, (tuple, list)) or len(row) < 2:
+                continue
+            meta, raw_hdr = row[0], row[1]
+            if isinstance(meta, bytes) and isinstance(raw_hdr, bytes):
+                seq_match = re.match(rb"\s*(\d+)\s", meta)
+                if seq_match:
+                    header_by_id[seq_match.group(1)] = raw_hdr
+
+    candidate_ids: list[bytes] = []
     for msg_id in msg_ids:
-        # Быстрый предфильтр по теме: сначала тянем только заголовок,
-        # полное тело (с вложениями) — лишь для подходящих писем.
-        # Без этого при сотнях непрочитанных писем каждая проверка
-        # выкачивает весь ящик и надолго блокирует event loop бота.
-        try:
-            typ_h, hdr_data = server.fetch(msg_id, "(BODY.PEEK[HEADER.FIELDS (SUBJECT)])")
-            if typ_h == "OK" and hdr_data and hdr_data[0]:
-                raw_hdr = hdr_data[0][1] if isinstance(hdr_data[0], (tuple, list)) and len(hdr_data[0]) > 1 else b""
-                subject_hdr = decode_mime_header(email.message_from_bytes(raw_hdr).get("Subject", ""))
-                if subject_hdr and not subject_hdr.lower().startswith(SUBJECT_FILTER.lower()):
-                    continue  # тема не подходит — полное тело не тянем
-        except Exception:
-            pass  # заголовок не получить — пробуем полное тело ниже (старое поведение)
+        raw_hdr = header_by_id.get(msg_id)
+        if raw_hdr is not None:
+            subject_hdr = decode_mime_header(email.message_from_bytes(raw_hdr).get("Subject", ""))
+            if subject_hdr and not subject_hdr.lower().startswith(SUBJECT_FILTER.lower()):
+                continue
+        candidate_ids.append(msg_id)
 
-        # BODY.PEEK[] — единственный правильный способ читать письмо
-        # не снимая флаг UNSEEN. UID в том же FETCH — стабильный
-        # идентификатор письма (см. ниже).
-        typ, msg_data = server.fetch(msg_id, "(UID BODY.PEEK[])")
+    # Тела подходящих писем читаем небольшими пакетами: для 87 конспектов
+    # один FETCH на каждое письмо рвал соединение IMAP по таймауту сервера.
+    body_by_id: dict[bytes, tuple[bytes, bytes]] = {}
+    body_batch_size = 10
+    logger.info("Подходящих писем: %d; загружаю тела пакетами по %d", len(candidate_ids), body_batch_size)
+    for offset in range(0, len(candidate_ids), body_batch_size):
+        batch = candidate_ids[offset:offset + body_batch_size]
+        typ, msg_data = server.fetch(b",".join(batch), "(UID BODY.PEEK[])")
         if typ != "OK":
-            continue
+            raise imaplib.IMAP4.error("Не удалось получить содержимое писем из IMAP")
+        batch_set = set(batch)
+        for row in msg_data or []:
+            if not isinstance(row, (tuple, list)) or len(row) < 2:
+                continue
+            meta, raw_email = row[0], row[1]
+            if not isinstance(meta, bytes) or not isinstance(raw_email, bytes):
+                continue
+            seq_match = re.match(rb"\s*(\d+)\s", meta)
+            if seq_match and seq_match.group(1) in batch_set:
+                body_by_id[seq_match.group(1)] = (meta, raw_email)
 
-        raw_email = msg_data[0][1]
+    matched_seq_ids: list[bytes] = []
+    for msg_id in candidate_ids:
+        fetched = body_by_id.get(msg_id)
+        if fetched is None:
+            continue
+        meta, raw_email = fetched
         msg = email.message_from_bytes(raw_email)
 
         subject = decode_mime_header(msg.get("Subject", ""))
@@ -629,37 +798,25 @@ def _filter_and_extract(server, msg_ids: list[bytes]) -> list[tuple]:
             display = remainder
 
         dt = get_email_date(msg) or datetime.now()
-
         txts = extract_txt_attachments(msg)
         txt_content = "\n\n---\n\n".join(txts) if txts else ""
-
         email_msg_id = msg.get("Message-ID", "") or ""
         email_from = decode_mime_header(msg.get("From", ""))
-        # UID — СТАБИЛЬНЫЙ идентификатор письма. Seq-номер (позиция в INBOX)
-        # меняется при любом изменении ящика (новое письмо, expunge), и
-        # тогда кнопка «Да, в корзину» могла удалить НЕ то письмо
-        # (08.2026: в корзину ушли CDEK-документы и рассылка Яндекса).
-        # Для IMAP-операций (прочитано/корзина) используем только UID.
-        imap_msg_id = ""
-        try:
-            meta = msg_data[0][0] if isinstance(msg_data[0], (tuple, list)) else b""
-            m_uid = re.search(rb"UID (\d+)", meta if isinstance(meta, bytes) else str(meta).encode())
-            if m_uid:
-                imap_msg_id = m_uid.group(1).decode()
-        except Exception:
-            imap_msg_id = ""
-        if not imap_msg_id:
-            imap_msg_id = msg_id.decode() if isinstance(msg_id, bytes) else str(msg_id)
 
+        # UID — стабильный идентификатор для операций с письмом.
+        uid_match = re.search(rb"UID (\d+)", meta)
+        imap_msg_id = uid_match.group(1).decode() if uid_match else msg_id.decode()
         matched.append((dt, display, txt_content, email_msg_id, email_from, imap_msg_id))
+        matched_seq_ids.append(msg_id)
 
+    # PEEK не ставит \Seen. Сохраняем прежнюю защиту от прочитанных писем,
+    # снимая этот флаг для найденных сообщений одним IMAP round-trip.
+    for offset in range(0, len(matched_seq_ids), 50):
         try:
-            server.store(msg_id, "-FLAGS", "(\\Seen)")
-        except Exception:
-            pass
+            server.store(b",".join(matched_seq_ids[offset:offset + 50]), "-FLAGS", "(\\Seen)")
+        except Exception as e:
+            logger.warning("Не удалось подтвердить флаг UNSEEN для пакета писем: %s", e)
 
-    # Сортируем: самые свежие сверху — рекрутеру важно видеть
-    # последний созвон первым.
     matched.sort(key=lambda x: x[0], reverse=True)
     return matched
 
@@ -714,8 +871,14 @@ def fetch_notes(user_id: int) -> tuple[str, list]:
             pass
         return (_format_list(matched, "📋 **Новые конспекты встреч**"), matched)
     finally:
-        server.close()
-        server.logout()
+        try:
+            server.close()
+        except Exception:
+            pass
+        try:
+            server.logout()
+        except Exception:
+            pass
 
 
 def fetch_new_notes(user_id: int) -> tuple[str, list]:
@@ -759,8 +922,14 @@ def fetch_new_notes(user_id: int) -> tuple[str, list]:
             pass
         return (_format_list(new_items, "New conspects (first time)"), new_items)
     finally:
-        server.close()
-        server.logout()
+        try:
+            server.close()
+        except Exception:
+            pass
+        try:
+            server.logout()
+        except Exception:
+            pass
 
 
 def fetch_notes_last_week(user_id: int) -> tuple[str, list]:
@@ -790,8 +959,14 @@ def fetch_notes_last_week(user_id: int) -> tuple[str, list]:
             return ("📭 За последнюю неделю нет конспектов встреч.", [])
         return (_format_list(matched, "📋 **Конспекты встреч за неделю**"), matched)
     finally:
-        server.close()
-        server.logout()
+        try:
+            server.close()
+        except Exception:
+            pass
+        try:
+            server.logout()
+        except Exception:
+            pass
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -970,49 +1145,36 @@ async def _get_yandex_iam_token_from_jwt(jwt_token: str) -> str | None:
         return None
 
 
-async def _test_wiki_connection(iam_token: str, org_id: str = "") -> str:
-    """
-    Проверяет подключение к Яндекс Вики API.
-    
-    Бизнес-правило: перед публикацией страницы нужно убедиться,
-    что API-доступ работает. Тест получает информацию о текущем
-    пользователе и список последних страниц.
-    
-    Возвращает отформатированный отчёт с результатами проверки.
-    Если проверка не удалась — возвращает строку с ❌.
-    """
-    # OAuth-токен пользователя (y0_...) передаётся в формате OAuth,
-    # IAM-токен — в формате Bearer.
+async def _test_wiki_connection(iam_token: str, collab_id: str = "", probe_slug: str = "") -> str:
+    """Проверяет OAuth-доступ и, если указан, чтение настроенной страницы Wiki."""
     auth_scheme = "OAuth" if iam_token.startswith("y0_") else "Bearer"
     headers = {
         "Authorization": f"{auth_scheme} {iam_token}",
         "Content-Type": "application/json",
     }
-    # Если указан collab_id организации — добавляем заголовок (обязателен для API)
-    if org_id:
-        headers["X-Collab-Org-Id"] = org_id
+    # Wiki REST API ждёт collab_id организации Яндекс 360; cloud org_id
+    # используется только для формирования ссылок на страницы.
+    if collab_id:
+        headers["X-Collab-Org-Id"] = collab_id
 
     report_parts = []
     all_ok = True
+    page_checked = False
 
-    # ── Тест 1: получение информации о пользователе ────────────────
-    # Проверяем, что токен валиден и API отвечает.
     try:
         async with httpx.AsyncClient(timeout=15) as client:
             resp = await client.get(f"{WIKI_API_BASE}/users/me", headers=headers)
-            if resp.status_code == 200:
-                user_data = resp.json()
-                login = user_data.get("login", "неизвестно")
-                email = user_data.get("email", "не указан")
-                report_parts.append(
-                    f"✅ **Пользователь:** `{login}` ({email})"
-                )
-            elif resp.status_code == 401:
-                report_parts.append("❌ **Ошибка авторизации (401):** IAM-токен недействителен или истёк.")
-                all_ok = False
-            else:
-                report_parts.append(f"❌ **Ошибка API ({resp.status_code}):** {_md(resp.text[:200])}")
-                all_ok = False
+        if resp.status_code == 200:
+            user_data = resp.json()
+            login = user_data.get("login", "неизвестно")
+            email = user_data.get("email", "не указан")
+            report_parts.append(f"✅ **Пользователь:** `{login}` ({email})")
+        elif resp.status_code == 401:
+            report_parts.append("❌ **Ошибка авторизации (401):** OAuth/IAM-токен недействителен или истёк.")
+            all_ok = False
+        else:
+            report_parts.append(f"❌ **Ошибка Wiki API ({resp.status_code}):** {_md(resp.text[:200])}")
+            all_ok = False
     except httpx.TimeoutException:
         report_parts.append("❌ **Таймаут:** Яндекс Вики не ответил за 15 секунд.")
         all_ok = False
@@ -1020,60 +1182,36 @@ async def _test_wiki_connection(iam_token: str, org_id: str = "") -> str:
         report_parts.append(f"❌ **Ошибка подключения:** {_md(e)}")
         all_ok = False
 
-    # ── Тест 2: список страниц (проверяем доступ на чтение) ────────
-    # Пробуем получить список кластеров или страниц, чтобы убедиться,
-    # что у пользователя есть права на чтение wiki.
-    if all_ok:
+    if all_ok and probe_slug:
         try:
             async with httpx.AsyncClient(timeout=15) as client:
                 resp = await client.get(
                     f"{WIKI_API_BASE}/pages",
                     headers=headers,
-                    params={"pageSize": 5},
+                    params={"slug": probe_slug, "fields": "content"},
                 )
-                if resp.status_code == 200:
-                    data = resp.json()
-                    pages = data.get("pages", [])
-                    if pages:
-                        report_parts.append(
-                            f"✅ **Доступ к страницам:** получено {len(pages)} страниц"
-                        )
-                        # Показываем примеры страниц
-                        for p in pages[:3]:
-                            title = p.get("title", "без названия")
-                            slug = p.get("slug", "?")
-                            report_parts.append(f"   📄 `{title}` (/{slug})")
-                    else:
-                        report_parts.append("✅ **Доступ к страницам:** есть, но страниц пока нет.")
-                elif resp.status_code == 403:
-                    report_parts.append("⚠️ **Нет прав на чтение страниц.** Проверьте настройки доступа в Яндекс Вики.")
-                else:
-                    report_parts.append(f"⚠️ **Не удалось получить страницы:** HTTP {resp.status_code}")
-        except Exception as e:
-            report_parts.append(f"⚠️ **Ошибка при получении страниц:** {_md(e)}")
-
-    # ── Тест 3: информация о кластере (организации) ────────────────
-    # Узнаём, к какому кластеру/организации привязан токен.
-    try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.get(f"{WIKI_API_BASE}/clusters", headers=headers)
             if resp.status_code == 200:
-                clusters = resp.json()
-                if isinstance(clusters, list) and clusters:
-                    for c in clusters:
-                        report_parts.append(f"🏢 **Кластер:** `{c.get('id', '?')}` — {c.get('title', '')}")
-                elif isinstance(clusters, dict):
-                    report_parts.append(f"🏢 **Кластер:** `{clusters.get('id', '?')}`")
-            # Не все аккаунты имеют доступ к кластерам — это нормально
-    except Exception:
-        pass
+                report_parts.append("✅ **Доступ к странице промпта:** чтение разрешено.")
+                page_checked = True
+            elif resp.status_code == 403:
+                report_parts.append("❌ **Нет прав на чтение настроенной страницы Wiki (403).**")
+                all_ok = False
+            elif resp.status_code == 404:
+                report_parts.append("❌ **Настроенная страница Wiki не найдена (404).**")
+                all_ok = False
+            else:
+                report_parts.append(f"❌ **Ошибка чтения страницы Wiki:** HTTP {resp.status_code}.")
+                all_ok = False
+        except httpx.TimeoutException:
+            report_parts.append("❌ **Таймаут:** страница Wiki не ответила за 15 секунд.")
+            all_ok = False
+        except Exception as e:
+            report_parts.append(f"❌ **Ошибка чтения страницы Wiki:** {_md(e)}")
+            all_ok = False
 
-    # Формируем итоговый отчёт
-    if all_ok:
-        title = "✅ **Подключение к Яндекс Вики работает!**\n\n"
-    else:
-        title = "❌ **Подключение к Яндекс Вики НЕ работает.**\n\n"
-
+    if all_ok and not probe_slug:
+        report_parts.append("⚠️ Страница для проверки чтения не настроена.")
+    title = "✅ **Подключение к Яндекс Вики работает!**\n\n" if all_ok else "❌ **Подключение к Яндекс Вики НЕ работает.**\n\n"
     return title + "\n".join(report_parts)
 
 
@@ -1428,7 +1566,12 @@ async def process_conspect_to_wiki(
     if not folder:
         if progress:
             await progress.fail()
-        return False, f"⚠️ Для «{_md(display)}» не задан подраздел Вики (проверьте wiki.routing).", "", "", None
+        # Классификация не удалась — предлагаем выбрать промпт вручную
+        prompts = _load_prompts()
+        if prompts:
+            logger.info("[WIKI-FLOW] user=%s: классификация не удалась, предлагаем выбрать промпт", user_id)
+            return False, PROMPT_CHOICE_NEEDED, "", "", list(prompts.keys())
+        return False, f"⚠️ Для «{_md(display)}» не задан подраздел Вики (проверьте wiki.routing) и нет доступных промптов.", "", "", None
     if progress:
         await progress.done()
 
@@ -1566,7 +1709,7 @@ async def process_conspect_to_wiki(
                      _label_published("Конспект", msg1),
                      _label_published("Протокол", msg2),
                      "", f"🗂 {page_name}"]
-    return True, "\\n".join(summary_parts), result, _wiki_page_url(wiki, protocol_slug), None
+    return True, "\n".join(summary_parts), result, _wiki_page_url(wiki, protocol_slug), None
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -1819,7 +1962,23 @@ def _move_email_to_trash(user_id: int, imap_msg_id: str) -> tuple[bool, str, str
         return False, "error", imap_msg_id
 
 
-async def _ask_trash_after_publish(callback: CallbackQuery, user_id: int, item) -> None:
+async def _send_reply_to_source_message(source, text: str, **kwargs):
+    """Send a status/result as a Telegram reply to the original note message."""
+    if isinstance(source, dict):
+        chat_id = source.get("chat_id")
+        message_id = source.get("message_id")
+    else:
+        chat_id = source.chat.id
+        message_id = source.message_id
+    return await bot.send_message(
+        chat_id=chat_id,
+        text=text,
+        reply_parameters=ReplyParameters(message_id=message_id, chat_id=chat_id),
+        **kwargs,
+    )
+
+
+async def _ask_trash_after_publish(callback: CallbackQuery, user_id: int, item, source_origin: dict | None = None) -> None:
     """После успешной расшифровки: помечает письмо прочитанным и
        спрашивает пользователя (кнопки да/нет) о перемещении в корзину."""
     imap_id = item[5] if len(item) >= 6 else ""
@@ -1833,6 +1992,23 @@ async def _ask_trash_after_publish(callback: CallbackQuery, user_id: int, item) 
     brief = " ".join(
         p for p in (f"«{subject}»" if subject else "", f"от {frm}" if frm else "") if p
     ) or imap_id
+    source_chat_id = source_origin.get("chat_id") if source_origin else callback.message.chat.id
+    source_message_id = source_origin.get("message_id") if source_origin else callback.message.message_id
+    reply_parameters = ReplyParameters(message_id=source_message_id, chat_id=source_chat_id)
+    if basket_always_enabled(user_id):
+        ok, reason, moved_brief = await asyncio.to_thread(_move_email_to_trash, user_id, imap_id)
+        source = source_origin or {"chat_id": source_chat_id, "message_id": source_message_id}
+        if ok:
+            result_text = f"🗑 Письмо автоматически перемещено в корзину: {moved_brief or brief}."
+        elif reason == "already_gone":
+            result_text = f"ℹ️ Письмо уже недоступно в папке входящих: {moved_brief or brief}."
+        elif reason == "not_telemost":
+            result_text = f"⛔️ Не перемещаю письмо в корзину: проверка безопасности не подтвердила протокол Телемоста ({moved_brief or brief})."
+        else:
+            result_text = f"❌ Не удалось автоматически переместить письмо в корзину: {moved_brief or brief}. Режим можно изменить в /setup basket."
+        await _send_reply_to_source_message(source, result_text)
+        logger.info("[TRASH-AUTO] user=%s uid=%s result=%s", user_id, imap_id, reason)
+        return
     read_status = await asyncio.to_thread(_set_email_read, user_id, imap_id)
     if read_status != "ok":
         # Письмо недоступно в INBOX (чаще всего — уже перемещено в корзину
@@ -1843,21 +2019,34 @@ async def _ask_trash_after_publish(callback: CallbackQuery, user_id: int, item) 
         logger.info("[TRASH] user=%s: письмо %s недоступно (status=%s) — вопрос о корзине пропущен",
                     user_id, imap_id, read_status)
         if read_status == "error":
-            await callback.message.answer(
-                f"❌ Не удалось пометить письмо прочитанным: {brief}. Вопрос о корзине пропущен.")
+            await bot.send_message(
+                chat_id=source_chat_id,
+                text=f"❌ Не удалось пометить письмо прочитанным: {brief}. Вопрос о корзине пропущен.",
+                reply_parameters=reply_parameters,
+            )
         else:
-            await callback.message.answer(
-                f"ℹ️ Письмо {brief} уже недоступно в почте (вероятно, перемещено в корзину ранее) — вопрос о корзине пропущен.")
+            await bot.send_message(
+                chat_id=source_chat_id,
+                text=f"ℹ️ Письмо {brief} уже недоступно в почте (вероятно, перемещено в корзину ранее) — вопрос о корзине пропущен.",
+                reply_parameters=reply_parameters,
+            )
         return
     kb = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="🗑 Да, в корзину", callback_data=f"trash_yes:{imap_id}"),
         InlineKeyboardButton(text="Нет, оставить", callback_data=f"trash_no:{imap_id}"),
-    ]])
-    await callback.message.answer(
-        f"📬 Письмо помечено прочитанным.\n\n"
-        f"🗑 Можно удалить письмо: {brief}.\n\n"
-        f"Переместить его в корзину почтового ящика?",
+    ], [InlineKeyboardButton(
+        text="♻️ Всегда помещать в корзину",
+        callback_data=f"trash_always:{imap_id}",
+    )]])
+    await bot.send_message(
+        chat_id=source_chat_id,
+        text=(
+            f"📬 Письмо помечено прочитанным.\n\n"
+            f"🗑 Можно удалить письмо: {brief}.\n\n"
+            f"Переместить его в корзину почтового ящика?"
+        ),
         reply_markup=kb,
+        reply_parameters=reply_parameters,
     )
 
 
@@ -1931,15 +2120,12 @@ async def _send_logo(chat_id: int) -> bool:
 
 
 async def _hide_reply_keyboard(chat_id: int) -> None:
-    """Скрывает постоянную нижнюю клавиатуру, чтобы inline-кнопки не уходили за неё.
+    """Сохраняет нижнее меню при показе inline-кнопок.
 
-    Отправляет пустое сообщение с ReplyKeyboardRemove.
+    Telegram применяет ReplyKeyboardRemove ко всему чату. Helper оставлен
+    как no-op для совместимости с вызовами сценариев.
     """
-    from aiogram.types import ReplyKeyboardRemove
-    try:
-        await bot.send_message(chat_id, " ", reply_markup=ReplyKeyboardRemove())
-    except Exception as e:
-        logger.debug("Failed to hide reply keyboard: %s", e)
+    return None
 
 
 def _bot_version() -> str:
@@ -1975,7 +2161,7 @@ _usage_tracker = UsageTracker()
 # коммерция, приоритеты. Промпт сопоставляется с конспектом по первому
 # слову названия.
 
-PROMPTS_FILE = Path(__file__).parent / "prompts.json"
+PROMPTS_FILE = BOT_DATA_DIR / "prompts.json"
 
 
 def _load_prompts() -> dict[str, str]:
@@ -2507,6 +2693,33 @@ def _setup_section_keyboard(user_id: int, section: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def _setup_basket_text(user_id: int) -> str:
+    enabled = basket_always_enabled(user_id)
+    state = "✅ включено" if enabled else "❔ спрашивать для каждого письма"
+    return (
+        "🗑 **Письма после публикации**\n\n"
+        f"Текущий режим: **{state}**.\n\n"
+        "Если включить автоматический режим, после успешной расшифровки и публикации в Wiki "
+        "бот будет перемещать соответствующее письмо в корзину.\n"
+        "В автоматический режим попадают только письма, прошедшие защитную проверку бота."
+    )
+
+
+def _setup_basket_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    enabled = basket_always_enabled(user_id)
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text=("✅ Всегда помещать в корзину" if enabled else "Всегда помещать в корзину"),
+            callback_data="setup_basket:always",
+        )],
+        [InlineKeyboardButton(
+            text=("❔ Спрашивать для каждого письма" if not enabled else "Спрашивать для каждого письма"),
+            callback_data="setup_basket:ask",
+        )],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="setup_menu:root")],
+    ])
+
+
 def _setup_root_text(user_id: int) -> str:
     """Текст главного меню /setup."""
     return (
@@ -2514,7 +2727,8 @@ def _setup_root_text(user_id: int) -> str:
         "Выберите раздел:\n\n"
         f"{_section_overall(user_id, 'email')} 📧 Почта (IMAP/SMTP)\n"
         f"{_section_overall(user_id, 'db')} 🗄️ PostgreSQL\n"
-        f"{_section_overall(user_id, 'ai')} 🤖 Нейросеть\n\n"
+        f"{_section_overall(user_id, 'ai')} 🤖 Нейросеть\n"
+        f"{'✅' if basket_always_enabled(user_id) else '❔'} 🗑 Корзина\n\n"
         "🔴 — не введено\n"
         "🟡 — введено, не проверено\n"
         "🟢 — введено и проверено"
@@ -2527,10 +2741,13 @@ def _setup_root_keyboard(user_id: int) -> InlineKeyboardMarkup:
         ("email", "📧 Почта"),
         ("db", "🗄️ PostgreSQL"),
         ("ai", "🤖 Нейросеть"),
+        ("basket", "🗑 Корзина"),
     ]
     rows = []
     for key, label in sections:
         flag = _section_overall(user_id, key)
+        if key == "basket":
+            flag = "✅" if basket_always_enabled(user_id) else "❔"
         rows.append([InlineKeyboardButton(
             text=f"{flag} {label}",
             callback_data=f"setup_menu:{key}",
@@ -2701,69 +2918,30 @@ def _prompt_known_for(user_id: int | None, display: str) -> bool:
 
 
 def _get_item_button(idx: int, display: str, user_id: int | None = None,
-                     list_id: str = "") -> InlineKeyboardMarkup | None:
-    """
-    Создаёт кнопку под конспектом в списке.
+                     list_id: str = "") -> InlineKeyboardMarkup:
+    """Создаёт действия распознавания и публикации для каждого конспекта.
 
-    Бизнес-правило (владелец, 08.2026): если бот ЗНАЕТ промпт для
-    расшифровки этого конспекта — промпт загружен в настройках
-    (по префиксу темы) ИЛИ лежит в корневой папке wiki подраздела
-    (маршрут wiki.routing + настроенная wiki) — кнопку «Саммари»
-    НЕ выводим, остаётся только полный флоу «📝 Расшифровать и
-    разместить в wiki».
-
-    Если промпт неизвестен — показываем «🟡 Выбрать промпт»
-    (и кнопку расшифровки, как раньше).
-
-    Бизнес-правило сопоставления: название конспекта должно начинаться
-    с темы промпта (без учёта регистра). Например, промпт "План развития"
-    подойдёт к конспекту "План развития на Q2".
-
-    callback_data несут list_id — идентификатор показанного списка,
-    чтобы нажатие работало с тем списком, который видел пользователь
-    (даже если кэш позже перезаписан другим списком).
+    Выбор промпта добавляется при настроенном списке, если тема письма
+    не сопоставлена автоматически. Основные действия доступны всегда.
     """
     prompts = _load_prompts() or {}
-
-    if _prompt_known_for(user_id, display):
-        # Промпт известен — кнопка «Саммари» не нужна
-        return InlineKeyboardMarkup(inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text=f"📝 Расшифровать и разместить в wiki #{idx}",
-                    callback_data=f"wiki_proc:{list_id}:{idx}"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text=f"📌 Кратко #{idx}",
-                    callback_data=f"brief:{list_id}:{idx}"
-                )
-            ],
-        ])
-    else:
-        if not prompts:
-            return None
-        return InlineKeyboardMarkup(inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text=f"🟡 Выбрать промпт #{idx}",
-                    callback_data=f"choose_prompt:{list_id}:{idx}"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text=f"📝 Расшифровать и разместить в wiki #{idx}",
-                    callback_data=f"wiki_proc:{list_id}:{idx}"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text=f"📌 Кратко #{idx}",
-                    callback_data=f"brief:{list_id}:{idx}"
-                )
-            ],
-        ])
+    rows = []
+    if prompts and not _prompt_known_for(user_id, display):
+        rows.append([InlineKeyboardButton(
+            text=f"🟡 Выбрать промпт #{idx}",
+            callback_data=f"choose_prompt:{list_id}:{idx}"
+        )])
+    rows.extend([
+        [InlineKeyboardButton(
+            text=f"📝 Расшифровать и разместить в wiki #{idx}",
+            callback_data=f"wiki_proc:{list_id}:{idx}"
+        )],
+        [InlineKeyboardButton(
+            text=f"📌 Кратко #{idx}",
+            callback_data=f"brief:{list_id}:{idx}"
+        )],
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 async def _mark_wiki_proc_busy(message) -> list[tuple[str, str]]:
@@ -2863,6 +3041,76 @@ async def _remove_wiki_proc_button(message) -> None:
         logger.warning("[WIKI-BTN] не удалось убрать кнопку у сообщения: %s", e)
 
 
+async def _save_wiki_proc_origin(state: FSMContext, origin_key: str, message) -> None:
+    """Сохраняет исходное сообщение кнопки, если сначала требуется выбрать промпт."""
+    try:
+        if not message.reply_markup:
+            return
+        data = await state.get_data()
+        origins = data.get("wiki_proc_origins", {})
+        origins[origin_key] = {
+            "chat_id": message.chat.id,
+            "message_id": message.message_id,
+            "reply_markup": message.reply_markup.model_dump(mode="json", exclude_none=True),
+        }
+        await state.update_data(wiki_proc_origins=origins)
+    except Exception as e:
+        logger.warning("[WIKI-BTN] не удалось сохранить исходное сообщение для выбора промпта: %s", e)
+
+
+async def _remove_wiki_proc_button_from_origin(state: FSMContext, origin_key: str) -> None:
+    """Удаляет Wiki-кнопку исходного конспекта после успешной публикации с выбранным промптом."""
+    try:
+        data = await state.get_data()
+        origins = data.get("wiki_proc_origins", {})
+        origin = origins.get(origin_key)
+        if not origin:
+            logger.warning("[WIKI-BTN] исходное сообщение для промпта %r не найдено", origin_key)
+            return
+        markup = InlineKeyboardMarkup.model_validate(origin["reply_markup"])
+        rows = [
+            [button for button in row if not (button.callback_data or "").startswith("wiki_proc:")]
+            for row in markup.inline_keyboard
+        ]
+        rows = [row for row in rows if row]
+        if len(rows) == len(markup.inline_keyboard) and all(
+            len(new_row) == len(old_row) for new_row, old_row in zip(rows, markup.inline_keyboard)
+        ):
+            return
+        new_markup = InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
+        await bot.edit_message_reply_markup(
+            chat_id=origin["chat_id"],
+            message_id=origin["message_id"],
+            reply_markup=new_markup,
+        )
+        origins.pop(origin_key, None)
+        await state.update_data(wiki_proc_origins=origins)
+        logger.info("[WIKI-BTN] кнопка убрана у исходного конспекта после выбора промпта")
+    except Exception as e:
+        logger.warning("[WIKI-BTN] не удалось убрать кнопку у исходного сообщения: %s", e)
+
+
+async def _restore_wiki_proc_button_from_origin(state: FSMContext, origin_key: str) -> None:
+    """Восстанавливает исходную клавиатуру конспекта, если AI/Wiki-флоу завершился ошибкой."""
+    try:
+        data = await state.get_data()
+        origins = data.get("wiki_proc_origins", {})
+        origin = origins.get(origin_key)
+        if not origin:
+            return
+        markup = InlineKeyboardMarkup.model_validate(origin["reply_markup"])
+        await bot.edit_message_reply_markup(
+            chat_id=origin["chat_id"],
+            message_id=origin["message_id"],
+            reply_markup=markup,
+        )
+        origins.pop(origin_key, None)
+        await state.update_data(wiki_proc_origins=origins)
+        logger.info("[WIKI-BTN] исходная кнопка восстановлена после ошибки выбора промпта")
+    except Exception as e:
+        logger.warning("[WIKI-BTN] не удалось восстановить исходную кнопку: %s", e)
+
+
 # ── Callback-хендлер для кнопки Саммари ─────────────────────
 
 @dp.callback_query(lambda c: c.data and c.data.startswith("summary:"))
@@ -2895,6 +3143,10 @@ async def summary_callback(callback: CallbackQuery, state: FSMContext):
     # Загружаем из кеша — конспекты с txt-содержимым
     items = _load_notes_cache(user_id, list_id)
     if idx < 0 or idx >= len(items):
+        logger.warning(
+            "[SUMMARY-CB] user=%s list_id=%r idx=%d out of range (len=%d) — callback_data=%r",
+            user_id, list_id, idx, len(items), callback.data
+        )
         await callback.message.answer("❌ Конспект устарел. Запросите /list заново.")
         return
 
@@ -2966,8 +3218,9 @@ async def summary_callback(callback: CallbackQuery, state: FSMContext):
         pass
 
     # Выводим результат с заголовком
+    safe_result = _sanitize_ai_md(result)
     header = f"🧠 **Саммари: {_md(display)}**\n\n---\n\n"
-    full_text = header + result
+    full_text = header + safe_result
 
     # Telegram не принимает >4000 символов — режем
     if len(full_text) <= 4000:
@@ -2975,8 +3228,8 @@ async def summary_callback(callback: CallbackQuery, state: FSMContext):
     else:
         # Разбиваем на части: заголовок отдельно, текст кусками
         await callback.message.answer(header, parse_mode=ParseMode.MARKDOWN)
-        for i in range(0, len(result), 3500):
-            await callback.message.answer(result[i:i + 3500])
+        for i in range(0, len(safe_result), 3500):
+            await callback.message.answer(safe_result[i:i + 3500])
 
     # ── Кнопка «Расшифровать и разместить в wiki» ─────────────
     wiki_config = get_wiki_config(user_id)
@@ -3022,8 +3275,10 @@ async def wiki_proc_callback(callback: CallbackQuery, state: FSMContext):
 
     items = _load_notes_cache(user_id, list_id)
     if idx < 0 or idx >= len(items):
-        logger.warning("[WIKI-BTN] user=%s idx=%d вне диапазона кэша list_id=%r (len=%d)",
-                       user_id, idx, list_id, len(items))
+        logger.warning(
+            "[WIKI-BTN] user=%s idx=%d вне диапазона кэша list_id=%r (len=%d) callback_data=%r",
+            user_id, idx, list_id, len(items), callback.data
+        )
         await callback.message.answer("❌ Конспект устарел. Запросите /list заново.")
         return
     item = items[idx]
@@ -3036,10 +3291,12 @@ async def wiki_proc_callback(callback: CallbackQuery, state: FSMContext):
     # Сразу помечаем нажатую кнопку ⏳ — процесс начался
     # (бизнес-правило владельца, 08.2026).
     marked = await _mark_wiki_proc_busy(callback.message)
-    status_msg = await callback.message.answer(
+    status_msg = await _send_reply_to_source_message(
+        callback.message,
         f"⏳ Расшифровываю «{_md(item[1])}» и размещаю в wiki...",
         parse_mode=ParseMode.MARKDOWN,
     )
+    wiki_published = False
     try:
         progress = WikiProgress(status_msg, user_id, item[1])
         ok, msg, summary, protocol_url, prompt_choices = await process_conspect_to_wiki(user_id, item, progress)
@@ -3047,16 +3304,20 @@ async def wiki_proc_callback(callback: CallbackQuery, state: FSMContext):
             # Prompt not determined — ask user to choose from available prompts
             prompts = _load_prompts()
             if not prompts:
-                await status_msg.edit_text("❌ No prompts available. Please add prompts first.", parse_mode=ParseMode.MARKDOWN)
+                await status_msg.edit_text("❌ Нет доступных промптов. Сначала добавьте промпты через /add_prompt.", parse_mode=ParseMode.MARKDOWN)
                 await _restore_wiki_proc_button(callback.message, marked)
                 return
-            # Create keyboard with prompt topics
+            # Create keyboard with prompt topics — use short indices to fit in 64-byte callback_data
+            prompt_topics = sorted(prompts.keys())
+            # Store mapping for this session (user_id -> list of topics by index)
+            _save_prompt_choices(user_id, prompt_topics)
+            await _save_wiki_proc_origin(state, f"{list_id}:{idx_str}", callback.message)
             keyboard = []
             row = []
-            for i, topic in enumerate(sorted(prompts.keys())):
+            for i, topic in enumerate(prompt_topics):
                 row.append(InlineKeyboardButton(
                     text=f"{_md(topic)}",
-                    callback_data=f"choose_prompt:{list_id}:{idx}:{topic}"
+                    callback_data=f"choose_prompt:{list_id}:{idx_str}:{i}"
                 ))
                 if len(row) == 2:  # 2 buttons per row
                     keyboard.append(row)
@@ -3065,24 +3326,31 @@ async def wiki_proc_callback(callback: CallbackQuery, state: FSMContext):
                 keyboard.append(row)
             reply_markup = InlineKeyboardMarkup(inline_keyboard=keyboard)
             await status_msg.edit_text(
-                "⚠️ Prompt not determined. Please select a prompt for processing:",
+                "⚠️ Промпт не определён. Выберите промпт для обработки:",
                 parse_mode=ParseMode.MARKDOWN,
                 reply_markup=reply_markup
             )
             # Don't restore the button yet — wait for user choice
             return
         logger.info("[WIKI-BTN] user=%s результат: ok=%s msg=%r", user_id, ok, (msg or "")[:150])
-        final = f"{progress.render()}\n\n{msg}"
+        safe_msg = _sanitize_ai_md(msg)
+        final = f"{progress.render()}\n\n{safe_msg}"
         if ok:
+            wiki_published = True
+            await _remove_wiki_proc_button(callback.message)
             key = _short_uid(f"{item[0].timestamp()}:{item[1]}")
             _save_summary_cache(user_id, key, item[1], summary, wiki_url=protocol_url)
             kb = _after_publish_keyboard(key)
-            await status_msg.edit_text(final, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+            # Логируем текст перед отправкой для диагностики Markdown-ошибок
+            logger.info("[WIKI-BTN-MD-SEND] user=%s sending final msg len=%d preview=%r",
+                        user_id, len(final or ""), (final or "")[:150])
+            await status_msg.edit_text(final, parse_mode=ParseMode.MARKDOWN)
+            await _send_reply_to_source_message(callback.message, "⏳ Доступные действия:", parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
             await _ask_trash_after_publish(callback, user_id, item)
-            # Сценарий прошёл без ошибок — убираем кнопку у ЭТОГО сообщения
-            # (у других сообщений кнопка остаётся).
-            await _remove_wiki_proc_button(callback.message)
         else:
+            # Логируем текст перед отправкой для диагностики Markdown-ошибок
+            logger.info("[WIKI-BTN-MD-SEND] user=%s sending final msg len=%d preview=%r",
+                        user_id, len(final or ""), (final or "")[:150])
             await status_msg.edit_text(final, parse_mode=ParseMode.MARKDOWN)
             # Ошибка — снимаем пометку ⏳, чтобы кнопку можно было нажать снова.
             await _restore_wiki_proc_button(callback.message, marked)
@@ -3092,7 +3360,8 @@ async def wiki_proc_callback(callback: CallbackQuery, state: FSMContext):
             await status_msg.edit_text(f"❌ Ошибка: {e}")
         except Exception:
             pass
-        await _restore_wiki_proc_button(callback.message, marked)
+        if not wiki_published:
+            await _restore_wiki_proc_button(callback.message, marked)
 
 
 @dp.callback_query(lambda c: c.data and c.data.startswith("wiki_process:"))
@@ -3127,7 +3396,8 @@ async def wiki_process_callback(callback: CallbackQuery, state: FSMContext):
     # Сразу помечаем нажатую кнопку ⏳ — процесс начался
     # (бизнес-правило владельца, 08.2026).
     marked = await _mark_wiki_proc_busy(callback.message)
-    status_msg = await callback.message.answer(
+    status_msg = await _send_reply_to_source_message(
+        callback.message,
         f"⏳ Расшифровываю «{_md(display)}» и размещаю в wiki...",
         parse_mode=ParseMode.MARKDOWN,
     )
@@ -3138,16 +3408,20 @@ async def wiki_process_callback(callback: CallbackQuery, state: FSMContext):
             # Prompt not determined — ask user to choose from available prompts
             prompts = _load_prompts()
             if not prompts:
-                await status_msg.edit_text("❌ No prompts available. Please add prompts first.", parse_mode=ParseMode.MARKDOWN)
+                await status_msg.edit_text("❌ Нет доступных промптов. Сначала добавьте промпты через /add_prompt.", parse_mode=ParseMode.MARKDOWN)
                 await _restore_wiki_proc_button(callback.message, marked)
                 return
-            # Create keyboard with prompt topics
+            # Create keyboard with prompt topics — use short indices to fit in 64-byte callback_data
+            prompt_topics = sorted(prompts.keys())
+            # Store mapping for this session (user_id -> list of topics by index)
+            _save_prompt_choices(user_id, prompt_topics)
+            await _save_wiki_proc_origin(state, f"pending:{uid}", callback.message)
             keyboard = []
             row = []
-            for i, topic in enumerate(sorted(prompts.keys())):
+            for i, topic in enumerate(prompt_topics):
                 row.append(InlineKeyboardButton(
                     text=f"{_md(topic)}",
-                    callback_data=f"choose_prompt_for:{uid}:{topic}"
+                    callback_data=f"choose_prompt_for:{uid}:{i}"
                 ))
                 if len(row) == 2:
                     keyboard.append(row)
@@ -3156,19 +3430,24 @@ async def wiki_process_callback(callback: CallbackQuery, state: FSMContext):
                 keyboard.append(row)
             reply_markup = InlineKeyboardMarkup(inline_keyboard=keyboard)
             await status_msg.edit_text(
-                "⚠️ Prompt not determined. Please select a prompt for processing:",
+                "⚠️ Промпт не определён. Выберите промпт для обработки:",
                 parse_mode=ParseMode.MARKDOWN,
                 reply_markup=reply_markup
             )
             # Don't restore the button yet — wait for user choice
             return
-        final = f"{progress.render()}\n\n{msg}"
+        safe_msg = _sanitize_ai_md(msg)
+        final = f"{progress.render()}\n\n{safe_msg}"
         if ok:
             _remove_wiki_pending(user_id, uid)
             logger.info("[WIKI-BTN] user=%s: конспект «%s» обработан в wiki", user_id, display[:70])
             _save_summary_cache(user_id, uid, display, summary, wiki_url=protocol_url)
             kb = _after_publish_keyboard(uid)
-            await status_msg.edit_text(final, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+            # Логируем текст перед отправкой для диагностики Markdown-ошибок
+            logger.info("[WIKI-BTN-MD-SEND] user=%s sending final msg len=%d preview=%r",
+                        user_id, len(final or ""), (final or "")[:150])
+            await status_msg.edit_text(final, parse_mode=ParseMode.MARKDOWN)
+            await _send_reply_to_source_message(callback.message, "⏳ Доступные действия:", parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
             await _ask_trash_after_publish(callback, user_id, item)
         else:
             logger.warning("[WIKI-BTN] user=%s: флоу вернул ошибку: %r", user_id, (msg or "")[:150])
@@ -3176,11 +3455,23 @@ async def wiki_process_callback(callback: CallbackQuery, state: FSMContext):
             # Ошибка — снимаем пометку ⏳, чтобы кнопку можно было нажать снова.
             await _restore_wiki_proc_button(callback.message, marked)
     except Exception as e:
-        logger.error("[WIKI-BTN] user=%s исключение: %s", user_id, e, exc_info=True)
+        error_text = str(e)
+        logger.error("[WIKI-BTN] user=%s исключение: %s", user_id, error_text, exc_info=True)
+        # Диагностика: если ошибка Telegram — логируем полный текст сообщения, которое пытались отправить
+        final_text = locals().get("final", "") or ""
+        msg_text = locals().get("msg", "") or ""
+        if "Can't find end of the entity" in error_text:
+            logger.error("[WIKI-BTN-MD-ERROR] Telegram Markdown parse error at byte offset. user=%s msg_len=%d msg_preview=%r final_preview=%r msg_preview=%r",
+                         user_id, len(final_text), msg_text[:200], final_text[:200], msg_text[:200])
+        # Логируем полный текст сообщения (если доступен) для диагностики
         try:
-            await status_msg.edit_text(f"❌ Ошибка обработки: {e}")
-        except Exception:
-            pass
+            # Санитизируем текст ошибки — предотвращаем рекурсивную Markdown-ошибку
+            safe_error = _sanitize_ai_md(str(e))
+            await status_msg.edit_text(f"❌ Ошибка обработки: {safe_error}")
+        except Exception as inner_e:
+            inner_text = str(inner_e)
+            logger.error("[WIKI-BTN] user=%s ошибка при отправке ошибки: %s | msg_len=%d msg_preview=%r",
+                         user_id, inner_text, len(final_text), final_text[:200] if final_text else "")
         await _restore_wiki_proc_button(callback.message, marked)
 
 
@@ -3188,32 +3479,46 @@ async def wiki_process_callback(callback: CallbackQuery, state: FSMContext):
 async def choose_prompt_callback(callback: CallbackQuery, state: FSMContext):
     """
     Когда пользователь нажимает 🟡 Выбрать промпт #N — предлагаем
-    создать подходящий промпт для этого типа конспекта.
-    
-    Бизнес-правило: подсказываем первое слово из названия конспекта
-    как тему нового промпта.
+    список сохранённых промптов для выбора.
+    После выбора промпта — запускает стандартный сценарий обработки конспекта
+    (классификация → оригинал в «Конспекты» → AI-расшифровка → протокол в «Протоколы»)
+    с выбранным промптом.
     """
+    logger.info("[CHOOSE_PROMPT] callback_data=%r from user=%s", callback.data, callback.from_user.id)
+    await callback.answer()
     parts = callback.data.split(":", 1)[1].split(":")
     # Selection format: choose_prompt:{list_id}:{idx}:{topic} (4 parts after split with max 1)
     # Actually after split(":", 1) we have the rest; splitting that by ":" gives:
     # - Old: [list_id, idx] or [idx] → 1-2 parts
     # - Selection: [list_id, idx, topic] → 3 parts (topic may contain colons, so join rest)
     if len(parts) >= 3:
-        # Selection format: user selected a prompt topic for this note
+        # Selection format: user selected a prompt topic index for this note
         list_id, idx_str = parts[0], parts[1]
-        topic = ':'.join(parts[2:])
+        topic_index = int(parts[2])
         idx = int(idx_str) - 1
         await callback.answer()
         user_id = callback.from_user.id
         items = _load_notes_cache(user_id, list_id)
         if idx < 0 or idx >= len(items):
+            logger.warning(
+                "[CHOOSE-PROMPT-SEL] user=%s list_id=%r idx=%d out of range (len=%d) callback_data=%r",
+                user_id, list_id, idx, len(items), callback.data
+            )
             await callback.message.answer("❌ Конспект устарел. Запросите /list заново.")
             return
+        # Load topic from saved choices
+        prompt_topics = _load_prompt_choices(user_id)
+        if topic_index < 0 or topic_index >= len(prompt_topics):
+            await callback.message.answer("❌ Неверный выбор промпта. Попробуйте снова.")
+            return
+        topic = prompt_topics[topic_index]
         item = items[idx]
-        # Re-run the protocol flow with the selected prompt topic
-        from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-        # Show status message and process
-        status_msg = await callback.message.answer(
+        origin_key = f"{list_id}:{idx_str}"
+        source_origin = (await state.get_data()).get("wiki_proc_origins", {}).get(origin_key)
+        source_message = source_origin or callback.message
+        # Reply to the original note while the selected prompt runs.
+        status_msg = await _send_reply_to_source_message(
+            source_message,
             f"⏳ Обрабатываю «{_md(item[1])}» через промпт «{_md(topic)}»...",
             parse_mode=ParseMode.MARKDOWN,
         )
@@ -3222,24 +3527,27 @@ async def choose_prompt_callback(callback: CallbackQuery, state: FSMContext):
             ok, msg, summary, protocol_url, _ = await process_conspect_to_wiki(
                 user_id, item, progress, prompt_topic=topic
             )
-            final = f"{progress.render()}\n\n{msg}"
+            safe_msg = _sanitize_ai_md(msg)
+            final = f"{progress.render()}\n\n{safe_msg}"
             if ok:
+                await _remove_wiki_proc_button_from_origin(state, origin_key)
                 key = _short_uid(f"{item[0].timestamp()}:{item[1]}")
                 _save_summary_cache(user_id, key, item[1], summary, wiki_url=protocol_url)
                 kb = _after_publish_keyboard(key)
+                await _hide_reply_keyboard(status_msg.chat.id)
                 await status_msg.edit_text(final, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
-                await _ask_trash_after_publish(callback, user_id, item)
-                await _remove_wiki_proc_button(callback.message)
+                await _ask_trash_after_publish(callback, user_id, item, source_origin=source_origin)
             else:
+                await _hide_reply_keyboard(status_msg.chat.id)
                 await status_msg.edit_text(final, parse_mode=ParseMode.MARKDOWN)
-                await _restore_wiki_proc_button(callback.message, [])
+                await _restore_wiki_proc_button_from_origin(state, f"{list_id}:{idx_str}")
         except Exception as e:
             logger.error("[WIKI-BTN-SELECT] user=%s exception: %s", user_id, e, exc_info=True)
             try:
                 await status_msg.edit_text(f"❌ Ошибка: {e}")
             except Exception:
                 pass
-            await _restore_wiki_proc_button(callback.message, [])
+            await _restore_wiki_proc_button_from_origin(state, f"{list_id}:{idx_str}")
         return
     # Новый формат: choose_prompt:{list_id}:{idx}; старый: choose_prompt:{idx}
     if len(parts) == 2 and parts[0] and not parts[0].isdigit():
@@ -3252,11 +3560,41 @@ async def choose_prompt_callback(callback: CallbackQuery, state: FSMContext):
     user_id = callback.from_user.id
     items = _load_notes_cache(user_id, list_id)
     if idx < 0 or idx >= len(items):
+        logger.warning(
+            "[CHOOSE-PROMPT] user=%s list_id=%r idx=%d out of range (len=%d) callback_data=%r",
+            user_id, list_id, idx, len(items), callback.data
+        )
         await callback.message.answer("❌ Конспект устарел. Запросите /list заново.")
         return
 
-    _dt, display, _txt = items[idx]
-    await callback.message.answer(_prompt_guidance(display), parse_mode=ParseMode.MARKDOWN)
+    _dt, display, _txt, _, _, _ = items[idx]
+    prompts = _load_prompts()
+    if not prompts:
+        await callback.message.answer("❌ Нет доступных промптов. Сначала добавьте промпты через /add_prompt.", parse_mode=ParseMode.MARKDOWN)
+        return
+    # Store mapping for this session (user_id -> list of topics by index)
+    prompt_topics = sorted(prompts.keys())
+    _save_prompt_choices(user_id, prompt_topics)
+    await _save_wiki_proc_origin(state, f"{list_id}:{idx_str}", callback.message)
+    keyboard = []
+    row = []
+    for i, topic in enumerate(prompt_topics):
+        row.append(InlineKeyboardButton(
+            text=f"{_md(topic)}",
+            callback_data=f"choose_prompt:{list_id}:{idx_str}:{i}"
+        ))
+        if len(row) == 2:
+            keyboard.append(row)
+            row = []
+    if row:
+        keyboard.append(row)
+    reply_markup = InlineKeyboardMarkup(inline_keyboard=keyboard)
+    await _send_reply_to_source_message(
+        callback.message,
+        "Выберите промпт для обработки:",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=reply_markup,
+    )
 
 
 @dp.callback_query(lambda c: c.data and c.data.startswith("choose_prompt_for:"))
@@ -3269,15 +3607,28 @@ async def choose_prompt_for_callback(callback: CallbackQuery, state: FSMContext)
         await callback.message.answer("❌ Некорректные данные кнопки.")
         return
     uid = parts[0]
-    topic = ':'.join(parts[1:])
+    topic_index = int(parts[1])
     user_id = callback.from_user.id
     pending = _load_wiki_pending(user_id)
     item = pending.get(uid)
     if not item:
+        logger.warning(
+            "[CHOOSE-PROMPT-FOR] user=%s uid=%r not found in pending (pending_len=%d) callback_data=%r",
+            user_id, uid, len(pending), callback.data
+        )
         await callback.message.answer("❌ Конспект устарел или уже обработан.")
         return
-    # Re-run protocol flow with selected prompt
-    status_msg = await callback.message.answer(
+    # Load topic from saved choices
+    prompt_topics = _load_prompt_choices(user_id)
+    if topic_index < 0 or topic_index >= len(prompt_topics):
+        await callback.message.answer("❌ Неверный выбор промпта. Попробуйте снова.")
+        return
+    topic = prompt_topics[topic_index]
+    source_origin = (await state.get_data()).get("wiki_proc_origins", {}).get(f"pending:{uid}")
+    source_message = source_origin or callback.message
+    # Reply to the original note while the selected prompt runs.
+    status_msg = await _send_reply_to_source_message(
+        source_message,
         f"⏳ Обрабатываю «{_md(item[1])}» через промпт «{_md(topic)}»...",
         parse_mode=ParseMode.MARKDOWN,
     )
@@ -3286,14 +3637,15 @@ async def choose_prompt_for_callback(callback: CallbackQuery, state: FSMContext)
         ok, msg, summary, protocol_url, _ = await process_conspect_to_wiki(
             user_id, item, progress, prompt_topic=topic
         )
-        final = f"{progress.render()}\n\n{msg}"
+        safe_msg = _sanitize_ai_md(msg)
+        final = f"{progress.render()}\n\n{safe_msg}"
         if ok:
             _remove_wiki_pending(user_id, uid)
             logger.info("[WIKI-BTN] user=%s: конспект «%s» обработан в wiki (выбран промпт)", user_id, item[1][:70])
             _save_summary_cache(user_id, uid, item[1], summary, wiki_url=protocol_url)
             kb = _after_publish_keyboard(uid)
             await status_msg.edit_text(final, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
-            await _ask_trash_after_publish(callback, user_id, item)
+            await _ask_trash_after_publish(callback, user_id, item, source_origin=source_origin)
         else:
             logger.warning("[WIKI-BTN] user=%s: флоу вернул ошибку (выбранный промпт): %r", user_id, (msg or "")[:150])
             await status_msg.edit_text(final, parse_mode=ParseMode.MARKDOWN)
@@ -3325,6 +3677,10 @@ async def choose_prompt_pending_callback(callback: CallbackQuery, state: FSMCont
     pending = _load_wiki_pending(user_id)
     item = pending.get(key)
     if not item:
+        logger.warning(
+            "[CHOOSE-PROMPT-PENDING] user=%s key=%r not found in pending (pending_len=%d) callback_data=%r",
+            user_id, key, len(pending), callback.data
+        )
         await callback.answer("❌ Конспект устарел или уже обработан.", show_alert=True)
         return
     display = item[1]
@@ -3353,15 +3709,105 @@ async def publish_wiki_callback(callback: CallbackQuery, state: FSMContext):
 
     user_id = callback.from_user.id
     items = _load_notes_cache(user_id)
-    if idx < 0 or idx >= len(items):
-        await callback.message.answer("❌ Конспект устарел. Запросите /list заново.")
-        return
+    # Если список из /list устарел или пуст — пробуем взять из pending (уведомление)
+    pending_items = {}
+    if idx < 0 or idx >= len(items) or len(items) == 0:
+        pending = _load_wiki_pending(user_id)
+        if pending:
+            # Берём самый свежий элемент из pending (по ключу с максимальным timestamp)
+            latest_key = max(pending.keys(), key=lambda k: pending[k].get("ts", 0) if isinstance(pending[k], dict) else 0)
+            # Но для совместимости с индексом — если idx == 0 или в pending только 1, используем его
+            if len(pending) == 1 or idx == 0:
+                # Используем первый (или единственный) элемент из pending
+                first_key = list(pending.keys())[0]
+                item_data = pending[first_key]
+                dt = datetime.fromisoformat(item_data["dt"]) if item_data.get("dt") else datetime.now()
+                item = (dt, item_data.get("display", ""), item_data.get("txt", ""), "", "", item_data.get("imap_id", ""))
+                # Сразу готовим для флоу
+                uid = _short_uid(f"{dt.timestamp()}:{item[1]}")
+                _save_wiki_pending(user_id, item)
+                marked = await _mark_wiki_proc_busy(callback.message)
+                status_msg = await _send_reply_to_source_message(
+                    callback.message,
+                    f"⏳ Расшифровываю «{_md(item[1])}» и размещаю в wiki...",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+                # Переходим сразу к обработке — пропускаем проверку items
+                try:
+                    progress = WikiProgress(status_msg, user_id, item[1])
+                    ok, msg, summary, protocol_url, prompt_choices = await process_conspect_to_wiki(user_id, item, progress)
+                    if not ok and msg == PROMPT_CHOICE_NEEDED:
+                        prompts = _load_prompts()
+                        if not prompts:
+                            await status_msg.edit_text("❌ Нет доступных промптов. Сначала добавьте промпты через /add_prompt.", parse_mode=ParseMode.MARKDOWN)
+                            await _restore_wiki_proc_button(callback.message, marked)
+                            return
+                        prompt_topics = sorted(prompts.keys())
+                        _save_prompt_choices(user_id, prompt_topics)
+                        keyboard = []
+                        row = []
+                        for i, topic in enumerate(prompt_topics):
+                            row.append(InlineKeyboardButton(text=f"{_md(topic)}", callback_data=f"choose_prompt_for:{uid}:{i}"))
+                            if len(row) == 2:
+                                keyboard.append(row)
+                                row = []
+                        if row:
+                            keyboard.append(row)
+                        reply_markup = InlineKeyboardMarkup(inline_keyboard=keyboard)
+                        await status_msg.edit_text("⚠️ Промпт не определён. Выберите промпт для обработки:", parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
+                        return
+                    safe_msg = _sanitize_ai_md(msg)
+                    final = f"{progress.render()}\n\n{safe_msg}"
+                    if ok:
+                        _remove_wiki_pending(user_id, uid)
+                        logger.info("[WIKI-BTN] user=%s: конспект «%s» обработан в wiki (из pending)", user_id, item[1][:70])
+                        _save_summary_cache(user_id, uid, item[1], summary, wiki_url=protocol_url)
+                        kb = _after_publish_keyboard(uid)
+                        logger.info("[WIKI-BTN-MD-SEND] user=%s sending final msg len=%d preview=%r", user_id, len(final or ""), (final or "")[:150])
+                        await status_msg.edit_text(final, parse_mode=ParseMode.MARKDOWN)
+                        await _send_reply_to_source_message(callback.message, "⏳ Доступные действия:", parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+                        await _ask_trash_after_publish(callback, user_id, item)
+                    else:
+                        logger.warning("[WIKI-BTN] user=%s: флоу вернул ошибку (из pending): %r", user_id, (msg or "")[:150])
+                        await status_msg.edit_text(final, parse_mode=ParseMode.MARKDOWN)
+                        await _restore_wiki_proc_button(callback.message, marked)
+                except Exception as e:
+                    error_text = str(e)
+                    logger.error("[WIKI-BTN] user=%s исключение (из pending): %s", user_id, error_text, exc_info=True)
+                    final_text = locals().get("final", "") or ""
+                    msg_text = locals().get("msg", "") or ""
+                    if "Can't find end of the entity" in error_text:
+                        logger.error("[WIKI-BTN-MD-ERROR] Telegram Markdown parse error at byte offset. user=%s msg_len=%d msg_preview=%r final_preview=%r msg_preview=%r",
+                                     user_id, len(final_text), msg_text[:200], final_text[:200], msg_text[:200])
+                    try:
+                        safe_error = _sanitize_ai_md(str(e))
+                        await status_msg.edit_text(f"❌ Ошибка обработки: {safe_error}")
+                    except Exception as inner_e:
+                        inner_text = str(inner_e)
+                        logger.error("[WIKI-BTN] user=%s ошибка при отправке ошибки: %s | msg_len=%d msg_preview=%r",
+                                     user_id, inner_text, len(final_text), final_text[:200] if final_text else "")
+                    await _restore_wiki_proc_button(callback.message, marked)
+                # Выходим — обработка выполнена через pending
+                return
+        else:
+            logger.warning(
+                "[PUBLISH-WIKI] user=%s idx=%d недоступен: notes_cache_len=%d pending_len=%d callback_data=%r",
+                user_id, idx, len(items), len(pending), callback.data
+            )
+            await callback.message.answer("❌ Конспект устарел или недоступен из /list или уведомления. Выполните /list или дождитесь нового уведомления.")
+            return
     item = items[idx]
     if not item[2]:
         await callback.message.answer("❌ В письме не найден текст конспекта (txt-вложение).")
         return
 
-    status_msg = await callback.message.answer(
+    # Для совместимости с флоу выбора промпта — сохраняем в pending и готовим uid/marked
+    uid = _short_uid(f"{item[0].timestamp()}:{item[1]}")
+    _save_wiki_pending(user_id, item)
+    marked = await _mark_wiki_proc_busy(callback.message)
+
+    status_msg = await _send_reply_to_source_message(
+        callback.message,
         f"⏳ Расшифровываю «{_md(item[1])}» и размещаю в wiki...",
         parse_mode=ParseMode.MARKDOWN,
     )
@@ -3372,16 +3818,20 @@ async def publish_wiki_callback(callback: CallbackQuery, state: FSMContext):
             # Prompt not determined — ask user to choose from available prompts
             prompts = _load_prompts()
             if not prompts:
-                await status_msg.edit_text("❌ No prompts available. Please add prompts first.", parse_mode=ParseMode.MARKDOWN)
+                await status_msg.edit_text("❌ Нет доступных промптов. Сначала добавьте промпты через /add_prompt.", parse_mode=ParseMode.MARKDOWN)
                 await _restore_wiki_proc_button(callback.message, marked)
                 return
-            # Create keyboard with prompt topics
+            # Create keyboard with prompt topics — use short indices to fit in 64-byte callback_data
+            prompt_topics = sorted(prompts.keys())
+            # Store mapping for this session (user_id -> list of topics by index)
+            _save_prompt_choices(user_id, prompt_topics)
+            await _save_wiki_proc_origin(state, f"pending:{uid}", callback.message)
             keyboard = []
             row = []
-            for i, topic in enumerate(sorted(prompts.keys())):
+            for i, topic in enumerate(prompt_topics):
                 row.append(InlineKeyboardButton(
                     text=f"{_md(topic)}",
-                    callback_data=f"choose_prompt_for:{uid}:{topic}"
+                    callback_data=f"choose_prompt_for:{uid}:{i}"
                 ))
                 if len(row) == 2:
                     keyboard.append(row)
@@ -3390,13 +3840,14 @@ async def publish_wiki_callback(callback: CallbackQuery, state: FSMContext):
                 keyboard.append(row)
             reply_markup = InlineKeyboardMarkup(inline_keyboard=keyboard)
             await status_msg.edit_text(
-                "⚠️ Prompt not determined. Please select a prompt for processing:",
+                "⚠️ Промпт не определён. Выберите промпт для обработки:",
                 parse_mode=ParseMode.MARKDOWN,
                 reply_markup=reply_markup
             )
             # Don't restore the button yet — wait for user choice
             return
-        final = f"{progress.render()}\n\n{msg}"
+        safe_msg = _sanitize_ai_md(msg)
+        final = f"{progress.render()}\n\n{safe_msg}"
         if ok:
             key = _short_uid(f"{item[0].timestamp()}:{item[1]}")
             _save_summary_cache(user_id, key, item[1], summary, wiki_url=protocol_url)
@@ -3415,11 +3866,32 @@ async def publish_wiki_callback(callback: CallbackQuery, state: FSMContext):
 
 # ── Кнопки «Да/Нет» про перемещение письма в корзину ────────
 
-@dp.callback_query(lambda c: c.data and (c.data.startswith("trash_yes:") or c.data.startswith("trash_no:")))
+@dp.callback_query(lambda c: c.data and (c.data.startswith("trash_yes:") or c.data.startswith("trash_no:") or c.data.startswith("trash_always:")))
 async def trash_callback(callback: CallbackQuery, state: FSMContext):
     """После расшифровки пользователь отвечает, перемещать ли письмо в корзину."""
     user_id = callback.from_user.id
     imap_id = callback.data.split(":", 1)[1]
+    if callback.data.startswith("trash_always:"):
+        set_basket_always(user_id, True)
+        logger.info("[TRASH-BTN] user=%s: включил авто-корзину и согласился переместить письмо %s", user_id, imap_id)
+        ok, reason, brief = await asyncio.to_thread(_move_email_to_trash, user_id, imap_id)
+        source = callback.message.reply_to_message or callback.message
+        if ok:
+            await callback.answer("✅ Авто-корзина включена; письмо перемещено.")
+            await _send_reply_to_source_message(source, f"🗑 Письмо перемещено в корзину: {brief}. Автоматический режим включён для следующих успешно опубликованных писем. Изменить его можно через /setup basket.")
+            await _delete_trash_request(callback.message)
+        elif reason == "already_gone":
+            await callback.answer("ℹ️ Авто-корзина включена; письмо уже отсутствует.", show_alert=True)
+            await _send_reply_to_source_message(source, f"ℹ️ Письмо уже перемещено или отсутствует в папке входящих: {brief}. Автоматический режим включён для следующих писем.")
+            await _delete_trash_request(callback.message)
+        elif reason == "not_telemost":
+            await callback.answer("⛔️ Проверка безопасности запретила перемещение.", show_alert=True)
+            await _send_reply_to_source_message(source, f"⛔️ Не перемещаю письмо: проверка безопасности не подтвердила протокол Телемоста ({brief}). Автоматический режим включён для следующих писем.")
+            await _delete_trash_request(callback.message)
+        else:
+            await callback.answer("❌ Не удалось переместить письмо; режим включён.", show_alert=True)
+            await _send_reply_to_source_message(source, f"❌ Не удалось переместить письмо в корзину: {brief}. Автоматический режим включён для следующих успешно опубликованных писем; это письмо оставлено без повторной попытки.")
+        return
     if callback.data.startswith("trash_yes:"):
         logger.info("[TRASH-BTN] user=%s: пользователь согласился переместить письмо %s в корзину",
                     user_id, imap_id)
@@ -3542,8 +4014,9 @@ async def publish_group_callback(callback: CallbackQuery, state: FSMContext):
         if not digest or digest.startswith("❌"):
             await status.edit_text(digest or "❌ Нейросеть не ответила.", parse_mode=ParseMode.MARKDOWN)
             return
+        safe_digest = _sanitize_ai_md(digest)
         header = f"📋 {_md(display)}\n\n"
-        full = header + digest
+        full = header + safe_digest
         wiki_url = entry.get("wiki_url", "")
         if wiki_url:
             full += f"\n\n🔗 Полный протокол: {wiki_url}"
@@ -3607,43 +4080,34 @@ async def on_my_chat_member(update: ChatMemberUpdated):
 # ── Кнопка «📌 Кратко» ────────────────────────────────────────
 
 def _brief_action_keyboard(user_id: int, display: str, list_id: str, idx: int) -> InlineKeyboardMarkup:
-    """Кнопки под отчётом «📌 Кратко» из списка конспектов:
-       промпт определён → «📝 Расшифровать и разместить в wiki» (полный флоу);
-       промпт не определён → «🟡 Задать промпт» (подсказка /add_prompt).
-       idx — 0-based; в callback_data кладём 1-based (как номер в списке)."""
+    """После краткого распознавания всегда предлагает публикацию в Wiki."""
     n = idx + 1
-    if _prompt_known_for(user_id, display):
-        return InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(
-                text=f"📝 Расшифровать и разместить в wiki #{n}",
-                callback_data=f"wiki_proc:{list_id}:{n}",
-            )
-        ]])
-    return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(
+    rows = []
+    if not _prompt_known_for(user_id, display):
+        rows.append([InlineKeyboardButton(
             text=f"🟡 Задать промпт #{n}",
             callback_data=f"choose_prompt:{list_id}:{n}",
-        )
-    ]])
+        )])
+    rows.append([InlineKeyboardButton(
+        text=f"📝 Расшифровать и разместить в wiki #{n}",
+        callback_data=f"wiki_proc:{list_id}:{n}",
+    )])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def _brief_action_keyboard_pending(user_id: int, display: str, key: str) -> InlineKeyboardMarkup:
-    """Кнопки под отчётом «📌 Кратко» на уведомлении о новом конспекте:
-       промпт определён → «📝 Расшифровать и разместить в wiki» (по uid уведомления);
-       промпт не определён → «🟡 Задать промпт»."""
-    if _prompt_known_for(user_id, display):
-        return InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(
-                text="📝 Расшифровать и разместить в wiki",
-                callback_data=f"wiki_process:{key}",
-            )
-        ]])
-    return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(
+    """После краткого контекста из уведомления оставляет Wiki-действие доступным."""
+    rows = []
+    if not _prompt_known_for(user_id, display):
+        rows.append([InlineKeyboardButton(
             text="🟡 Задать промпт",
             callback_data=f"choose_prompt_pending:{key}",
-        )
-    ]])
+        )])
+    rows.append([InlineKeyboardButton(
+        text="📝 Расшифровать и разместить в wiki",
+        callback_data=f"wiki_process:{key}",
+    )])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 BRIEF_PROMPT = (
@@ -3673,6 +4137,10 @@ async def brief_callback(callback: CallbackQuery, state: FSMContext):
         return
     items = _load_notes_cache(user_id, list_id)
     if idx < 0 or idx >= len(items):
+        logger.warning(
+            "[BRIEF-CB] user=%s list_id=%r idx=%d out of range (len=%d) callback_data=%r",
+            user_id, list_id, idx, len(items), callback.data
+        )
         await callback.answer("❌ Конспект устарел. Запросите /list заново.", show_alert=True)
         return
     item = items[idx]
@@ -3692,8 +4160,9 @@ async def brief_callback(callback: CallbackQuery, state: FSMContext):
         if not result or result.startswith("❌"):
             await status.edit_text(result or "❌ Нейросеть не ответила.", parse_mode=ParseMode.MARKDOWN)
             return
+        safe_result = _sanitize_ai_md(result)
         header = f"📌 **Кратко: {_md(display)}**\n\n"
-        full = header + result
+        full = header + safe_result
         kb = _brief_action_keyboard(user_id, display, list_id, idx)
         try:
             await status.edit_text(full, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
@@ -3715,6 +4184,10 @@ async def brief_pending_callback(callback: CallbackQuery, state: FSMContext):
     pending = _load_wiki_pending(user_id)
     item = pending.get(key)
     if not item:
+        logger.warning(
+            "[BRIEF-PENDING] user=%s key=%r not found in pending (pending_len=%d) callback_data=%r",
+            user_id, key, len(pending), callback.data
+        )
         await callback.answer("❌ Конспект устарел или уже обработан.", show_alert=True)
         return
     display, txt_content = item[1], item[2]
@@ -3732,8 +4205,9 @@ async def brief_pending_callback(callback: CallbackQuery, state: FSMContext):
         if not result or result.startswith("❌"):
             await status.edit_text(result or "❌ Нейросеть не ответила.", parse_mode=ParseMode.MARKDOWN)
             return
+        safe_result = _sanitize_ai_md(result)
         header = f"📌 **Кратко: {_md(display)}**\n\n"
-        full = header + result
+        full = header + safe_result
         kb = _brief_action_keyboard_pending(user_id, display, key)
         try:
             await status.edit_text(full, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
@@ -4023,7 +4497,7 @@ async def add_prompt_topic(message: Message, state: FSMContext):
                     return
                 await state.update_data(topic=topic, file_text=file_text)
                 await message.answer(
-                    f"✅ Из файла определена тема: **«{_md(topic)}»**\\n\\n"
+                    f"✅ Из файла определена тема: **«{_md(topic)}»**\n\n"
                     "Теперь введите **текст** промпта или пришлите другой файл:\n"
                     "_(если оставить пустым — будет использован текст из файла)_",
                     parse_mode=ParseMode.MARKDOWN,
@@ -4583,6 +5057,7 @@ HELP_GROUPS = {
     "notes": {"emoji": "📬", "title": "Конспекты встреч", "description": "Просмотр конспектов встреч из почты"},
     "prompt": {"emoji": "🤖", "title": "Промпты", "description": "Управление шаблонами промптов для нейросети"},
     "wiki": {"emoji": "📚", "title": "Яндекс Вики", "description": "Публикация саммари в Яндекс Вики"},
+    "basket": {"emoji": "🗑", "title": "Корзина", "description": "Настройка автоматического перемещения писем в корзину"},
     "other": {"emoji": "ℹ️", "title": "Прочее", "description": "Справка и приветствие"},
 }
 
@@ -4604,6 +5079,13 @@ HELP_COMMANDS = {
         "short": "Запустить мастер настройки почты (4 шага)",
         "syntax": "/setup [подкоманда]", "aliases": [], "admin": False, "public": True,
         "details": "Без аргументов — 4 шага: Email, IMAP-сервер, логин, пароль.\nПодкоманды описаны в /help setup.",
+    },
+    "setup_basket": {
+        "emoji": "🗑", "group": "basket", "title": "Автоматическая корзина",
+        "short": "Настроить перемещение обработанных писем в корзину",
+        "syntax": "/setup basket", "aliases": ["/setup backet"],
+        "admin": False, "public": True,
+        "details": "Выберите автоматическое перемещение после публикации Wiki или подтверждение для каждого письма.",
     },
     "setup_email": {
         "emoji": "📧", "group": "setup", "title": "Изменить email",
@@ -4872,7 +5354,23 @@ HELP_SETUP = (
     "  Настройка PostgreSQL (только для администратора).\n"
     "  5 шагов: хост, порт, БД, пользователь, пароль.\n"
     "`/setup db test`\n"
-    "  Проверить подключение к PostgreSQL.\n"
+    "  Проверить подключение к PostgreSQL.\n\n"
+    "`/setup basket` (или `/setup backet`)\n"
+    "  Настроить поведение писем после публикации в Wiki.\n"
+    "  Включите автоматическое перемещение или оставьте вопрос для каждого письма.\n"
+    "  Также доступны `/setup basket on` и `/setup basket off`.\n"
+)
+
+HELP_BASKET = (
+    "🗑 **Корзина писем**\n\n"
+    "`/setup basket` или `/setup backet`\n"
+    "  Открыть настройку поведения после успешной расшифровки и публикации в Wiki.\n"
+    "  Режим «Всегда»: бот сразу перемещает обработанное письмо в корзину.\n"
+    "  Режим «Спрашивать»: бот предлагает решение после каждого письма.\n"
+    "  Кнопка «Всегда помещать в корзину» включает режим и перемещает текущее письмо.\n"
+    "  Автоматически перемещаются только письма, прошедшие проверку бота.\n\n"
+    "`/setup basket on` — включить автоматический режим.\n"
+    "`/setup basket off` — спрашивать для каждого письма."
 )
 
 HELP_LIST = (
@@ -4924,7 +5422,7 @@ HELP_OTHER = (
     "`/help` или `/помощь` или `/команды`\n"
     "  Эта справка.\n\n"
     "`/help <раздел>`\n"
-    "  Разделы: `setup`, `list`/`notes`, `prompt`, `wiki`.\n\n"
+    "  Разделы: `setup`, `basket`, `list`/`notes`, `prompt`, `wiki`.\n\n"
     "`/start`\n"
     "  Краткое приветствие.\n"
 )
@@ -4935,6 +5433,7 @@ HELP_ALL_SECTIONS = {
     "notes": ("📬 Конспекты", HELP_LIST),
     "prompt": ("🤖 Промпты", HELP_PROMPT),
     "wiki": ("📚 Яндекс Вики", HELP_WIKI),
+    "basket": ("🗑 Корзина", HELP_BASKET),
 }
 
 
@@ -5039,8 +5538,7 @@ async def cmd_start(message: Message, state: FSMContext):
         return
 
     # Настроенный пользователь — приветственное сообщение
-    # (стандарт HuntTech: Markdown для форматирования, нижнее меню
-    # актуальной клавиатуры — Telegram кэширует ReplyKeyboard по чату)
+    # (стандарт HuntTech: Markdown и постоянно доступное нижнее меню).
     ai_cfg = get_ai_config(user_id)
     ai_model = (ai_cfg or {}).get("model") or "не настроен"
     await _hide_reply_keyboard(message.chat.id)
@@ -5054,7 +5552,7 @@ async def cmd_start(message: Message, state: FSMContext):
         "📋 Назначение: бот для автоматизации конспектов встреч из почты.\n"
         "Извлекает отчёты из писем IMAP, генерирует саммари через нейросеть, "
         "сохраняет в базу знаний (Wiki) и присылает уведомления.\n"
-        "Поддерживает несколько AI-моделей с автоматическим fallback (DeepSeek → NVIDIA → OpenRouter free).\n"
+        "Поддерживает резервную модель через AI Key Vault (DeepSeek → AnyModel).\n"
         "\n"
         "Как это работает:\n"
         "1️⃣ /list — непрочитанные конспекты встреч\n"
@@ -5174,7 +5672,7 @@ async def cmd_user(message: Message):
         return
 
     if subcmd in ("add", "добавить"):
-        access_manager.add_user(user_id=target_id, added_by=user_id)
+        was_new = access_manager.add_user(user_id=target_id, added_by=user_id)
         await message.answer(f"✅ Пользователь {target_id} добавлен.")
         # Уведомляем пользователя, что доступ открыт
         try:
@@ -5188,6 +5686,71 @@ async def cmd_user(message: Message):
             )
         except Exception as exc:
             logger.warning("Не удалось уведомить пользователя %s: %s", target_id, exc)
+        # Уведомляем администратора о новом пользователе (если это было новое добавление)
+        if was_new and user_id != _master_admin_id:
+            try:
+                target_user = access_manager.get_user(target_id)
+                if target_user:
+                    name = target_user.get("full_name") or target_user.get("username") or f"User#{target_id}"
+                    await bot.send_message(
+                        chat_id=_master_admin_id,
+                        text=(
+                            f"👤 Новый пользователь добавлен в бот *HuntTech Protocols*\n\n"
+                            f"Имя: {name}\n"
+                            f"ID: `{target_id}`\n"
+                            f"Добавил: {user_id}"
+                        ),
+                        parse_mode=ParseMode.MARKDOWN,
+                    )
+            except Exception as exc:
+                logger.warning("Не удалось уведомить админа о новом пользователе: %s", exc)
+        return
+
+    if subcmd in ("approve", "одобрить"):
+        # Одобрить запрос доступа
+        req_info = access_manager.get_request_status(target_id)
+        if req_info != "pending":
+            await message.answer(f"❌ Нет ожидающего запроса от пользователя {target_id}")
+            return
+        # Получаем инфо о запросе перед одобрением
+        pending = access_manager.get_pending_requests()
+        req = next((r for r in pending if r.get("user_id") == target_id), None)
+        if req:
+            name = req.get("full_name") or req.get("username") or f"User#{target_id}"
+        else:
+            name = f"User#{target_id}"
+        # Одобряем
+        if access_manager.approve_request(target_id, approved_by=user_id):
+            await message.answer(f"✅ Запрос пользователя {target_id} одобрен.")
+            # Уведомляем пользователя
+            try:
+                await bot.send_message(
+                    chat_id=target_id,
+                    text=(
+                        "🎉 Ваш запрос на доступ к боту *HuntTech Protocols* одобрен!\n\n"
+                        "Напишите /start чтобы начать."
+                    ),
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+            except Exception as exc:
+                logger.warning("Не удалось уведомить пользователя %s: %s", target_id, exc)
+            # Уведомляем администратора
+            if user_id != _master_admin_id:
+                try:
+                    await bot.send_message(
+                        chat_id=_master_admin_id,
+                        text=(
+                            f"👤 Новый пользователь одобрен в бот *HuntTech Protocols*\n\n"
+                            f"Имя: {name}\n"
+                            f"ID: `{target_id}`\n"
+                            f"Одобрил: {user_id}"
+                        ),
+                        parse_mode=ParseMode.MARKDOWN,
+                    )
+                except Exception as exc:
+                    logger.warning("Не удалось уведомить админа об одобрении: %s", exc)
+        else:
+            await message.answer(f"❌ Не удалось одобрить запрос {target_id}")
         return
 
     if subcmd in ("remove", "delete", "удалить"):
@@ -5223,6 +5786,7 @@ async def cmd_user(message: Message):
         "",
         "/user list — список пользователей",
         "/user add <id> — добавить пользователя",
+        "/user approve <id> — одобрить запрос доступа",
         "/user remove <id> — удалить пользователя",
         "/user ban <id> — заблокировать",
         "/user unban <id> — разблокировать",
@@ -5286,17 +5850,27 @@ async def cmd_get_notes(message: Message):
         )
         return
 
-    sent = await message.answer("🔍 Ищу новые конспекты...")
+    sent = await message.answer("🔍 Ищу новые конспекты...", reply_markup=_main_menu_keyboard())
 
     try:
         header, items = await asyncio.to_thread(fetch_notes, user.id)
     except imaplib.IMAP4.error as e:
-        await sent.edit_text(f"❌ Ошибка IMAP: `{e}`")
+        logger.warning("IMAP прервал загрузку конспектов для user=%s: %s", user.id, e)
+        error_text = "❌ Почтовый сервер прервал загрузку конспектов. Попробуйте ещё раз."
+        try:
+            await sent.edit_text(error_text, parse_mode=None)
+        except Exception:
+            logger.warning("Не удалось обновить статус поиска; отправляю отдельное сообщение")
+            await message.answer(error_text, reply_markup=_main_menu_keyboard())
         return
     except Exception as e:
-        await sent.edit_text(f"❌ Ошибка: `{e}`")
-        import traceback
-        traceback.print_exc()
+        logger.exception("Ошибка обработки конспектов для user=%s", user.id)
+        error_text = "❌ Не удалось загрузить конспекты. Попробуйте ещё раз."
+        try:
+            await sent.edit_text(error_text, parse_mode=None)
+        except Exception:
+            logger.warning("Не удалось обновить статус поиска; отправляю отдельное сообщение")
+            await message.answer(error_text, reply_markup=_main_menu_keyboard())
         return
 
     if not items:
@@ -5309,7 +5883,7 @@ async def cmd_get_notes(message: Message):
     list_id = _save_notes_cache(user.id, items)
 
     total = len(items)
-    await message.answer(f"📋 **Новые конспекты встреч** — всего {total}", parse_mode=ParseMode.MARKDOWN)
+    await message.answer(f"📋 **Новые конспекты встреч** — всего {total}", parse_mode=ParseMode.MARKDOWN, reply_markup=_main_menu_keyboard())
 
     # Каждый конспект — отдельное сообщение с собственной кнопкой
     for idx, item in enumerate(items, 1):
@@ -5317,7 +5891,7 @@ async def cmd_get_notes(message: Message):
         date_str = dt.strftime("%d.%m.%Y %H:%M")
         text = f"**{idx}.** {_md(display)}\n📅 {date_str}"
         button = _get_item_button(idx, display, user.id, list_id)
-        await message.answer(text, parse_mode=ParseMode.MARKDOWN, reply_markup=button, hide_reply_keyboard=True)
+        await message.answer(text, parse_mode=ParseMode.MARKDOWN, reply_markup=button)
 
 
 # ── Команда /list_all (все за неделю) ────────────────────────
@@ -5337,7 +5911,7 @@ async def cmd_list_new(message: Message):
         )
         return
 
-    sent = await message.answer("Searching for new conspects...")
+    sent = await message.answer("Searching for new conspects...", reply_markup=_main_menu_keyboard())
 
     try:
         header, items = fetch_new_notes(user.id)
@@ -5362,16 +5936,15 @@ async def cmd_list_new(message: Message):
     list_id = _save_notes_cache(user.id, items)
 
     total = len(items)
-    # Скрываем нижнюю клавиатуру, чтобы кнопки не уходили за неё
-    await _hide_reply_keyboard(message.chat.id)
-    await message.answer(f"New conspects: {total} total", parse_mode=ParseMode.MARKDOWN)
+    # ReplyKeyboard остаётся закреплённой рядом с inline-действиями.
+    await message.answer(f"New conspects: {total} total", parse_mode=ParseMode.MARKDOWN, reply_markup=_main_menu_keyboard())
 
     for idx, item in enumerate(items, 1):
         dt, display = item[0], item[1]
         date_str = dt.strftime("%d.%m.%Y %H:%M")
         text = f"**{idx}.** {_md(display)}\n{date_str}"
         button = _get_item_button(idx, display, user.id, list_id)
-        await message.answer(text, parse_mode=ParseMode.MARKDOWN, reply_markup=button, hide_reply_keyboard=True)
+        await message.answer(text, parse_mode=ParseMode.MARKDOWN, reply_markup=button)
 
 
 async def cmd_list_all(message: Message):
@@ -5394,7 +5967,7 @@ async def cmd_list_all(message: Message):
         )
         return
 
-    sent = await message.answer("🔍 Загружаю конспекты за неделю...")
+    sent = await message.answer("🔍 Загружаю конспекты за неделю...", reply_markup=_main_menu_keyboard())
 
     try:
         header, items = fetch_notes_last_week(user.id)
@@ -5416,14 +5989,14 @@ async def cmd_list_all(message: Message):
     list_id = _save_notes_cache(user.id, items)
 
     total = len(items)
-    await message.answer(f"📋 **Конспекты встреч за неделю** — всего {total}", parse_mode=ParseMode.MARKDOWN)
+    await message.answer(f"📋 **Конспекты встреч за неделю** — всего {total}", parse_mode=ParseMode.MARKDOWN, reply_markup=_main_menu_keyboard())
 
     for idx, item in enumerate(items, 1):
         dt, display = item[0], item[1]
         date_str = dt.strftime("%d.%m.%Y %H:%M")
         text = f"**{idx}.** {_md(display)}\n📅 {date_str}"
         button = _get_item_button(idx, display, user.id, list_id)
-        await message.answer(text, parse_mode=ParseMode.MARKDOWN, reply_markup=button, hide_reply_keyboard=True)
+        await message.answer(text, parse_mode=ParseMode.MARKDOWN, reply_markup=button)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -5629,6 +6202,22 @@ async def _cmd_setup_show(message: Message, arg: str):
 async def _cmd_setup_ai_test(message: Message):
     """Тестирует текущее AI-подключение."""
     user_id = message.from_user.id
+    if AI_CREDENTIAL_SOURCE == "vault":
+        await message.answer("⏳ Проверяю AI Key Vault и разрешённую модель…")
+        try:
+            result = await VaultAIClient(user_id).complete(
+                "Ответь одним словом: готово.", "Проверка подключения.",
+                task="vault_connection_test", max_tokens=10,
+            )
+            await message.answer(
+                f"✅ Vault доступен. Модель: `{_md(result.provider)}/{_md(result.model)}`. "
+                f"Ответ: «{_md(result.content.strip())}»",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        except Exception as exc:
+            logger.error("Vault connection test failed (%s)", type(exc).__name__)
+            await message.answer("❌ Vault или разрешённая модель недоступны. См. журнал и аудит Vault.")
+        return
     ai_config = get_ai_config(user_id)
 
     if not ai_config:
@@ -5669,6 +6258,26 @@ async def cmd_setup_start(message: Message, state: FSMContext, command: CommandO
 
         if arg == "init":
             await _start_init(message, state)
+            return
+
+        if arg in ("basket", "backet"):
+            await message.answer(
+                _setup_basket_text(message.from_user.id),
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=_setup_basket_keyboard(message.from_user.id),
+            )
+            return
+
+        if arg in ("basket always", "basket on", "backet always", "backet on"):
+            set_basket_always(message.from_user.id, True)
+            await message.answer(_setup_basket_text(message.from_user.id), parse_mode=ParseMode.MARKDOWN,
+                                 reply_markup=_setup_basket_keyboard(message.from_user.id))
+            return
+
+        if arg in ("basket ask", "basket off", "backet ask", "backet off"):
+            set_basket_always(message.from_user.id, False)
+            await message.answer(_setup_basket_text(message.from_user.id), parse_mode=ParseMode.MARKDOWN,
+                                 reply_markup=_setup_basket_keyboard(message.from_user.id))
             return
 
         if arg.startswith("show"):
@@ -6370,7 +6979,7 @@ async def setup_password(message: Message, state: FSMContext):
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [
-                InlineKeyboardButton(text="🤖 Да, настроить AI", callback_data="ai_after_setup:yes", hide_reply_keyboard=True),
+                InlineKeyboardButton(text="🤖 Да, настроить AI", callback_data="ai_after_setup:yes"),
                 InlineKeyboardButton(text="🚫 Нет", callback_data="ai_after_setup:no"),
             ]
         ]),
@@ -6481,7 +7090,7 @@ async def setup_single_field(message: Message, state: FSMContext):
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [
-                InlineKeyboardButton(text="✅ Подтвердить", callback_data="setup_sf:confirm", hide_reply_keyboard=True),
+                InlineKeyboardButton(text="✅ Подтвердить", callback_data="setup_sf:confirm"),
                 InlineKeyboardButton(text="✏️ Редактировать", callback_data="setup_sf:edit"),
             ],
             [
@@ -6633,6 +7242,8 @@ async def setup_menu_callback(callback: CallbackQuery):
 
     if section == "root":
         text, kb = _setup_root_text(user_id), _setup_root_keyboard(user_id)
+    elif section == "basket":
+        text, kb = _setup_basket_text(user_id), _setup_basket_keyboard(user_id)
     else:
         if section == "db" and user_id != db.ADMIN_USER_ID:
             await callback.message.answer("❌ Команда только для администратора.")
@@ -6640,6 +7251,22 @@ async def setup_menu_callback(callback: CallbackQuery):
         text, kb = _setup_section_text(user_id, section), _setup_section_keyboard(user_id, section)
 
     await callback.message.edit_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("setup_basket:"))
+async def setup_basket_callback(callback: CallbackQuery):
+    """Переключает автоматическую корзину или режим вопроса для каждого письма."""
+    mode = callback.data.split(":", 1)[1]
+    if mode not in ("always", "ask"):
+        await callback.answer("❌ Неизвестный режим.", show_alert=True)
+        return
+    set_basket_always(callback.from_user.id, mode == "always")
+    await callback.answer("Настройка сохранена.")
+    await callback.message.edit_text(
+        _setup_basket_text(callback.from_user.id),
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=_setup_basket_keyboard(callback.from_user.id),
+    )
 
 
 @dp.callback_query(lambda c: c.data and c.data.startswith("setup_param:"))
@@ -6811,7 +7438,7 @@ async def setup_test_callback(callback: CallbackQuery):
 # каждого конспекта сохраняется в notes_cache.json сразу после /list.
 # Кнопка загружает конспект из кеша и отправляет в нейросеть.
 
-NOTES_CACHE_FILE = Path(__file__).parent / "notes_cache.json"
+NOTES_CACHE_FILE = BOT_DATA_DIR / "notes_cache.json"
 
 
 def _save_notes_cache(user_id: int, items: list) -> str:
@@ -6822,7 +7449,7 @@ def _save_notes_cache(user_id: int, items: list) -> str:
     list_id, поэтому нажатие всегда работает со СВОИМ списком, даже если
     позже бот показал другой список или фоновый цикл что-то сохранил.
 
-    Возвращает list_id (короткий хеш). Хранится до 5 последних списков
+    Возвращает list_id (короткий хеш). Хранится до 20 последних списков
     на пользователя (старые вытесняются).
     """
     cache = {}
@@ -6855,8 +7482,8 @@ def _save_notes_cache(user_id: int, items: list) -> str:
         cache[str(user_id)] = {legacy_id: {"items": per_user, "ts": 0}}
         per_user = cache[str(user_id)]
     per_user[list_id] = {"items": serialized, "ts": time.time()}
-    # Оставляем 5 последних списков
-    while len(per_user) > 5:
+    # Оставляем 20 последних списков (было 5 — увеличиваем для меньшей частоты вытеснения)
+    while len(per_user) > 20:
         oldest = min(per_user, key=lambda k: per_user[k].get("ts", 0))
         del per_user[oldest]
     NOTES_CACHE_FILE.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -6870,12 +7497,15 @@ def _load_notes_cache(user_id: int, list_id: str | None = None) -> list:
 
     list_id задан — возвращает именно этот список (кнопка из показанного
     когда-то /list); None — самый свежий снапшот (обратная совместимость).
+    Если list_id не найден — логируем детали и делаем fallback на последний список.
     """
     if not NOTES_CACHE_FILE.exists():
+        logger.debug("[NOTES-CACHE] user=%s: файл кэша не существует", user_id)
         return []
     try:
         cache = json.loads(NOTES_CACHE_FILE.read_text(encoding="utf-8"))
-    except Exception:
+    except Exception as e:
+        logger.error("[NOTES-CACHE] user=%s: ошибка чтения JSON: %s", user_id, e)
         return []
     per_user = cache.get(str(user_id), {})
     if isinstance(per_user, list):
@@ -6883,13 +7513,22 @@ def _load_notes_cache(user_id: int, list_id: str | None = None) -> list:
         legacy_id = _short_uid("legacy-format")[:8]
         per_user = {legacy_id: {"items": per_user, "ts": 0}}
     if not per_user:
+        logger.debug("[NOTES-CACHE] user=%s: кэш пользователя пуст", user_id)
         return []
     if list_id:
         snapshot = per_user.get(list_id)
         if not snapshot:
-            logger.warning("[NOTES-CACHE] user=%s: list_id=%r не найден — список устарел", user_id, list_id)
-            return []
-        serialized = snapshot.get("items", [])
+            # Детальный лог для диагностики: какие list_id доступны
+            available_ids = list(per_user.keys())
+            logger.warning(
+                "[NOTES-CACHE] user=%s: list_id=%r не найден (доступны: %s) — fallback на последний список",
+                user_id, list_id, available_ids
+            )
+            # Fallback: возвращаем самый свежий снапшот вместо пустого списка
+            latest = max(per_user.values(), key=lambda s: s.get("ts", 0))
+            serialized = latest.get("items", [])
+        else:
+            serialized = snapshot.get("items", [])
     else:
         latest = max(per_user.values(), key=lambda s: s.get("ts", 0))
         serialized = latest.get("items", [])
@@ -6898,6 +7537,7 @@ def _load_notes_cache(user_id: int, list_id: str | None = None) -> list:
         dt = datetime.fromisoformat(entry["dt"]) if entry.get("dt") else datetime.now()
         imap_id = entry.get("imap_id", "")
         items.append((dt, entry["display"], entry["txt"], "", "", imap_id))
+    logger.debug("[NOTES-CACHE] user=%s: загружено %d конспектов (list_id=%r)", user_id, len(items), list_id)
     return items
 
 
@@ -6907,8 +7547,32 @@ def _load_notes_cache(user_id: int, list_id: str | None = None) -> list:
 # При уведомлении о новом конспекте бот сохраняет его сюда (по uid),
 # чтобы по нажатию кнопки достать полный текст без повторного IMAP-запроса.
 
-WIKI_PENDING_FILE = Path(__file__).parent / "wiki_pending.json"
-SUMMARY_CACHE_FILE = Path(__file__).parent / "summary_cache.json"
+WIKI_PENDING_FILE = BOT_DATA_DIR / "wiki_pending.json"
+SUMMARY_CACHE_FILE = BOT_DATA_DIR / "summary_cache.json"
+PROMPT_CHOICES_FILE = BOT_DATA_DIR / "prompt_choices.json"
+
+
+def _save_prompt_choices(user_id: int, topics: list[str]) -> None:
+    """Сохраняет маппинг индекс -> тема промпта для выбора пользователем."""
+    cache = {}
+    if PROMPT_CHOICES_FILE.exists():
+        try:
+            cache = json.loads(PROMPT_CHOICES_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            cache = {}
+    cache[str(user_id)] = topics
+    PROMPT_CHOICES_FILE.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _load_prompt_choices(user_id: int) -> list[str]:
+    """Загружает список тем промптов для пользователя."""
+    if not PROMPT_CHOICES_FILE.exists():
+        return []
+    try:
+        cache = json.loads(PROMPT_CHOICES_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    return cache.get(str(user_id), [])
 
 
 def _save_wiki_pending(user_id: int, item) -> None:
@@ -7018,26 +7682,36 @@ def _load_summary_cache(user_id: int) -> dict:
 
 
 async def _send_summary(target, display: str, summary: str) -> None:
-    """Выводит саммари в чат. Заголовок — с MARKDOWN; тело — с MARKDOWN,
-       при невалидной разметке от AI — fallback на обычный текст."""
-    header = f"📄 **Саммари: {_md(display)}**\n\n---\n\n"
-    full = header + summary
+    """Выводит саммари в чат с поддержкой Markdown.
+       Заголовок и тело отправляются с parse_mode=MARKDOWN.
+       При ошибке парсинга — fallback на plain text."""
+    # Экранируем display для заголовка (Markdown v1 спецсимволы: _ * [ ] ` \)
+    safe_display = _md(display)
+    header = f"📄 **Саммари: {safe_display}**\n\n---\n\n"
+
+    # Санитизируем summary от непарных markdown-сущностей
+    safe_summary = _sanitize_ai_md(summary)
+
+    full = header + safe_summary
     if len(full) <= 4000:
         try:
             await target.answer(full, parse_mode=ParseMode.MARKDOWN)
-        except Exception:
-            await target.answer(full)
+        except Exception as e:
+            logger.warning("[SHOW-SUMMARY] Markdown parse error, fallback to plain: %s", e)
+            await target.answer(full.replace("**", "").replace("*", "").replace("`", "").replace("_", ""))
     else:
         try:
             await target.answer(header, parse_mode=ParseMode.MARKDOWN)
-        except Exception:
-            await target.answer(header)
-        for i in range(0, len(summary), 3500):
-            chunk = summary[i:i + 3500]
+        except Exception as e:
+            logger.warning("[SHOW-SUMMARY] Header markdown error, fallback to plain: %s", e)
+            await target.answer(header.replace("**", "").replace("*", "").replace("`", "").replace("_", ""))
+        for i in range(0, len(safe_summary), 3500):
+            chunk = safe_summary[i:i + 3500]
             try:
                 await target.answer(chunk, parse_mode=ParseMode.MARKDOWN)
-            except Exception:
-                await target.answer(chunk)
+            except Exception as e:
+                logger.warning("[SHOW-SUMMARY] Chunk markdown error, fallback to plain: %s", e)
+                await target.answer(chunk.replace("**", "").replace("*", "").replace("`", "").replace("_", ""))
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -7072,18 +7746,36 @@ def _get_openrouter_key() -> str:
     return ""
 
 
+# Хранение ID сообщения для обновления уведомления (одна строка заменяет другую)
+_admin_notification_msg_id: int | None = None
+
 async def _notify_admin(message: str) -> None:
-    """Отправляет уведомление администратору о переключении AI."""
+    """Отправляет/обновляет уведомление администратору о переключении AI (одна строка заменяет другую)."""
+    global _admin_notification_msg_id
     admin_id = 272980897  # ADMIN_USER_ID
+    text = f"🤖 **AI Fallback**\n{message}"
     try:
-        await bot.send_message(
+        if _admin_notification_msg_id is not None:
+            try:
+                await bot.edit_message_text(
+                    chat_id=admin_id,
+                    message_id=_admin_notification_msg_id,
+                    text=text,
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+                return
+            except Exception:
+                # Если сообщение удалено или недоступно — сбрасываем и отправляем новое
+                _admin_notification_msg_id = None
+        msg = await bot.send_message(
             chat_id=admin_id,
-            text=f"🤖 **AI Fallback**\n{message}",
+            text=text,
             parse_mode=ParseMode.MARKDOWN,
         )
+        _admin_notification_msg_id = msg.message_id
     except Exception as e:
         logger.warning("AI fallback notification failed: %s", e)
-        logger.error("Failed to notify admin about AI fallback: %s", e, exc_info=True)
+        logger.error("Failed to notify admin about AI fallback: %s", e)
 
 
 def _build_multi_fallback_ai_client(user_id: int):
@@ -7150,7 +7842,7 @@ def _build_multi_fallback_ai_client(user_id: int):
         username="",
         bot_name="protocols-bot",
         notify_func=_notify_admin,
-        proxy="http://tWQrfq:YtJRww@209.46.2.183:8000",
+        proxy=os.getenv("OPENROUTER_PROXY") or None,
     )
 
 
@@ -7211,6 +7903,32 @@ async def call_ai(user_id: int, system_prompt: str, user_text: str, task: str = 
     """
     import time
     from urllib.parse import urlparse
+
+    if AI_CREDENTIAL_SOURCE == "vault":
+        primary_model = os.getenv("VAULT_PRIMARY_MODEL", "deepseek-chat")
+        started = time.monotonic()
+        try:
+            response = await VaultAIClient(user_id).complete(
+                system_prompt=system_prompt,
+                user_prompt=user_text,
+                task=task,
+            )
+            _track_usage(
+                user_id, f"vault:{response.provider}", response.model, task,
+                "ok", response.usage, response.duration_ms,
+            )
+            if response.model != primary_model:
+                await _notify_admin(
+                    f"Основная модель {primary_model} недоступна; использована "
+                    f"резервная {response.provider}/{response.model}."
+                )
+            return response.content
+        except Exception as exc:
+            _track_usage(user_id, "vault", primary_model, task, "error", None,
+                         (time.monotonic() - started) * 1000)
+            logger.error("Vault AI call failed (user=%s task=%s error=%s)",
+                         user_id, task, type(exc).__name__)
+            return "❌ Не удалось получить ответ от разрешённых моделей. Проверьте подключение Vault."
 
     ai_config = get_ai_config(user_id)
     if not ai_config:
@@ -7450,7 +8168,14 @@ async def ai_after_setup_callback(callback: CallbackQuery, state: FSMContext):
     except Exception:
         pass
 
-    if action == "yes":
+    if action == "yes" and AI_CREDENTIAL_SOURCE == "vault":
+        await state.clear()
+        await callback.message.answer(
+            "🔐 Доступ к моделям управляется через AI Key Vault. "
+            "Проверить подключение можно командой `/setup ai test`.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    elif action == "yes":
         await callback.message.answer(
             "🤖 **Настройка нейросети**\n\n"
             "Выберите провайдера:",
@@ -7465,6 +8190,14 @@ async def ai_after_setup_callback(callback: CallbackQuery, state: FSMContext):
 @dp.message(Command("setup_ai", "setup_llm"))
 async def cmd_setup_ai(message: Message, state: FSMContext):
     """Начинает настройку AI: выбор провайдера."""
+    if AI_CREDENTIAL_SOURCE == "vault":
+        await state.clear()
+        await message.answer(
+            "🔐 Настройки моделей и ключей управляются через AI Key Vault.\n"
+            "Используйте `/setup ai test` для проверки доступа.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
     await message.answer(
         "🤖 **Настройка нейросети**\n\n"
         "Выберите провайдера:",
@@ -7484,6 +8217,11 @@ async def ai_provider_callback(callback: CallbackQuery, state: FSMContext):
     provider_key = callback.data.split(":", 1)[1]
     await callback.answer()
     await callback.message.delete()
+
+    if AI_CREDENTIAL_SOURCE == "vault":
+        await state.clear()
+        await callback.message.answer("🔐 Выбор моделей управляется через AI Key Vault.")
+        return
 
     if provider_key == "custom":
         # Свой endpoint: сохраняем пустой endpoint, просим ввести URL
@@ -7527,6 +8265,10 @@ async def ai_setup_apikey(message: Message, state: FSMContext):
     Если endpoint ещё не задан (custom путь) — сначала endpoint, потом модель.
     /skip — оставить текущий API key (из сохранённого AI-конфига).
     """
+    if AI_CREDENTIAL_SOURCE == "vault":
+        await state.clear()
+        await message.answer("🔐 API-ключи управляются через AI Key Vault; не отправляйте ключи в чат.")
+        return
     text = message.text.strip()
     ai_config = get_ai_config(message.from_user.id) or {}
 
@@ -7590,6 +8332,10 @@ async def ai_setup_model(message: Message, state: FSMContext):
     Если был выбран custom путь — сначала получаем endpoint (через _need_endpoint).
     /skip — оставить текущее значение (модель или endpoint для custom-пути).
     """
+    if AI_CREDENTIAL_SOURCE == "vault":
+        await state.clear()
+        await message.answer("🔐 Модели и права доступа управляются через AI Key Vault.")
+        return
     text = message.text.strip()
     ai_config = get_ai_config(message.from_user.id) or {}
 
@@ -7799,9 +8545,11 @@ async def setup_wiki_authorized_key(message: Message, state: FSMContext):
     # org_id не передаём — сохранится старый, если был
     save_wiki_config(user_id, json.dumps(key_json))
 
-    # Проверяем подключение к Wiki API (используем org_id из только что сохранённого конфига)
-    saved_org_id = get_wiki_config(user_id).get("org_id", "")
-    report = await _test_wiki_connection(iam_token, saved_org_id)
+    # Проверяем Wiki API с collab_id организации Яндекс 360; org_id нужен только для ссылок.
+    saved_wiki = get_wiki_config(user_id) or {}
+    saved_org_id = saved_wiki.get("org_id", "")
+    saved_collab_id = saved_wiki.get("collab_id", "")
+    report = await _test_wiki_connection(iam_token, saved_collab_id, saved_wiki.get("prompt_slug", ""))
 
     if report.startswith("❌"):
         await state.clear()
@@ -8097,7 +8845,8 @@ async def cmd_wiki_test(message: Message):
     try:
         report = await _test_wiki_connection(
             token,
-            wiki_config.get("org_id", ""),
+            wiki_config.get("collab_id", ""),
+            wiki_config.get("prompt_slug", ""),
         )
         await status.edit_text(report, parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
@@ -8309,13 +9058,24 @@ async def main():
             await _send_logo(_master_admin_id)
             ai_cfg = get_ai_config(_master_admin_id)
             ai_model = (ai_cfg or {}).get("model") or "не настроен"
+            # Список зарегистрированных пользователей
+            users = access_manager.get_allowed_users()
+            user_lines = []
+            for u in users:
+                name = u.get("full_name") or u.get("username") or f"User#{u['user_id']}"
+                banned = " 🚫" if u.get("is_banned") else ""
+                user_lines.append(f"  • {name} (id={u['user_id']}){banned}")
+            users_text = "\n".join(user_lines) if user_lines else "  (нет)"
+
             startup_text = (
                 "🚀 HuntTech Protocols Bot\n"
                 f"🤖 Версия бота: {_bot_version()}\n"
                 "━━━━━━━━━━━━━━━━━━━━━━\n"
                 "✅ Бот запущен и готов к работе!\n"
                 f"🤖 AI: {ai_model}\n"
-                "━━━━━━━━━━━━━━━━━━━━━━"
+                "━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"👥 Зарегистрированные пользователи ({len(users)}):\n"
+                f"{users_text}"
             )
             await bot.send_message(
                 chat_id=_master_admin_id,
@@ -8339,7 +9099,18 @@ async def main():
         except Exception as e:
             logger.warning("Changelog message failed: %s", e)
 
-    await dp.start_polling(bot)
+    retry_delay = 5
+    while True:
+        try:
+            await dp.start_polling(bot, close_bot_session=False)
+            break
+        except TelegramNetworkError as exc:
+            logger.warning(
+                "Telegram polling is unavailable (%s); retrying in %d seconds",
+                type(exc).__name__, retry_delay,
+            )
+            await asyncio.sleep(retry_delay)
+            retry_delay = min(retry_delay * 2, 120)
 
 
 if __name__ == "__main__":

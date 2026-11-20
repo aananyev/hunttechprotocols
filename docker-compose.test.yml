@@ -1,0 +1,67 @@
+services:
+  protocols-bot:
+    container_name: hunttech-protocols-bot-test
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=32m
+    volumes:
+      - protocols_data:/data
+      - protocols_common_state:/.hermes
+    secrets:
+      - tg_token
+      - vault_client_token
+      - vault_signing_private_key
+      - vault_encryption_private_key
+    environment:
+      BOT_DATA_DIR: /data
+      MASTER_ADMIN_ID: ${MASTER_ADMIN_ID:?set MASTER_ADMIN_ID}
+      AI_CREDENTIAL_SOURCE: vault
+      VAULT_URL: http://vault:8080
+      VAULT_CLIENT_ID: protocols-bot-test
+      VAULT_CLIENT_TOKEN: file:/run/secrets/vault_client_token
+      VAULT_JWT_ISSUER: protocols-bot-test
+      VAULT_SIGNING_KID: protocols-test-signing-1
+      VAULT_ENCRYPTION_KID: protocols-test-encryption-1
+      VAULT_SIGNING_PRIVATE_KEY: file:/run/secrets/vault_signing_private_key
+      VAULT_ENCRYPTION_PRIVATE_KEY: file:/run/secrets/vault_encryption_private_key
+      VAULT_PRIMARY_PROVIDER: deepseek
+      VAULT_PRIMARY_MODEL: deepseek-chat
+      VAULT_FALLBACK_MODELS: openrouter=nvidia/nemotron-3-super-120b-a12b:free
+      VAULT_ALLOW_INSECURE_TEST: "true"
+      VAULT_REQUIRE_MTLS: "false"
+      PYTHONUNBUFFERED: "1"
+    networks:
+      vault_edge:
+        ipv4_address: 172.22.0.10
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    mem_limit: 768m
+    cpus: 1.0
+
+secrets:
+  tg_token:
+    file: ./secrets/tg_token
+  vault_client_token:
+    file: ./secrets/vault_client_token
+  vault_signing_private_key:
+    file: ./secrets/vault_signing_private_key.pem
+  vault_encryption_private_key:
+    file: ./secrets/vault_encryption_private_key.pem
+
+volumes:
+  protocols_data:
+    name: hunttech-protocols-test-data
+  protocols_common_state:
+    name: hunttech-protocols-test-common-state
+
+networks:
+  vault_edge:
+    name: ai-key-vault-test-v2_vault_edge
+    external: true
